@@ -7,20 +7,29 @@ use std::sync::Arc;
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 
 use app::{embed_batch, AppError, AppState};
-use config::Config;
+use config::{Config, StorageBackend};
 use wire::{EmbeddingObject, EmbeddingsRequest, EmbeddingsResponse, ErrorResponse, Usage};
 use zerocache_adapters_openai::OpenAiProvider;
+use zerocache_adapters_redis::RedisStore;
 use zerocache_adapters_sled::SledStore;
+use zerocache_ports::EmbeddingStore;
 
 #[tokio::main]
 async fn main() {
     let config = Config::from_env();
 
-    let store = SledStore::open(&config.storage_path).expect("failed to open sled store");
+    let store: Arc<dyn EmbeddingStore> = match config.storage_backend {
+        StorageBackend::Sled => {
+            Arc::new(SledStore::open(&config.storage_path).expect("failed to open sled store"))
+        }
+        StorageBackend::Redis => {
+            Arc::new(RedisStore::connect(&config.redis_url).expect("failed to connect to redis"))
+        }
+    };
     let provider = OpenAiProvider::new(&config.provider_base_url, &config.provider_api_key);
 
     let state = Arc::new(AppState {
-        store: Arc::new(store),
+        store,
         provider: Arc::new(provider),
         model_version: "v1".to_string(),
     });

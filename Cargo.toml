@@ -4,6 +4,7 @@ members = [
     "zerocache-core",
     "zerocache-ports",
     "zerocache-adapters-sled",
+    "zerocache-adapters-redis",
     "zerocache-adapters-openai",
     "zerocache-http",
 ]

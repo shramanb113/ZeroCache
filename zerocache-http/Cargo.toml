@@ -7,6 +7,7 @@ edition.workspace = true
 zerocache-core = { path = "../zerocache-core" }
 zerocache-ports = { path = "../zerocache-ports" }
 zerocache-adapters-sled = { path = "../zerocache-adapters-sled" }
+zerocache-adapters-redis = { path = "../zerocache-adapters-redis" }
 zerocache-adapters-openai = { path = "../zerocache-adapters-openai" }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }

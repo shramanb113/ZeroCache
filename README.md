@@ -20,7 +20,8 @@ Dependencies point inward only, enforced via Cargo workspace crate boundaries:
 | --- | --- |
 | `zerocache-core` | Domain logic: `CacheKey` derivation, hit/miss reconciliation. No I/O, no async runtime. |
 | `zerocache-ports` | `EmbeddingStore` / `EmbeddingProvider` trait contracts. |
-| `zerocache-adapters-sled` | `EmbeddingStore` implementation backed by [sled](https://github.com/spacejam/sled). |
+| `zerocache-adapters-sled` | `EmbeddingStore` implementation backed by [sled](https://github.com/spacejam/sled) — embedded, single-process. Local dev / single-instance only. |
+| `zerocache-adapters-redis` | `EmbeddingStore` implementation backed by Redis — shared, network-accessible. Use this for multi-replica (e.g. Kubernetes) deployments. |
 | `zerocache-adapters-openai` | `EmbeddingProvider` implementation calling an OpenAI-compatible endpoint. |
 | `zerocache-http` | axum HTTP server, OpenAI wire-shape translation, and application wiring. |
 

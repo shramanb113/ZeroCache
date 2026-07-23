@@ -1,0 +1,10 @@
+[package]
+name = "zerocache-adapters-redis"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zerocache-core = { path = "../zerocache-core" }
+zerocache-ports = { path = "../zerocache-ports" }
+redis = { version = "0.27", features = ["r2d2"] }
+r2d2 = "0.8"
