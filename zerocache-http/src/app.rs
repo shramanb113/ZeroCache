@@ -160,6 +160,7 @@ pub fn embed_batch(state: &AppState, request: EmbedRequest) -> Result<(Vec<Vec<f
     let mut provider_total_tokens = 0;
 
     if !reconciled.misses.is_empty() {
+
         let miss_texts: Vec<String> = reconciled
             .misses
             .iter()
