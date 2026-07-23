@@ -20,8 +20,12 @@ use zerocache_adapters_redis::RedisStore;
 use zerocache_adapters_sled::SledStore;
 use zerocache_ports::EmbeddingStore;
 
-#[tokio::main]
-async fn main() {
+// Not `#[tokio::main]`: `OpenAiProvider` holds a `reqwest::blocking::Client`,
+// which builds its own internal Tokio runtime at construction time. Building
+// (or later dropping) that internal runtime while already inside another
+// runtime's context panics — so the provider must be constructed before any
+// Tokio runtime exists, and the runtime entered explicitly afterward.
+fn main() {
     let config = Config::from_env();
 
     let store: Arc<dyn EmbeddingStore> = match config.storage_backend {
@@ -33,6 +37,7 @@ async fn main() {
         }
     };
     let provider = OpenAiProvider::new(&config.provider_base_url, &config.provider_api_key);
+    let port = config.port;
 
     let state = Arc::new(AppState {
         store,
@@ -40,15 +45,18 @@ async fn main() {
         model_version: "v1".to_string(),
     });
 
-    let app = Router::new()
-        .route("/v1/embeddings", post(embeddings_handler))
-        .with_state(state);
+    let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    runtime.block_on(async move {
+        let app = Router::new()
+            .route("/v1/embeddings", post(embeddings_handler))
+            .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port))
-        .await
-        .expect("failed to bind port");
-    println!("zerocache-http listening on 0.0.0.0:{}", config.port);
-    axum::serve(listener, app).await.expect("server error");
+        let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+            .await
+            .expect("failed to bind port");
+        println!("zerocache-http listening on 0.0.0.0:{port}");
+        axum::serve(listener, app).await.expect("server error");
+    });
 }
 
 async fn embeddings_handler(
