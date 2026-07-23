@@ -2670,6 +2670,8 @@ dependencies = [
  "prometheus",
  "serde",
  "tokio",
+ "zerocache-adapters-gemini",
+ "zerocache-adapters-mistral",
  "zerocache-adapters-openai",
  "zerocache-adapters-redis",
  "zerocache-adapters-sled",

@@ -47,7 +47,7 @@ mod tests {
     fn put_then_get_roundtrips() {
         let dir = std::env::temp_dir().join(format!("zerocache-sled-test-{}", std::process::id()));
         let store = SledStore::open(&dir).unwrap();
-        let key = CacheKey::derive("m", "v1", "hello");
+        let key = CacheKey::derive([1u8; 32], "openai", "m", "v1", "hello");
 
         assert_eq!(store.get(&key).unwrap(), None);
         store.put(key, vec![1.0, 2.5, -3.25]).unwrap();
