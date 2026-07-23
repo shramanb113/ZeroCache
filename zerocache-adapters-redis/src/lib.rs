@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use redis::Commands;
 use zerocache_core::CacheKey;
 use zerocache_ports::{EmbeddingStore, StoreError};
@@ -9,15 +11,16 @@ use zerocache_ports::{EmbeddingStore, StoreError};
 // so a last-write-wins SET is not a correctness problem.
 pub struct RedisStore {
     pool: r2d2::Pool<redis::Client>,
+    ttl: Option<Duration>,
 }
 
 impl RedisStore {
-    pub fn connect(redis_url: &str) -> Result<Self, StoreError> {
+    pub fn connect(redis_url: &str, ttl: Option<Duration>) -> Result<Self, StoreError> {
         let client = redis::Client::open(redis_url).map_err(|e| StoreError(e.to_string()))?;
         let pool = r2d2::Pool::builder()
             .build(client)
             .map_err(|e| StoreError(e.to_string()))?;
-        Ok(Self { pool })
+        Ok(Self { pool, ttl })
     }
 }
 
@@ -32,8 +35,24 @@ impl EmbeddingStore for RedisStore {
 
     fn put(&self, key: CacheKey, vector: Vec<f32>) -> Result<(), StoreError> {
         let mut conn = self.pool.get().map_err(|e| StoreError(e.to_string()))?;
-        conn.set::<_, _, ()>(redis_key(&key), encode(&vector))
-            .map_err(|e| StoreError(e.to_string()))?;
+        match self.ttl {
+            // Redis handles expiry natively -- no stored-value format change
+            // needed, unlike sled.
+            Some(ttl) => {
+                conn.set_ex::<_, _, ()>(redis_key(&key), encode(&vector), ttl.as_secs())
+                    .map_err(|e| StoreError(e.to_string()))?;
+            }
+            None => {
+                conn.set::<_, _, ()>(redis_key(&key), encode(&vector))
+                    .map_err(|e| StoreError(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn delete(&self, key: &CacheKey) -> Result<(), StoreError> {
+        let mut conn = self.pool.get().map_err(|e| StoreError(e.to_string()))?;
+        conn.del::<_, ()>(redis_key(key)).map_err(|e| StoreError(e.to_string()))?;
         Ok(())
     }
 }
