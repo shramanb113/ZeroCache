@@ -2629,10 +2629,12 @@ dependencies = [
 name = "zerocache-adapters-openai"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "httpmock",
  "reqwest",
  "serde",
  "serde_json",
+ "tokio",
  "zerocache-ports",
 ]
 
@@ -2683,6 +2685,7 @@ dependencies = [
 name = "zerocache-ports"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "zerocache-core",
 ]
 
