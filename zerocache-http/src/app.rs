@@ -10,9 +10,6 @@ use zerocache_ports::{EmbeddingProvider, EmbeddingStore, ProviderError, StoreErr
 pub struct AppState {
     pub store: Arc<dyn EmbeddingStore>,
     pub providers: HashMap<String, Arc<dyn EmbeddingProvider>>,
-    // Bumped when an adapter's handling of a model changes in a way that
-    // could change its output, independent of what the client sends as `model`.
-    pub model_version: String,
     pub metrics: Metrics,
 }
 
@@ -131,23 +128,35 @@ pub struct EmbedRequest<'a> {
 /// Runs the cache flow for one batch: reconcile against the store (scoped to
 /// `request.owner_id` + `request.provider_name` via the cache key), fetch
 /// only the misses from `request.provider`, write them back, and return
-/// vectors in the same order as `request.texts`. Store/provider calls are
-/// blocking, so callers on the async server must run this inside
-/// `tokio::task::spawn_blocking`.
+/// vectors in the same order as `request.texts`.
+///
+/// Store reads and store writes each run inside their own
+/// `tokio::task::spawn_blocking`, since `sled`/`redis` are synchronous. The
+/// provider call in between is awaited directly — it's async now, not
+/// blocking, so it runs on the same runtime as the rest of the server
+/// instead of needing a thread-pool hop.
 ///
 /// A store or provider failure aborts the whole batch rather than degrading
 /// silently into an extra miss or a dropped write — the caller is expected
 /// to surface it as an error response.
-pub fn embed_batch(state: &AppState, request: EmbedRequest) -> Result<(Vec<Vec<f32>>, BatchStats), AppError> {
+pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<(Vec<Vec<f32>>, BatchStats), AppError> {
+    let provider_version = request.provider.version();
     let keys: Vec<CacheKey> = request
         .texts
         .iter()
-        .map(|text| {
-            CacheKey::derive(request.owner_id, request.provider_name, request.model, &state.model_version, text)
-        })
+        .map(|text| CacheKey::derive(request.owner_id, request.provider_name, request.model, provider_version, text))
         .collect();
 
-    let reconciled = reconcile(&keys, |key| state.store.get(key).map_err(AppError::Store))?;
+    let reconciled = {
+        let store = Arc::clone(&state.store);
+        let keys_for_lookup = keys.clone();
+        tokio::task::spawn_blocking(move || {
+            reconcile(&keys_for_lookup, |key| store.get(key).map_err(AppError::Store))
+        })
+        .await
+        .expect("store reconciliation task panicked")?
+    };
+
     let hits = reconciled.hits.len();
     let misses = reconciled.misses.len();
 
@@ -160,23 +169,35 @@ pub fn embed_batch(state: &AppState, request: EmbedRequest) -> Result<(Vec<Vec<f
     let mut provider_total_tokens = 0;
 
     if !reconciled.misses.is_empty() {
-
         let miss_texts: Vec<String> = reconciled
             .misses
             .iter()
             .map(|(index, _)| request.texts[*index].clone())
             .collect();
+
         let (fetched, usage) = request
             .provider
             .embed_batch(request.api_key, request.model, &miss_texts)
+            .await
             .map_err(AppError::Provider)?;
         provider_prompt_tokens = usage.prompt_tokens;
         provider_total_tokens = usage.total_tokens;
 
+        let mut writes = Vec::with_capacity(reconciled.misses.len());
         for ((index, key), vector) in reconciled.misses.into_iter().zip(fetched.into_iter()) {
-            state.store.put(key, vector.clone()).map_err(AppError::Store)?;
-            results[index] = Some(vector);
+            results[index] = Some(vector.clone());
+            writes.push((key, vector));
         }
+
+        let store = Arc::clone(&state.store);
+        tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+            for (key, vector) in writes {
+                store.put(key, vector).map_err(AppError::Store)?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("store write task panicked")?;
     }
 
     let vectors = results
@@ -240,8 +261,9 @@ mod tests {
         response: Vec<Vec<f32>>,
     }
 
+    #[async_trait::async_trait]
     impl EmbeddingProvider for MockProvider {
-        fn embed_batch(
+        async fn embed_batch(
             &self,
             _api_key: &str,
             _model: &str,
@@ -250,12 +272,17 @@ mod tests {
             assert_eq!(texts.len(), self.response.len(), "mock provider called with unexpected batch size");
             Ok((self.response.clone(), ProviderUsage { prompt_tokens: 10, total_tokens: 10 }))
         }
+
+        fn version(&self) -> &'static str {
+            "mock-v1"
+        }
     }
 
     struct FailingProvider;
 
+    #[async_trait::async_trait]
     impl EmbeddingProvider for FailingProvider {
-        fn embed_batch(
+        async fn embed_batch(
             &self,
             _api_key: &str,
             _model: &str,
@@ -263,18 +290,27 @@ mod tests {
         ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
             Err(ProviderError("mock provider failure".into()))
         }
+
+        fn version(&self) -> &'static str {
+            "mock-v1"
+        }
     }
 
     struct PanicProvider;
 
+    #[async_trait::async_trait]
     impl EmbeddingProvider for PanicProvider {
-        fn embed_batch(
+        async fn embed_batch(
             &self,
             _api_key: &str,
             _model: &str,
             _texts: &[String],
         ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
             panic!("provider must not be called when the store lookup already failed");
+        }
+
+        fn version(&self) -> &'static str {
+            "mock-v1"
         }
     }
 
@@ -285,14 +321,13 @@ mod tests {
         AppState {
             store: Arc::new(store),
             providers: StdHashMap::new(),
-            model_version: "v1".to_string(),
             metrics: Metrics::new(),
         }
     }
 
-    #[test]
-    fn all_hits_skips_provider_entirely() {
-        let key = CacheKey::derive(OWNER_A, "openai", "m", "v1", "cached text");
+    #[tokio::test]
+    async fn all_hits_skips_provider_entirely() {
+        let key = CacheKey::derive(OWNER_A, "openai", "m", "mock-v1", "cached text");
         let state = state_with(MockStore::with(vec![(key, vec![1.0, 2.0])]));
         let provider = PanicProvider;
         let texts = vec!["cached text".to_string()];
@@ -308,6 +343,7 @@ mod tests {
                 texts: &texts,
             },
         )
+        .await
         .unwrap();
 
         assert_eq!(vectors, vec![vec![1.0, 2.0]]);
@@ -316,8 +352,8 @@ mod tests {
         assert_eq!(stats.provider_prompt_tokens, 0);
     }
 
-    #[test]
-    fn all_misses_calls_provider_and_writes_back_to_store() {
+    #[tokio::test]
+    async fn all_misses_calls_provider_and_writes_back_to_store() {
         let state = state_with(MockStore::empty());
         let provider = MockProvider { response: vec![vec![9.0, 9.0]] };
         let texts = vec!["fresh text".to_string()];
@@ -333,6 +369,7 @@ mod tests {
                 texts: &texts,
             },
         )
+        .await
         .unwrap();
 
         assert_eq!(vectors, vec![vec![9.0, 9.0]]);
@@ -340,13 +377,13 @@ mod tests {
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.provider_prompt_tokens, 10);
 
-        let key = CacheKey::derive(OWNER_A, "openai", "m", "v1", "fresh text");
+        let key = CacheKey::derive(OWNER_A, "openai", "m", "mock-v1", "fresh text");
         assert_eq!(state.store.get(&key).unwrap(), Some(vec![9.0, 9.0]));
     }
 
-    #[test]
-    fn mixed_batch_preserves_original_order() {
-        let hit_key = CacheKey::derive(OWNER_A, "openai", "m", "v1", "old");
+    #[tokio::test]
+    async fn mixed_batch_preserves_original_order() {
+        let hit_key = CacheKey::derive(OWNER_A, "openai", "m", "mock-v1", "old");
         let state = state_with(MockStore::with(vec![(hit_key, vec![1.0])]));
         let provider = MockProvider { response: vec![vec![2.0]] };
         let texts = vec!["new".to_string(), "old".to_string()];
@@ -362,6 +399,7 @@ mod tests {
                 texts: &texts,
             },
         )
+        .await
         .unwrap();
 
         assert_eq!(vectors, vec![vec![2.0], vec![1.0]]);
@@ -369,13 +407,12 @@ mod tests {
         assert_eq!(stats.misses, 1);
     }
 
-    #[test]
-    fn different_owners_never_share_a_cache_entry() {
+    #[tokio::test]
+    async fn different_owners_never_share_a_cache_entry() {
         let state = state_with(MockStore::empty());
         let provider = MockProvider { response: vec![vec![7.0]] };
         let texts = vec!["identical text".to_string()];
 
-        // Owner A misses, gets cached under owner A's namespace.
         let (_, stats_a) = embed_batch(
             &state,
             EmbedRequest {
@@ -387,11 +424,10 @@ mod tests {
                 texts: &texts,
             },
         )
+        .await
         .unwrap();
         assert_eq!(stats_a.misses, 1, "owner A's first request must be a miss");
 
-        // Owner B, same provider/model/text, different owner_id: must also
-        // be a miss, not a free ride off owner A's cached entry.
         let (_, stats_b) = embed_batch(
             &state,
             EmbedRequest {
@@ -403,12 +439,13 @@ mod tests {
                 texts: &texts,
             },
         )
+        .await
         .unwrap();
         assert_eq!(stats_b.misses, 1, "owner B must not hit owner A's cache entry");
     }
 
-    #[test]
-    fn store_lookup_failure_aborts_before_any_provider_call() {
+    #[tokio::test]
+    async fn store_lookup_failure_aborts_before_any_provider_call() {
         let state = state_with(FailingStore);
         let provider = PanicProvider;
         let texts = vec!["text".to_string()];
@@ -423,13 +460,14 @@ mod tests {
                 model: "m",
                 texts: &texts,
             },
-        );
+        )
+        .await;
 
         assert!(matches!(result, Err(AppError::Store(_))));
     }
 
-    #[test]
-    fn provider_failure_surfaces_as_app_error() {
+    #[tokio::test]
+    async fn provider_failure_surfaces_as_app_error() {
         let state = state_with(MockStore::empty());
         let provider = FailingProvider;
         let texts = vec!["text".to_string()];
@@ -444,13 +482,14 @@ mod tests {
                 model: "m",
                 texts: &texts,
             },
-        );
+        )
+        .await;
 
         assert!(matches!(result, Err(AppError::Provider(_))));
     }
 
-    #[test]
-    fn metrics_are_labeled_by_provider_and_only_recorded_on_success() {
+    #[tokio::test]
+    async fn metrics_are_labeled_by_provider_and_only_recorded_on_success() {
         let state = state_with(MockStore::empty());
         let openai_provider = MockProvider { response: vec![vec![1.0]] };
         let texts = vec!["text".to_string()];
@@ -466,6 +505,7 @@ mod tests {
                 texts: &texts,
             },
         )
+        .await
         .unwrap();
 
         let mistral_texts = vec!["other text".to_string()];
@@ -480,7 +520,8 @@ mod tests {
                 model: "m",
                 texts: &mistral_texts,
             },
-        );
+        )
+        .await;
 
         let metrics_text = state.metrics.encode();
         assert!(metrics_text.contains("zerocache_cache_misses_total{provider=\"openai\"} 1"));
@@ -488,5 +529,65 @@ mod tests {
             !metrics_text.contains("zerocache_cache_misses_total{provider=\"mistral\"}"),
             "a failed request must not record any metric for that provider"
         );
+    }
+
+    #[tokio::test]
+    async fn different_provider_versions_produce_different_cache_entries() {
+        struct VersionedProvider {
+            version: &'static str,
+            response: Vec<Vec<f32>>,
+        }
+
+        #[async_trait::async_trait]
+        impl EmbeddingProvider for VersionedProvider {
+            async fn embed_batch(
+                &self,
+                _api_key: &str,
+                _model: &str,
+                texts: &[String],
+            ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
+                assert_eq!(texts.len(), self.response.len());
+                Ok((self.response.clone(), ProviderUsage::default()))
+            }
+
+            fn version(&self) -> &'static str {
+                self.version
+            }
+        }
+
+        let state = state_with(MockStore::empty());
+        let texts = vec!["same text".to_string()];
+
+        let v1 = VersionedProvider { version: "1.0.0", response: vec![vec![1.0]] };
+        let (_, stats_v1) = embed_batch(
+            &state,
+            EmbedRequest {
+                provider: &v1,
+                provider_name: "openai",
+                api_key: "key",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &texts,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats_v1.misses, 1);
+
+        let v2 = VersionedProvider { version: "2.0.0", response: vec![vec![2.0]] };
+        let (_, stats_v2) = embed_batch(
+            &state,
+            EmbedRequest {
+                provider: &v2,
+                provider_name: "openai",
+                api_key: "key",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &texts,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats_v2.misses, 1, "a different adapter version must not hit the old version's cache entry");
     }
 }

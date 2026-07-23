@@ -24,12 +24,8 @@ use zerocache_adapters_sled::SledStore;
 use zerocache_core::derive_owner_id;
 use zerocache_ports::{EmbeddingProvider, EmbeddingStore};
 
-// Not `#[tokio::main]`: adapters build a `reqwest::blocking::Client`, which
-// constructs its own internal Tokio runtime at creation time. Building (or
-// later dropping) that internal runtime while already inside another
-// runtime's context panics — so adapters must be constructed before any
-// Tokio runtime exists, and the runtime entered explicitly afterward.
-fn main() {
+#[tokio::main]
+async fn main() {
     let config = Config::from_env();
 
     let store: Arc<dyn EmbeddingStore> = match config.storage_backend {
@@ -54,23 +50,19 @@ fn main() {
     let state = Arc::new(AppState {
         store,
         providers,
-        model_version: "v1".to_string(),
         metrics: Metrics::new(),
     });
 
-    let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-    runtime.block_on(async move {
-        let app = Router::new()
-            .route("/:provider/v1/embeddings", post(embeddings_handler))
-            .route("/metrics", get(metrics_handler))
-            .with_state(state);
+    let app = Router::new()
+        .route("/:provider/v1/embeddings", post(embeddings_handler))
+        .route("/metrics", get(metrics_handler))
+        .with_state(state);
 
-        let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
-            .await
-            .expect("failed to bind port");
-        println!("zerocache-http listening on 0.0.0.0:{port}");
-        axum::serve(listener, app).await.expect("server error");
-    });
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+        .await
+        .expect("failed to bind port");
+    println!("zerocache-http listening on 0.0.0.0:{port}");
+    axum::serve(listener, app).await.expect("server error");
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -103,22 +95,17 @@ async fn embeddings_handler(
     let owner_id = derive_owner_id(&api_key);
     let model = request.model;
     let texts = request.input;
-    let model_for_task = model.clone();
-    let provider_name_for_task = provider_name.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
-        let embed_request = EmbedRequest {
-            provider: provider.as_ref(),
-            provider_name: &provider_name_for_task,
-            api_key: &api_key,
-            owner_id,
-            model: &model_for_task,
-            texts: &texts,
-        };
-        embed_batch(&state, embed_request)
-    })
-    .await
-    .expect("embed_batch task panicked");
+    let embed_request = EmbedRequest {
+        provider: provider.as_ref(),
+        provider_name: &provider_name,
+        api_key: &api_key,
+        owner_id,
+        model: &model,
+        texts: &texts,
+    };
+
+    let result = embed_batch(&state, embed_request).await;
 
     let (vectors, stats) = result.map_err(|err| {
         let status = match &err {
