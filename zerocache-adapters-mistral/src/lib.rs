@@ -1,15 +1,20 @@
 use serde::{Deserialize, Serialize};
 use zerocache_ports::{EmbeddingProvider, ProviderError, ProviderUsage};
 
+// See zerocache-adapters-openai for why this is a single conservative
+// constant shared uniformly across adapters rather than a tuned per-provider
+// limit.
+const MAX_BATCH_SIZE: usize = 100;
+
 pub struct MistralProvider {
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
     base_url: String,
 }
 
 impl MistralProvider {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::Client::new(),
             base_url: base_url.into(),
         }
     }
@@ -39,38 +44,49 @@ struct UsageResponse {
     total_tokens: u32,
 }
 
+#[async_trait::async_trait]
 impl EmbeddingProvider for MistralProvider {
-    fn embed_batch(
+    async fn embed_batch(
         &self,
         api_key: &str,
         model: &str,
         texts: &[String],
     ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
-        let body = EmbeddingsRequest { model, input: texts };
-
-        let response = self
-            .client
-            .post(format!("{}/v1/embeddings", self.base_url))
-            .bearer_auth(api_key)
-            .json(&body)
-            .send()
-            .map_err(|e| ProviderError(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| ProviderError(e.to_string()))?
-            .json::<EmbeddingsResponse>()
-            .map_err(|e| ProviderError(e.to_string()))?;
-
         let mut ordered = vec![Vec::new(); texts.len()];
-        for item in response.data {
-            ordered[item.index] = item.embedding;
+        let mut prompt_tokens = 0;
+        let mut total_tokens = 0;
+
+        for (chunk_index, chunk) in texts.chunks(MAX_BATCH_SIZE).enumerate() {
+            let base_index = chunk_index * MAX_BATCH_SIZE;
+            let body = EmbeddingsRequest { model, input: chunk };
+
+            let response = self
+                .client
+                .post(format!("{}/v1/embeddings", self.base_url))
+                .bearer_auth(api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ProviderError(e.to_string()))?
+                .error_for_status()
+                .map_err(|e| ProviderError(e.to_string()))?
+                .json::<EmbeddingsResponse>()
+                .await
+                .map_err(|e| ProviderError(e.to_string()))?;
+
+            for item in response.data {
+                ordered[base_index + item.index] = item.embedding;
+            }
+            prompt_tokens += response.usage.prompt_tokens;
+            total_tokens += response.usage.total_tokens;
         }
 
-        let usage = ProviderUsage {
-            prompt_tokens: response.usage.prompt_tokens,
-            total_tokens: response.usage.total_tokens,
-        };
-
+        let usage = ProviderUsage { prompt_tokens, total_tokens };
         Ok((ordered, usage))
+    }
+
+    fn version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
     }
 }
 
@@ -81,62 +97,122 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn embed_batch_reorders_response_by_index_and_returns_usage() {
-        let server = MockServer::start();
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/embeddings")
-                .header("authorization", "Bearer test-key")
-                .json_body(json!({ "model": "mistral-embed", "input": ["a", "b"] }));
-            then.status(200).json_body(json!({
-                "id": "embd-123",
-                "object": "list",
-                "model": "mistral-embed",
-                "data": [
-                    { "object": "embedding", "embedding": [2.0], "index": 1 },
-                    { "object": "embedding", "embedding": [1.0], "index": 0 }
-                ],
-                "usage": { "prompt_tokens": 5, "total_tokens": 5 }
-            }));
-        });
+    #[tokio::test]
+    async fn embed_batch_reorders_response_by_index_and_returns_usage() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1/embeddings")
+                    .header("authorization", "Bearer test-key")
+                    .json_body(json!({ "model": "mistral-embed", "input": ["a", "b"] }));
+                then.status(200).json_body(json!({
+                    "id": "embd-123",
+                    "object": "list",
+                    "model": "mistral-embed",
+                    "data": [
+                        { "object": "embedding", "embedding": [2.0], "index": 1 },
+                        { "object": "embedding", "embedding": [1.0], "index": 0 }
+                    ],
+                    "usage": { "prompt_tokens": 5, "total_tokens": 5 }
+                }));
+            })
+            .await;
 
         let provider = MistralProvider::new(server.base_url());
         let (vectors, usage) = provider
             .embed_batch("test-key", "mistral-embed", &["a".to_string(), "b".to_string()])
+            .await
             .unwrap();
 
-        mock.assert();
+        mock.assert_async().await;
         assert_eq!(vectors, vec![vec![1.0], vec![2.0]]);
         assert_eq!(usage.prompt_tokens, 5);
         assert_eq!(usage.total_tokens, 5);
     }
 
-    #[test]
-    fn embed_batch_returns_error_on_http_error_status() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(POST).path("/v1/embeddings");
-            then.status(401).json_body(json!({ "message": "Unauthorized" }));
-        });
+    #[tokio::test]
+    async fn embed_batch_returns_error_on_http_error_status() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/embeddings");
+                then.status(401).json_body(json!({ "message": "Unauthorized" }));
+            })
+            .await;
 
         let provider = MistralProvider::new(server.base_url());
-        let result = provider.embed_batch("bad-key", "mistral-embed", &["x".to_string()]);
+        let result = provider.embed_batch("bad-key", "mistral-embed", &["x".to_string()]).await;
 
         assert!(result.is_err());
     }
 
-    #[test]
-    fn embed_batch_returns_error_on_malformed_response_body() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(POST).path("/v1/embeddings");
-            then.status(200).body("not json");
-        });
+    #[tokio::test]
+    async fn embed_batch_returns_error_on_malformed_response_body() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/embeddings");
+                then.status(200).body("not json");
+            })
+            .await;
 
         let provider = MistralProvider::new(server.base_url());
-        let result = provider.embed_batch("test-key", "mistral-embed", &["x".to_string()]);
+        let result = provider.embed_batch("test-key", "mistral-embed", &["x".to_string()]).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn embed_batch_splits_large_input_into_chunks_and_reassembles_in_order() {
+        let server = MockServer::start_async().await;
+
+        let first_chunk = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1/embeddings")
+                    .matches(|req| {
+                        let body: serde_json::Value =
+                            serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
+                        body["input"].as_array().map(|a| a.len()) == Some(100)
+                    });
+                then.status(200).json_body_obj(&json!({
+                    "id": "embd-1", "object": "list", "model": "mistral-embed",
+                    "data": (0..100).map(|i| json!({ "object": "embedding", "embedding": [i as f64], "index": i })).collect::<Vec<_>>(),
+                    "usage": { "prompt_tokens": 100, "total_tokens": 100 }
+                }));
+            })
+            .await;
+        let second_chunk = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1/embeddings")
+                    .matches(|req| {
+                        let body: serde_json::Value =
+                            serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
+                        body["input"].as_array().map(|a| a.len()) == Some(50)
+                    });
+                then.status(200).json_body_obj(&json!({
+                    "id": "embd-2", "object": "list", "model": "mistral-embed",
+                    "data": (0..50).map(|i| json!({ "object": "embedding", "embedding": [1000.0 + i as f64], "index": i })).collect::<Vec<_>>(),
+                    "usage": { "prompt_tokens": 50, "total_tokens": 50 }
+                }));
+            })
+            .await;
+
+        let texts: Vec<String> = (0..150).map(|i| format!("text-{i}")).collect();
+        let provider = MistralProvider::new(server.base_url());
+        let (vectors, usage) = provider
+            .embed_batch("test-key", "mistral-embed", &texts)
+            .await
+            .unwrap();
+
+        first_chunk.assert_async().await;
+        second_chunk.assert_async().await;
+        assert_eq!(vectors.len(), 150);
+        assert_eq!(vectors[0], vec![0.0]);
+        assert_eq!(vectors[149], vec![1049.0]);
+        assert_eq!(usage.prompt_tokens, 150);
+        assert_eq!(usage.total_tokens, 150);
     }
 }

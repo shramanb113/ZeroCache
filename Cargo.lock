@@ -2618,10 +2618,12 @@ dependencies = [
 name = "zerocache-adapters-mistral"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "httpmock",
  "reqwest",
  "serde",
  "serde_json",
+ "tokio",
  "zerocache-ports",
 ]
 
