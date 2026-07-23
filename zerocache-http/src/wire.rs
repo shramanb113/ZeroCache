@@ -25,3 +25,8 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub total_tokens: u32,
 }
+
+#[derive(Serialize)]
+pub struct ErrorResponse {
+    pub error: String,
+}

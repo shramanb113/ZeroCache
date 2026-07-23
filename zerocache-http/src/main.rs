@@ -4,11 +4,11 @@ mod wire;
 
 use std::sync::Arc;
 
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 
-use app::{embed_batch, AppState};
+use app::{embed_batch, AppError, AppState};
 use config::Config;
-use wire::{EmbeddingObject, EmbeddingsRequest, EmbeddingsResponse, Usage};
+use wire::{EmbeddingObject, EmbeddingsRequest, EmbeddingsResponse, ErrorResponse, Usage};
 use zerocache_adapters_openai::OpenAiProvider;
 use zerocache_adapters_sled::SledStore;
 
@@ -38,14 +38,22 @@ async fn main() {
 async fn embeddings_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<EmbeddingsRequest>,
-) -> Json<EmbeddingsResponse> {
+) -> Result<Json<EmbeddingsResponse>, (StatusCode, Json<ErrorResponse>)> {
     let model = request.model;
     let texts = request.input;
     let model_for_provider = model.clone();
 
     let vectors = tokio::task::spawn_blocking(move || embed_batch(&state, &model_for_provider, &texts))
         .await
-        .expect("embed_batch panicked");
+        .expect("embed_batch task panicked");
+
+    let vectors = vectors.map_err(|err| {
+        let status = match &err {
+            AppError::Provider(_) => StatusCode::BAD_GATEWAY,
+            AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, Json(ErrorResponse { error: err.to_string() }))
+    })?;
 
     let data = vectors
         .into_iter()
@@ -53,10 +61,10 @@ async fn embeddings_handler(
         .map(|(index, embedding)| EmbeddingObject { embedding, index })
         .collect();
 
-    Json(EmbeddingsResponse {
+    Ok(Json(EmbeddingsResponse {
         object: "list",
         data,
         model,
         usage: Usage { prompt_tokens: 0, total_tokens: 0 },
-    })
+    }))
 }

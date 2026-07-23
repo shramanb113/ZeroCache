@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use zerocache_ports::EmbeddingProvider;
+use zerocache_ports::{EmbeddingProvider, ProviderError};
 
 pub struct OpenAiProvider {
     client: reqwest::blocking::Client,
@@ -35,7 +35,7 @@ struct EmbeddingData {
 }
 
 impl EmbeddingProvider for OpenAiProvider {
-    fn embed_batch(&self, model: &str, texts: &[String]) -> Vec<Vec<f32>> {
+    fn embed_batch(&self, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, ProviderError> {
         let body = EmbeddingsRequest { model, input: texts };
 
         let response = self
@@ -44,16 +44,16 @@ impl EmbeddingProvider for OpenAiProvider {
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
-            .expect("embedding provider request failed")
+            .map_err(|e| ProviderError(e.to_string()))?
             .error_for_status()
-            .expect("embedding provider returned an error status")
+            .map_err(|e| ProviderError(e.to_string()))?
             .json::<EmbeddingsResponse>()
-            .expect("embedding provider response did not match the expected shape");
+            .map_err(|e| ProviderError(e.to_string()))?;
 
         let mut ordered = vec![Vec::new(); texts.len()];
         for item in response.data {
             ordered[item.index] = item.embedding;
         }
-        ordered
+        Ok(ordered)
     }
 }
