@@ -134,7 +134,7 @@ Responses also carry `X-Zerocache-Hits` / `X-Zerocache-Misses` headers; `usage` 
 
 1. **Core**: unit tests, no I/O — key derivation and reconciliation verified in isolation first. Done (`zerocache-core`, 6 tests).
 2. **Application**: tested against mock `EmbeddingStore`/`EmbeddingProvider` — verifies orchestration without real network/disk. Done (`zerocache-http/src/app.rs` `#[cfg(test)]` module, 6 tests: hit/miss splitting, ordering, store/provider failure propagation, metrics-only-recorded-on-success).
-3. **Adapters**: integration tests against real sled and a stubbed provider. Partial — one `sled` roundtrip test exists; no automated test against a real/stubbed OpenAI endpoint yet (verified manually via the local smoke test instead, see below).
+3. **Adapters**: integration tests against real sled and a stubbed provider. Done — `sled` roundtrip test, plus 3 `httpmock`-stubbed `zerocache-adapters-openai` tests (response reordered by index, HTTP error status, malformed body). No test against real Redis (would need a running instance); real-provider behavior additionally verified manually via the local smoke test.
 4. **End-to-end, consumer 1**: real batch run through Argus (TS/Mastra) — produces Phase 1 hit-rate/cost numbers. **Not started** — Argus is a separate, large project; wiring it up is out of scope until Argus itself is ready. A manual local smoke test (real OpenAI key, miss then repeat-hit) substituted for this on 2026-07-23 and caught a real startup panic, fixed in commit `714944b`.
 5. **End-to-end, consumer 2**: real batch run through a second, Python-based ingestion script (LangChain/LlamaIndex) — this is the test that actually validates the neutrality claim, not #4. Not started, blocked on #4.
 

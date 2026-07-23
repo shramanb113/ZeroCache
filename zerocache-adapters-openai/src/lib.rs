@@ -74,3 +74,71 @@ impl EmbeddingProvider for OpenAiProvider {
         Ok((ordered, usage))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use httpmock::prelude::*;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn embed_batch_reorders_response_by_index_and_returns_usage() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/embeddings")
+                .header("authorization", "Bearer test-key")
+                .json_body(json!({ "model": "text-embedding-3-small", "input": ["a", "b"] }));
+            then.status(200).json_body(json!({
+                "object": "list",
+                "model": "text-embedding-3-small",
+                // returned out of order on purpose, to prove the adapter
+                // reorders by `index` rather than trusting array order
+                "data": [
+                    { "embedding": [2.0], "index": 1 },
+                    { "embedding": [1.0], "index": 0 }
+                ],
+                "usage": { "prompt_tokens": 5, "total_tokens": 5 }
+            }));
+        });
+
+        let provider = OpenAiProvider::new(server.base_url(), "test-key");
+        let (vectors, usage) = provider
+            .embed_batch("text-embedding-3-small", &["a".to_string(), "b".to_string()])
+            .unwrap();
+
+        mock.assert();
+        assert_eq!(vectors, vec![vec![1.0], vec![2.0]]);
+        assert_eq!(usage.prompt_tokens, 5);
+        assert_eq!(usage.total_tokens, 5);
+    }
+
+    #[test]
+    fn embed_batch_returns_error_on_http_error_status() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/embeddings");
+            then.status(401).json_body(json!({ "error": "invalid api key" }));
+        });
+
+        let provider = OpenAiProvider::new(server.base_url(), "bad-key");
+        let result = provider.embed_batch("m", &["x".to_string()]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn embed_batch_returns_error_on_malformed_response_body() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/embeddings");
+            then.status(200).body("not json");
+        });
+
+        let provider = OpenAiProvider::new(server.base_url(), "test-key");
+        let result = provider.embed_batch("m", &["x".to_string()]);
+
+        assert!(result.is_err());
+    }
+}
