@@ -2604,6 +2604,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "zerocache-adapters-gemini"
+version = "0.1.0"
+dependencies = [
+ "httpmock",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "zerocache-ports",
+]
+
+[[package]]
+name = "zerocache-adapters-mistral"
+version = "0.1.0"
+dependencies = [
+ "httpmock",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "zerocache-ports",
+]
+
+[[package]]
 name = "zerocache-adapters-openai"
 version = "0.1.0"
 dependencies = [
