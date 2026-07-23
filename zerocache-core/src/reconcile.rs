@@ -31,10 +31,12 @@ pub fn reconcile<E>(
 mod tests {
     use super::*;
 
+    const OWNER: [u8; 32] = [1u8; 32];
+
     #[test]
     fn splits_hits_and_misses_preserving_index() {
-        let hit_key = CacheKey::derive("m", "v1", "cached");
-        let miss_key = CacheKey::derive("m", "v1", "not cached");
+        let hit_key = CacheKey::derive(OWNER, "openai", "m", "v1", "cached");
+        let miss_key = CacheKey::derive(OWNER, "openai", "m", "v1", "not cached");
         let keys = [miss_key, hit_key, miss_key];
 
         let result = reconcile(&keys, |k| {
@@ -51,7 +53,10 @@ mod tests {
 
     #[test]
     fn all_miss_when_store_is_empty() {
-        let keys = [CacheKey::derive("m", "v1", "a"), CacheKey::derive("m", "v1", "b")];
+        let keys = [
+            CacheKey::derive(OWNER, "openai", "m", "v1", "a"),
+            CacheKey::derive(OWNER, "openai", "m", "v1", "b"),
+        ];
         let result = reconcile(&keys, |_| Ok::<_, std::convert::Infallible>(None)).unwrap();
         assert_eq!(result.hits.len(), 0);
         assert_eq!(result.misses.len(), 2);
@@ -59,7 +64,7 @@ mod tests {
 
     #[test]
     fn aborts_and_propagates_on_lookup_error() {
-        let keys = [CacheKey::derive("m", "v1", "a")];
+        let keys = [CacheKey::derive(OWNER, "openai", "m", "v1", "a")];
         let result = reconcile(&keys, |_| Err("store unavailable"));
         assert_eq!(result.err(), Some("store unavailable"));
     }
