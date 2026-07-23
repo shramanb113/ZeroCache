@@ -33,6 +33,7 @@ pub struct ProviderUsage {
 pub trait EmbeddingStore: Send + Sync {
     fn get(&self, key: &CacheKey) -> Result<Option<Vec<f32>>, StoreError>;
     fn put(&self, key: CacheKey, vector: Vec<f32>) -> Result<(), StoreError>;
+    fn delete(&self, key: &CacheKey) -> Result<(), StoreError>;
 }
 
 #[async_trait::async_trait]
