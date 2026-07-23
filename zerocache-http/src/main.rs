@@ -13,9 +13,9 @@ use axum::{
     Json, Router,
 };
 
-use app::{embed_batch, AppError, AppState, EmbedRequest, Metrics};
+use app::{delete_batch, embed_batch, AppError, AppState, DeleteRequest, EmbedRequest, Metrics};
 use config::{Config, StorageBackend};
-use wire::{EmbeddingObject, EmbeddingsRequest, EmbeddingsResponse, ErrorResponse, Usage};
+use wire::{DeleteResponse, EmbeddingObject, EmbeddingsRequest, EmbeddingsResponse, ErrorResponse, Usage};
 use zerocache_adapters_gemini::GeminiProvider;
 use zerocache_adapters_mistral::MistralProvider;
 use zerocache_adapters_openai::OpenAiProvider;
@@ -30,10 +30,10 @@ async fn main() {
 
     let store: Arc<dyn EmbeddingStore> = match config.storage_backend {
         StorageBackend::Sled => {
-            Arc::new(SledStore::open(&config.storage_path).expect("failed to open sled store"))
+            Arc::new(SledStore::open(&config.storage_path, config.ttl).expect("failed to open sled store"))
         }
         StorageBackend::Redis => {
-            Arc::new(RedisStore::connect(&config.redis_url).expect("failed to connect to redis"))
+            Arc::new(RedisStore::connect(&config.redis_url, config.ttl).expect("failed to connect to redis"))
         }
     };
 
@@ -54,7 +54,10 @@ async fn main() {
     });
 
     let app = Router::new()
-        .route("/:provider/v1/embeddings", post(embeddings_handler))
+        .route(
+            "/:provider/v1/embeddings",
+            post(embeddings_handler).delete(delete_handler),
+        )
         .route("/metrics", get(metrics_handler))
         .with_state(state);
 
@@ -143,6 +146,51 @@ async fn embeddings_handler(
     );
 
     Ok(response)
+}
+
+async fn delete_handler(
+    State(state): State<Arc<AppState>>,
+    Path(provider_name): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<EmbeddingsRequest>,
+) -> Result<Json<DeleteResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let api_key = extract_bearer_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "missing or malformed Authorization header (expected 'Bearer <key>')".to_string(),
+            }),
+        )
+    })?;
+
+    let provider = state.providers.get(&provider_name).cloned().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse { error: format!("unknown provider '{provider_name}'") }),
+        )
+    })?;
+
+    let owner_id = derive_owner_id(&api_key);
+    let model = request.model;
+    let texts = request.input;
+
+    let delete_request = DeleteRequest {
+        provider: provider.as_ref(),
+        provider_name: &provider_name,
+        owner_id,
+        model: &model,
+        texts: &texts,
+    };
+
+    let deleted = delete_batch(&state, delete_request).await.map_err(|err| {
+        let status = match &err {
+            AppError::Provider(_) => StatusCode::BAD_GATEWAY,
+            AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, Json(ErrorResponse { error: err.to_string() }))
+    })?;
+
+    Ok(Json(DeleteResponse { deleted }))
 }
 
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {

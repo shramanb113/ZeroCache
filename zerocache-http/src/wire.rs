@@ -30,3 +30,8 @@ pub struct Usage {
 pub struct ErrorResponse {
     pub error: String,
 }
+
+#[derive(Serialize)]
+pub struct DeleteResponse {
+    pub deleted: usize,
+}

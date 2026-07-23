@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use prometheus::{Encoder, IntCounterVec, Opts, Registry, TextEncoder};
 
-use zerocache_core::{reconcile, CacheKey};
+use zerocache_core::{normalize_text, reconcile, CacheKey};
 use zerocache_ports::{EmbeddingProvider, EmbeddingStore, ProviderError, StoreError};
 
 pub struct AppState {
@@ -130,6 +130,13 @@ pub struct EmbedRequest<'a> {
 /// only the misses from `request.provider`, write them back, and return
 /// vectors in the same order as `request.texts`.
 ///
+/// Text is normalized (trimmed, internal whitespace collapsed) before both
+/// hashing and being sent to the provider — applying it in only one place
+/// would let the cache key and what's actually embedded silently diverge.
+/// Misses that normalize to an identical string are deduplicated: the
+/// provider is called once per unique text, not once per original index, and
+/// the same fetched vector is broadcast back to every matching position.
+///
 /// Store reads and store writes each run inside their own
 /// `tokio::task::spawn_blocking`, since `sled`/`redis` are synchronous. The
 /// provider call in between is awaited directly — it's async now, not
@@ -141,8 +148,8 @@ pub struct EmbedRequest<'a> {
 /// to surface it as an error response.
 pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<(Vec<Vec<f32>>, BatchStats), AppError> {
     let provider_version = request.provider.version();
-    let keys: Vec<CacheKey> = request
-        .texts
+    let normalized_texts: Vec<String> = request.texts.iter().map(|text| normalize_text(text)).collect();
+    let keys: Vec<CacheKey> = normalized_texts
         .iter()
         .map(|text| CacheKey::derive(request.owner_id, request.provider_name, request.model, provider_version, text))
         .collect();
@@ -169,24 +176,38 @@ pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<
     let mut provider_total_tokens = 0;
 
     if !reconciled.misses.is_empty() {
-        let miss_texts: Vec<String> = reconciled
-            .misses
-            .iter()
-            .map(|(index, _)| request.texts[*index].clone())
-            .collect();
+        // Dedupe misses by CacheKey: several original indices can normalize
+        // to the identical text (or already be literal duplicates in the
+        // input), and each such group shares one CacheKey. Fetch each
+        // unique text once, then broadcast its vector to every index that
+        // shares its key.
+        let mut unique_miss_texts: Vec<String> = Vec::new();
+        let mut key_to_unique_index: HashMap<CacheKey, usize> = HashMap::new();
+        let mut index_to_unique_index: Vec<(usize, usize)> = Vec::with_capacity(reconciled.misses.len());
+
+        for (index, key) in &reconciled.misses {
+            let unique_index = *key_to_unique_index.entry(*key).or_insert_with(|| {
+                unique_miss_texts.push(normalized_texts[*index].clone());
+                unique_miss_texts.len() - 1
+            });
+            index_to_unique_index.push((*index, unique_index));
+        }
 
         let (fetched, usage) = request
             .provider
-            .embed_batch(request.api_key, request.model, &miss_texts)
+            .embed_batch(request.api_key, request.model, &unique_miss_texts)
             .await
             .map_err(AppError::Provider)?;
         provider_prompt_tokens = usage.prompt_tokens;
         provider_total_tokens = usage.total_tokens;
 
-        let mut writes = Vec::with_capacity(reconciled.misses.len());
-        for ((index, key), vector) in reconciled.misses.into_iter().zip(fetched.into_iter()) {
-            results[index] = Some(vector.clone());
-            writes.push((key, vector));
+        for (index, unique_index) in &index_to_unique_index {
+            results[*index] = Some(fetched[*unique_index].clone());
+        }
+
+        let mut writes = Vec::with_capacity(key_to_unique_index.len());
+        for (key, unique_index) in key_to_unique_index {
+            writes.push((key, fetched[unique_index].clone()));
         }
 
         let store = Arc::clone(&state.store);
@@ -209,6 +230,46 @@ pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<
     state.metrics.record(request.provider_name, &stats);
 
     Ok((vectors, stats))
+}
+
+/// Everything one `DELETE /{provider}/v1/embeddings` call needs: which
+/// entries to remove, scoped to the caller's own namespace via `owner_id`
+/// exactly like a normal read/write request — a caller can only ever delete
+/// entries in their own namespace, never anyone else's. `provider` is only
+/// used for its `version()`, to compute the same keys a matching `POST`
+/// would have used; no provider call is ever made for a delete.
+pub struct DeleteRequest<'a> {
+    pub provider: &'a dyn EmbeddingProvider,
+    pub provider_name: &'a str,
+    pub owner_id: [u8; 32],
+    pub model: &'a str,
+    pub texts: &'a [String],
+}
+
+/// Deletes the cache entries that a matching `POST` with the same
+/// provider/model/texts (and the same caller) would have hit. Returns the
+/// number of keys the delete was attempted for -- deletion is idempotent, so
+/// this is not "how many existed," just "how many were requested."
+pub async fn delete_batch(state: &AppState, request: DeleteRequest<'_>) -> Result<usize, AppError> {
+    let provider_version = request.provider.version();
+    let keys: Vec<CacheKey> = request
+        .texts
+        .iter()
+        .map(|text| CacheKey::derive(request.owner_id, request.provider_name, request.model, provider_version, &normalize_text(text)))
+        .collect();
+
+    let count = keys.len();
+    let store = Arc::clone(&state.store);
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        for key in keys {
+            store.delete(&key).map_err(AppError::Store)?;
+        }
+        Ok(())
+    })
+    .await
+    .expect("store delete task panicked")?;
+
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -243,6 +304,11 @@ mod tests {
             self.data.lock().unwrap().insert(key, vector);
             Ok(())
         }
+
+        fn delete(&self, key: &CacheKey) -> Result<(), StoreError> {
+            self.data.lock().unwrap().remove(key);
+            Ok(())
+        }
     }
 
     struct FailingStore;
@@ -253,6 +319,10 @@ mod tests {
         }
 
         fn put(&self, _key: CacheKey, _vector: Vec<f32>) -> Result<(), StoreError> {
+            Err(StoreError("mock store failure".into()))
+        }
+
+        fn delete(&self, _key: &CacheKey) -> Result<(), StoreError> {
             Err(StoreError("mock store failure".into()))
         }
     }
@@ -589,5 +659,155 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stats_v2.misses, 1, "a different adapter version must not hit the old version's cache entry");
+    }
+
+    #[tokio::test]
+    async fn duplicate_texts_in_one_batch_call_provider_only_once() {
+        struct CountingProvider {
+            call_count: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl EmbeddingProvider for CountingProvider {
+            async fn embed_batch(
+                &self,
+                _api_key: &str,
+                _model: &str,
+                texts: &[String],
+            ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
+                self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(texts.len(), 1, "duplicate texts in the batch must be deduplicated before calling the provider");
+                Ok((vec![vec![42.0]], ProviderUsage::default()))
+            }
+
+            fn version(&self) -> &'static str {
+                "mock-v1"
+            }
+        }
+
+        let state = state_with(MockStore::empty());
+        let provider = CountingProvider { call_count: std::sync::atomic::AtomicUsize::new(0) };
+        // Same text three times in one batch.
+        let texts = vec!["same text".to_string(), "same text".to_string(), "same text".to_string()];
+
+        let (vectors, stats) = embed_batch(
+            &state,
+            EmbedRequest {
+                provider: &provider,
+                provider_name: "openai",
+                api_key: "key",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &texts,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(provider.call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(vectors, vec![vec![42.0], vec![42.0], vec![42.0]], "the same vector must be broadcast to every duplicate position");
+        assert_eq!(stats.misses, 3, "hit/miss accounting still reflects all three original positions");
+    }
+
+    #[tokio::test]
+    async fn whitespace_variants_of_the_same_text_share_a_cache_entry() {
+        let state = state_with(MockStore::empty());
+        let provider = MockProvider { response: vec![vec![1.0]] };
+        let texts = vec!["  hello   world  ".to_string()];
+
+        embed_batch(
+            &state,
+            EmbedRequest {
+                provider: &provider,
+                provider_name: "openai",
+                api_key: "key",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &texts,
+            },
+        )
+        .await
+        .unwrap();
+
+        // A second request with different incidental whitespace, but the
+        // same normalized content, must hit the entry the first request
+        // wrote -- proving the store key was derived from normalized text.
+        let panic_provider = PanicProvider;
+        let differently_spaced_texts = vec!["hello world".to_string()];
+        let (vectors, stats) = embed_batch(
+            &state,
+            EmbedRequest {
+                provider: &panic_provider,
+                provider_name: "openai",
+                api_key: "key",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &differently_spaced_texts,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.hits, 1);
+        assert_eq!(vectors, vec![vec![1.0]]);
+    }
+
+    #[tokio::test]
+    async fn delete_batch_removes_entries_so_a_later_request_misses_again() {
+        let key = CacheKey::derive(OWNER_A, "openai", "m", "mock-v1", "to be forgotten");
+        let state = state_with(MockStore::with(vec![(key, vec![9.0]) ]));
+        let provider = MockProvider { response: vec![vec![1.0]] };
+        let texts = vec!["to be forgotten".to_string()];
+
+        let deleted = delete_batch(
+            &state,
+            DeleteRequest {
+                provider: &provider,
+                provider_name: "openai",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &texts,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleted, 1);
+
+        let (_, stats) = embed_batch(
+            &state,
+            EmbedRequest {
+                provider: &provider,
+                provider_name: "openai",
+                api_key: "key",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &texts,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.hits, 0, "a deleted entry must be a miss again, not still cached");
+        assert_eq!(stats.misses, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_batch_failure_surfaces_as_app_error() {
+        let state = state_with(FailingStore);
+        let provider = PanicProvider;
+        let texts = vec!["text".to_string()];
+
+        let result = delete_batch(
+            &state,
+            DeleteRequest {
+                provider: &provider,
+                provider_name: "openai",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &texts,
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::Store(_))));
     }
 }

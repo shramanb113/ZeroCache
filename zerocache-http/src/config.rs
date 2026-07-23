@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 pub enum StorageBackend {
     // Embedded, single-process. Fine for local dev or a single-replica
     // deployment; cannot be shared across multiple Kubernetes pods.
@@ -12,6 +14,7 @@ pub struct Config {
     pub storage_backend: StorageBackend,
     pub storage_path: String,
     pub redis_url: String,
+    pub ttl: Option<Duration>,
 }
 
 impl Config {
@@ -28,6 +31,10 @@ impl Config {
             storage_path: std::env::var("ZEROCACHE_STORAGE_PATH").unwrap_or_else(|_| "./data".into()),
             redis_url: std::env::var("ZEROCACHE_REDIS_URL")
                 .unwrap_or_else(|_| "redis://127.0.0.1:6379".into()),
+            ttl: std::env::var("ZEROCACHE_TTL_SECONDS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_secs),
         }
     }
 }
