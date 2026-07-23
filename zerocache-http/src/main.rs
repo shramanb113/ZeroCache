@@ -4,7 +4,13 @@ mod wire;
 
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
+};
 
 use app::{embed_batch, AppError, AppState};
 use config::{Config, StorageBackend};
@@ -41,22 +47,23 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port))
         .await
         .expect("failed to bind port");
+    println!("zerocache-http listening on 0.0.0.0:{}", config.port);
     axum::serve(listener, app).await.expect("server error");
 }
 
 async fn embeddings_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<EmbeddingsRequest>,
-) -> Result<Json<EmbeddingsResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let model = request.model;
     let texts = request.input;
     let model_for_provider = model.clone();
 
-    let vectors = tokio::task::spawn_blocking(move || embed_batch(&state, &model_for_provider, &texts))
+    let result = tokio::task::spawn_blocking(move || embed_batch(&state, &model_for_provider, &texts))
         .await
         .expect("embed_batch task panicked");
 
-    let vectors = vectors.map_err(|err| {
+    let (vectors, stats) = result.map_err(|err| {
         let status = match &err {
             AppError::Provider(_) => StatusCode::BAD_GATEWAY,
             AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -70,10 +77,23 @@ async fn embeddings_handler(
         .map(|(index, embedding)| EmbeddingObject { embedding, index })
         .collect();
 
-    Ok(Json(EmbeddingsResponse {
+    let mut response = Json(EmbeddingsResponse {
         object: "list",
         data,
         model,
         usage: Usage { prompt_tokens: 0, total_tokens: 0 },
-    }))
+    })
+    .into_response();
+
+    let headers = response.headers_mut();
+    headers.insert(
+        "x-zerocache-hits",
+        stats.hits.to_string().parse().expect("digit string is a valid header value"),
+    );
+    headers.insert(
+        "x-zerocache-misses",
+        stats.misses.to_string().parse().expect("digit string is a valid header value"),
+    );
+
+    Ok(response)
 }

@@ -29,6 +29,11 @@ impl fmt::Display for AppError {
 
 impl std::error::Error for AppError {}
 
+pub struct BatchStats {
+    pub hits: usize,
+    pub misses: usize,
+}
+
 /// Runs the cache flow for one batch: reconcile against the store, fetch only
 /// the misses from the provider, write them back, and return vectors in the
 /// same order as `texts`. Store/provider calls are blocking, so callers on
@@ -37,13 +42,21 @@ impl std::error::Error for AppError {}
 /// A store or provider failure aborts the whole batch rather than degrading
 /// silently into an extra miss or a dropped write — the caller is expected
 /// to surface it as an error response.
-pub fn embed_batch(state: &AppState, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, AppError> {
+pub fn embed_batch(
+    state: &AppState,
+    model: &str,
+    texts: &[String],
+) -> Result<(Vec<Vec<f32>>, BatchStats), AppError> {
     let keys: Vec<CacheKey> = texts
         .iter()
         .map(|text| CacheKey::derive(model, &state.model_version, text))
         .collect();
 
     let reconciled = reconcile(&keys, |key| state.store.get(key).map_err(AppError::Store))?;
+    let stats = BatchStats {
+        hits: reconciled.hits.len(),
+        misses: reconciled.misses.len(),
+    };
 
     let mut results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
     for (index, vector) in reconciled.hits {
@@ -67,8 +80,10 @@ pub fn embed_batch(state: &AppState, model: &str, texts: &[String]) -> Result<Ve
         }
     }
 
-    Ok(results
+    let vectors = results
         .into_iter()
         .map(|v| v.expect("every index must be filled by a hit or a miss"))
-        .collect())
+        .collect();
+
+    Ok((vectors, stats))
 }
