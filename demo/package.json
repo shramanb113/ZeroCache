@@ -1,0 +1,23 @@
+{
+  "name": "demo",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "mastra dev",
+    "build": "mastra build",
+    "start": "mastra start"
+  },
+  "dependencies": {
+    "@mastra/core": "latest",
+    "ai": "^7.0.36"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "mastra": "latest",
+    "typescript": "^6.0.3"
+  }
+}

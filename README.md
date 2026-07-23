@@ -61,6 +61,37 @@ No provider API key is configured on the server — every caller brings their ow
 
 `ZEROCACHE_STORAGE_BACKEND=sled` (the default) is embedded and single-process — fine for local dev, but each replica would keep its own private cache. Use `redis` for any deployment with more than one instance (e.g. Kubernetes) so all replicas share one cache; it's connection-pooled with no distributed locking, since the content-addressed key means concurrent writes from different replicas are never conflicting.
 
+### Demo
+
+[`demo/`](./demo) is a real, unmodified [Mastra](https://mastra.ai) TypeScript project — not a mocked example — with a small workflow (`duplicate-finder`) that embeds a batch of text through Zerocache and flags near-duplicates by cosine similarity. It's the clearest way to see Zerocache actually work against a real framework and a real provider.
+
+```sh
+# terminal 1: Zerocache itself
+cargo run -p zerocache-http
+
+# terminal 2: the demo
+cd demo
+npm install
+npm run dev
+```
+
+Open [http://localhost:4111](http://localhost:4111) (Mastra Studio), go to **Workflows → duplicate-finder**, and run it with a real provider API key (Gemini, using model `gemini-embedding-001`) and a batch of texts, e.g.:
+
+```json
+{
+  "apiKey": "<your Gemini API key>",
+  "texts": [
+    "The quick brown fox jumps over the lazy dog",
+    "The quick brown fox jumps over the lazy dog.",
+    "A sentence about zerocache and embedding caches"
+  ]
+}
+```
+
+Run it once, then run it again with the same (or an overlapping) batch — Studio's graph view shows each step's real duration, and `elapsedMs` in the output drops sharply once the texts are cached. The workflow itself never talks to Zerocache-specific code beyond a `base_url`/`apiKey`/`model` config — see [`demo/src/mastra/workflows/duplicate-finder.ts`](./demo/src/mastra/workflows/duplicate-finder.ts).
+
+A minimal standalone version without the Mastra Studio UI is also included at [`demo/test-embed.mjs`](./demo/test-embed.mjs): `ZEROCACHE_DEMO_KEY=<your key> node demo/test-embed.mjs`.
+
 ## API
 
 ```text
