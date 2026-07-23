@@ -71,7 +71,15 @@ POST /v1/embeddings
 { "object": "list", "data": [ { "embedding": [...], "index": 0 }, ... ], "model": "...", "usage": {...} }
 ```
 
-The response shape is preserved exactly so existing OpenAI-compatible client libraries in either language require no code change beyond the base URL.
+The response shape is preserved exactly so existing OpenAI-compatible client libraries in either language require no code change beyond the base URL. Each response also carries `X-Zerocache-Hits` / `X-Zerocache-Misses` headers, and `usage` reflects only what was actually billed by the provider for this request (0 for an all-cache-hit batch).
+
+### Metrics
+
+```text
+GET /metrics
+```
+
+Cumulative counters in Prometheus text exposition format: `zerocache_cache_hits_total`, `zerocache_cache_misses_total`, `zerocache_provider_prompt_tokens_total`. Per-instance — with multiple replicas (`ZEROCACHE_STORAGE_BACKEND=redis`), point your Prometheus scrape config at each pod and aggregate with `sum()` for a fleet-wide view.
 
 ## Non-goals (v1)
 

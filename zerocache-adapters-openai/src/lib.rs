@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use zerocache_ports::{EmbeddingProvider, ProviderError};
+use zerocache_ports::{EmbeddingProvider, ProviderError, ProviderUsage};
 
 pub struct OpenAiProvider {
     client: reqwest::blocking::Client,
@@ -26,6 +26,7 @@ struct EmbeddingsRequest<'a> {
 #[derive(Deserialize)]
 struct EmbeddingsResponse {
     data: Vec<EmbeddingData>,
+    usage: UsageResponse,
 }
 
 #[derive(Deserialize)]
@@ -34,8 +35,18 @@ struct EmbeddingData {
     index: usize,
 }
 
+#[derive(Deserialize)]
+struct UsageResponse {
+    prompt_tokens: u32,
+    total_tokens: u32,
+}
+
 impl EmbeddingProvider for OpenAiProvider {
-    fn embed_batch(&self, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, ProviderError> {
+    fn embed_batch(
+        &self,
+        model: &str,
+        texts: &[String],
+    ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
         let body = EmbeddingsRequest { model, input: texts };
 
         let response = self
@@ -54,6 +65,12 @@ impl EmbeddingProvider for OpenAiProvider {
         for item in response.data {
             ordered[item.index] = item.embedding;
         }
-        Ok(ordered)
+
+        let usage = ProviderUsage {
+            prompt_tokens: response.usage.prompt_tokens,
+            total_tokens: response.usage.total_tokens,
+        };
+
+        Ok((ordered, usage))
     }
 }

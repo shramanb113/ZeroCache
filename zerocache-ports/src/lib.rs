@@ -24,11 +24,21 @@ impl fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProviderUsage {
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
+}
+
 pub trait EmbeddingStore: Send + Sync {
     fn get(&self, key: &CacheKey) -> Result<Option<Vec<f32>>, StoreError>;
     fn put(&self, key: CacheKey, vector: Vec<f32>) -> Result<(), StoreError>;
 }
 
 pub trait EmbeddingProvider: Send + Sync {
-    fn embed_batch(&self, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, ProviderError>;
+    fn embed_batch(
+        &self,
+        model: &str,
+        texts: &[String],
+    ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError>;
 }

@@ -100,6 +100,7 @@ The PRD (§3) is authoritative for intent, but treat these as the actual code, n
 2. **`EmbeddingStore`/`EmbeddingProvider` carry `Send + Sync` bounds**, needed because `zerocache-http` shares them across async axum handlers behind `Arc<dyn Trait>`.
 3. **Both traits return `Result`, not bare values.** Originally scaffolded without this (matching PRD §6.2 literally) and it was a real gap — failures panicked instead of surfacing as HTTP errors. Fixed 2026-07-23.
 4. **`zerocache-adapters-redis` exists in v1.** PRD §4 and §6.4 explicitly defer distributed/multi-instance storage to "Future" work. Added ahead of that schedule because Kubernetes multi-replica deployment is a real near-term requirement, not a hypothetical — confirmed with the PRD's author before building. `zerocache-adapters-sled` remains the default; Redis is opt-in via `ZEROCACHE_STORAGE_BACKEND=redis`.
+5. **`GET /metrics` exists in v1**, ahead of PRD §11's full observability spec. Prometheus text format, three counters (`zerocache_cache_hits_total`, `zerocache_cache_misses_total`, `zerocache_provider_prompt_tokens_total`) — deliberately scoped to just what Phase 1's success criteria (§15: measured hit rate, measured tokens billed) need, not per-consumer tagging or latency-saved-vs-baseline, which need decisions not yet made. Chosen over a bespoke JSON endpoint specifically because with `zerocache-adapters-redis` multi-replica deployments, per-pod counters only mean something once something aggregates across pods — Prometheus's scrape-and-`sum()` model does that; a single pod's JSON response can't.
 
 ## API contract (v1)
 
@@ -112,6 +113,8 @@ POST /v1/embeddings
 →
 { "object": "list", "data": [ { "embedding": [...], "index": 0 }, ... ], "model": "...", "usage": {...} }
 ```
+
+Responses also carry `X-Zerocache-Hits` / `X-Zerocache-Misses` headers; `usage` reflects only tokens actually billed for this request's misses (0 for an all-hit batch — not a placeholder).
 
 ## Multi-consumer design (PRD §7)
 

@@ -8,11 +8,11 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 
-use app::{embed_batch, AppError, AppState};
+use app::{embed_batch, AppError, AppState, Metrics};
 use config::{Config, StorageBackend};
 use wire::{EmbeddingObject, EmbeddingsRequest, EmbeddingsResponse, ErrorResponse, Usage};
 use zerocache_adapters_openai::OpenAiProvider;
@@ -43,12 +43,14 @@ fn main() {
         store,
         provider: Arc::new(provider),
         model_version: "v1".to_string(),
+        metrics: Metrics::new(),
     });
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     runtime.block_on(async move {
         let app = Router::new()
             .route("/v1/embeddings", post(embeddings_handler))
+            .route("/metrics", get(metrics_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
@@ -89,7 +91,10 @@ async fn embeddings_handler(
         object: "list",
         data,
         model,
-        usage: Usage { prompt_tokens: 0, total_tokens: 0 },
+        usage: Usage {
+            prompt_tokens: stats.provider_prompt_tokens,
+            total_tokens: stats.provider_total_tokens,
+        },
     })
     .into_response();
 
@@ -104,4 +109,11 @@ async fn embeddings_handler(
     );
 
     Ok(response)
+}
+
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.metrics.encode(),
+    )
 }
