@@ -17,7 +17,7 @@ RAG ingestion pipelines re-embed text that's already been embedded before — du
 Dependencies point inward only, enforced via Cargo workspace crate boundaries:
 
 | Crate | Responsibility |
-|---|---|
+| --- | --- |
 | `zerocache-core` | Domain logic: `CacheKey` derivation, hit/miss reconciliation. No I/O, no async runtime. |
 | `zerocache-ports` | `EmbeddingStore` / `EmbeddingProvider` trait contracts. |
 | `zerocache-adapters-sled` | `EmbeddingStore` implementation backed by [sled](https://github.com/spacejam/sled). |
@@ -48,7 +48,7 @@ ZEROCACHE_PROVIDER_API_KEY=sk-... cargo run -p zerocache-http
 Configuration is environment-variable only:
 
 | Variable | Required | Default |
-|---|---|---|
+| --- | --- | --- |
 | `ZEROCACHE_PROVIDER_API_KEY` | yes | — |
 | `ZEROCACHE_PORT` | no | `8080` |
 | `ZEROCACHE_STORAGE_PATH` | no | `./data` |
@@ -58,7 +58,7 @@ Configuration is environment-variable only:
 
 A single endpoint matching the standard embeddings API shape:
 
-```
+```text
 POST /v1/embeddings
 { "model": "...", "input": ["text1", "text2", ...] }
 
