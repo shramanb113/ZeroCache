@@ -52,8 +52,12 @@ Configuration is environment-variable only:
 | --- | --- | --- |
 | `ZEROCACHE_PROVIDER_API_KEY` | yes | — |
 | `ZEROCACHE_PORT` | no | `8080` |
-| `ZEROCACHE_STORAGE_PATH` | no | `./data` |
+| `ZEROCACHE_STORAGE_BACKEND` | no | `sled` (or `redis`) |
+| `ZEROCACHE_STORAGE_PATH` | no, sled only | `./data` |
+| `ZEROCACHE_REDIS_URL` | no, redis only | `redis://127.0.0.1:6379` |
 | `ZEROCACHE_PROVIDER_BASE_URL` | no | `https://api.openai.com` |
+
+`ZEROCACHE_STORAGE_BACKEND=sled` (the default) is embedded and single-process — fine for local dev, but each replica would keep its own private cache. Use `redis` for any deployment with more than one instance (e.g. Kubernetes) so all replicas share one cache; it's connection-pooled with no distributed locking, since the content-addressed key means concurrent writes from different replicas are never conflicting.
 
 ## API
 
