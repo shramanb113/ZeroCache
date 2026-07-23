@@ -1,0 +1,13 @@
+[package]
+name = "zerocache-http"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zerocache-core = { path = "../zerocache-core" }
+zerocache-ports = { path = "../zerocache-ports" }
+zerocache-adapters-sled = { path = "../zerocache-adapters-sled" }
+zerocache-adapters-openai = { path = "../zerocache-adapters-openai" }
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+serde = { version = "1", features = ["derive"] }

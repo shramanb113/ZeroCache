@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "zerocache-core",
+    "zerocache-ports",
+    "zerocache-adapters-sled",
+    "zerocache-adapters-openai",
+    "zerocache-http",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"

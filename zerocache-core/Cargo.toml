@@ -1,0 +1,7 @@
+[package]
+name = "zerocache-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+blake3 = "1"

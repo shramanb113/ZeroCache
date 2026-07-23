@@ -1,0 +1,9 @@
+[package]
+name = "zerocache-adapters-sled"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zerocache-core = { path = "../zerocache-core" }
+zerocache-ports = { path = "../zerocache-ports" }
+sled = "0.34"

@@ -1,0 +1,7 @@
+[package]
+name = "zerocache-ports"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zerocache-core = { path = "../zerocache-core" }
