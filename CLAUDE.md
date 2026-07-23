@@ -52,10 +52,14 @@ trait EmbeddingStore: Send + Sync {
     fn put(&self, key: CacheKey, vector: Vec<f32>) -> Result<(), StoreError>;
 }
 
+#[async_trait::async_trait]
 trait EmbeddingProvider: Send + Sync {
-    fn embed_batch(&self, api_key: &str, model: &str, texts: &[String]) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError>;
+    async fn embed_batch(&self, api_key: &str, model: &str, texts: &[String]) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError>;
+    fn version(&self) -> &'static str;
 }
 ```
+
+`EmbeddingProvider` is async (2026-07-24) — adapters use async `reqwest`, not `reqwest::blocking`, so a provider call is `.await`ed directly in `zerocache-http` rather than needing `tokio::task::spawn_blocking`. `EmbeddingStore` stays synchronous (`sled`/`redis` are blocking APIs); their calls still run inside `spawn_blocking`. `version()` replaces the old global `model_version: String` on `AppState` — each adapter returns its own `env!("CARGO_PKG_VERSION")`, so the cache key's version component is tied to that adapter crate's own `Cargo.toml` version, not a manually-maintained string someone has to remember to bump. Each adapter also chunks its input into batches of `MAX_BATCH_SIZE = 100` — a single conservative constant, not tuned per-provider, since the real per-provider limits couldn't be reliably verified.
 
 ### Application
 
@@ -104,6 +108,7 @@ The PRD (§3) is authoritative for intent, but treat these as the actual code, n
 4. **`zerocache-adapters-redis` exists in v1.** PRD §4 and §6.4 explicitly defer distributed/multi-instance storage to "Future" work. Added ahead of that schedule because Kubernetes multi-replica deployment is a real near-term requirement, not a hypothetical — confirmed with the PRD's author before building. `zerocache-adapters-sled` remains the default; Redis is opt-in via `ZEROCACHE_STORAGE_BACKEND=redis`.
 5. **`GET /metrics` exists in v1**, ahead of PRD §11's full observability spec. Prometheus text format, three counters (`zerocache_cache_hits_total`, `zerocache_cache_misses_total`, `zerocache_provider_prompt_tokens_total`) — deliberately scoped to just what Phase 1's success criteria (§15: measured hit rate, measured tokens billed) need, not per-consumer tagging or latency-saved-vs-baseline, which need decisions not yet made. Chosen over a bespoke JSON endpoint specifically because with `zerocache-adapters-redis` multi-replica deployments, per-pod counters only mean something once something aggregates across pods — Prometheus's scrape-and-`sum()` model does that; a single pod's JSON response can't.
 6. **v1's single operator-configured provider (`ZEROCACHE_PROVIDER_API_KEY`) is gone, replaced by per-request bring-your-own-key (2026-07-24).** PRD §6.4/§4 describe additional provider adapters as "Future" work behind one operator-configured provider — this goes further: any of three providers (`openai`, `mistral`, `gemini`) can be selected per-request via the URL path, using the caller's own forwarded key, never Zerocache's. This also activates PRD §7's previously-deferred namespacing: `CacheKey` now includes an `owner_id` (a hash of the caller's key, never the raw key) alongside `provider`, `model`, `model_version`, `text`. Full reasoning in `decisions.md`.
+7. **`EmbeddingProvider` is async (2026-07-24).** Adapters use async `reqwest`, removing the earlier `reqwest::blocking`-inside-`spawn_blocking` overhead (two runtimes, a thread-pool hop per request) — this was a real architectural wart, not a style choice; see the note in memory/commit history about why `main()` originally couldn't be `#[tokio::main]`. It can be again now. Each adapter also chunks input into batches of `MAX_BATCH_SIZE = 100` (a single conservative constant, not a verified per-provider limit — see `decisions.md`), and `version()` replaces the old global `model_version` string, tying cache-key versioning to each adapter crate's own `Cargo.toml` version instead of a manually-bumped convention.
 
 ## API contract (v2 — multi-tenant, multi-provider)
 
