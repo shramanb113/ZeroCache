@@ -38,6 +38,7 @@ pub trait EmbeddingStore: Send + Sync {
 pub trait EmbeddingProvider: Send + Sync {
     fn embed_batch(
         &self,
+        api_key: &str,
         model: &str,
         texts: &[String],
     ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError>;

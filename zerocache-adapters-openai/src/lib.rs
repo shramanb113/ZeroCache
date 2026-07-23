@@ -4,15 +4,13 @@ use zerocache_ports::{EmbeddingProvider, ProviderError, ProviderUsage};
 pub struct OpenAiProvider {
     client: reqwest::blocking::Client,
     base_url: String,
-    api_key: String,
 }
 
 impl OpenAiProvider {
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+    pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             client: reqwest::blocking::Client::new(),
             base_url: base_url.into(),
-            api_key: api_key.into(),
         }
     }
 }
@@ -44,6 +42,7 @@ struct UsageResponse {
 impl EmbeddingProvider for OpenAiProvider {
     fn embed_batch(
         &self,
+        api_key: &str,
         model: &str,
         texts: &[String],
     ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
@@ -52,7 +51,7 @@ impl EmbeddingProvider for OpenAiProvider {
         let response = self
             .client
             .post(format!("{}/v1/embeddings", self.base_url))
-            .bearer_auth(&self.api_key)
+            .bearer_auth(api_key)
             .json(&body)
             .send()
             .map_err(|e| ProviderError(e.to_string()))?
@@ -93,8 +92,6 @@ mod tests {
             then.status(200).json_body(json!({
                 "object": "list",
                 "model": "text-embedding-3-small",
-                // returned out of order on purpose, to prove the adapter
-                // reorders by `index` rather than trusting array order
                 "data": [
                     { "embedding": [2.0], "index": 1 },
                     { "embedding": [1.0], "index": 0 }
@@ -103,9 +100,9 @@ mod tests {
             }));
         });
 
-        let provider = OpenAiProvider::new(server.base_url(), "test-key");
+        let provider = OpenAiProvider::new(server.base_url());
         let (vectors, usage) = provider
-            .embed_batch("text-embedding-3-small", &["a".to_string(), "b".to_string()])
+            .embed_batch("test-key", "text-embedding-3-small", &["a".to_string(), "b".to_string()])
             .unwrap();
 
         mock.assert();
@@ -122,8 +119,8 @@ mod tests {
             then.status(401).json_body(json!({ "error": "invalid api key" }));
         });
 
-        let provider = OpenAiProvider::new(server.base_url(), "bad-key");
-        let result = provider.embed_batch("m", &["x".to_string()]);
+        let provider = OpenAiProvider::new(server.base_url());
+        let result = provider.embed_batch("bad-key", "m", &["x".to_string()]);
 
         assert!(result.is_err());
     }
@@ -136,8 +133,8 @@ mod tests {
             then.status(200).body("not json");
         });
 
-        let provider = OpenAiProvider::new(server.base_url(), "test-key");
-        let result = provider.embed_batch("m", &["x".to_string()]);
+        let provider = OpenAiProvider::new(server.base_url());
+        let result = provider.embed_batch("test-key", "m", &["x".to_string()]);
 
         assert!(result.is_err());
     }
