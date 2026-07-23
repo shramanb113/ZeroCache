@@ -1,0 +1,13 @@
+[package]
+name = "zerocache-adapters-gemini"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zerocache-ports = { path = "../zerocache-ports" }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+httpmock = "0.7"
+serde_json = "1"

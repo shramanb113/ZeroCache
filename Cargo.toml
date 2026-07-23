@@ -6,6 +6,8 @@ members = [
     "zerocache-adapters-sled",
     "zerocache-adapters-redis",
     "zerocache-adapters-openai",
+    "zerocache-adapters-mistral",
+    "zerocache-adapters-gemini",
     "zerocache-http",
 ]
 
