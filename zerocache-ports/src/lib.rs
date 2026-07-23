@@ -35,11 +35,19 @@ pub trait EmbeddingStore: Send + Sync {
     fn put(&self, key: CacheKey, vector: Vec<f32>) -> Result<(), StoreError>;
 }
 
+#[async_trait::async_trait]
 pub trait EmbeddingProvider: Send + Sync {
-    fn embed_batch(
+    async fn embed_batch(
         &self,
         api_key: &str,
         model: &str,
         texts: &[String],
     ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError>;
+
+    /// Identifies this adapter's own build for cache-key purposes — tied to
+    /// the adapter crate's `Cargo.toml` version, not a manually maintained
+    /// string, so a behavior change is invisible in the cache key only if
+    /// the crate version wasn't bumped, the same discipline every published
+    /// crate already needs.
+    fn version(&self) -> &'static str;
 }

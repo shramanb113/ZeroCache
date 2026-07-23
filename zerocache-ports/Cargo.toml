@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 zerocache-core = { path = "../zerocache-core" }
+async-trait = "0.1"
