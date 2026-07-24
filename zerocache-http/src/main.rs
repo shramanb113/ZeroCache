@@ -65,7 +65,40 @@ async fn main() {
         .await
         .expect("failed to bind port");
     println!("zerocache-http listening on 0.0.0.0:{port}");
-    axum::serve(listener, app).await.expect("server error");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("server error");
+}
+
+/// Resolves on Ctrl+C (works on every platform, including the Windows dev
+/// environment) or, on Unix only, SIGTERM (what Kubernetes sends a pod
+/// before force-killing it after the grace period). Whichever fires first
+/// wins; the other branch is simply dropped.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+
+    println!("shutdown signal received, finishing in-flight requests");
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
