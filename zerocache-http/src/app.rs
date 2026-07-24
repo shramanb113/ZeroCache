@@ -1,11 +1,43 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use prometheus::{Encoder, IntCounterVec, Opts, Registry, TextEncoder};
 
 use zerocache_core::{normalize_text, reconcile, CacheKey};
 use zerocache_ports::{EmbeddingProvider, EmbeddingStore, ProviderError, StoreError};
+
+// A store call is not bounded by PROVIDER_TIMEOUT, which only applies to
+// provider HTTP calls -- without this, a stuck store backend (e.g. a stale
+// Redis connection) could hang a request indefinitely, and /ready, which
+// exists specifically to detect exactly that, would hang right along with
+// it, defeating the point of a readiness probe. Bounding every store call
+// uniformly here (not just in the Redis adapter) means a hung backend of
+// any kind degrades into a fast, visible AppError::Store instead of an
+// indefinite hang -- one that would otherwise also block graceful
+// shutdown's drain, since with_graceful_shutdown waits for in-flight
+// handler futures, and an unbounded store call is awaited inside one.
+const STORE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Runs a blocking store operation on the blocking thread pool, bounded by
+/// `STORE_TIMEOUT`. Note this bounds how long the *caller* waits, not the
+/// spawned OS thread itself -- a genuinely wedged sync call still occupies a
+/// blocking-pool thread until it eventually returns (Rust cannot preempt
+/// blocking code). The Redis adapter additionally sets its own socket-level
+/// read/write timeouts, which do bound the underlying call itself; this
+/// wrapper is the uniform backstop for any backend, including ones that
+/// don't set their own.
+async fn run_store_task<T, F>(task: F) -> Result<T, AppError>
+where
+    F: FnOnce() -> Result<T, AppError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::time::timeout(STORE_TIMEOUT, tokio::task::spawn_blocking(task))
+        .await
+        .map_err(|_| AppError::Store(StoreError("store operation timed out".into())))?
+        .expect("store task panicked")
+}
 
 pub struct AppState {
     pub store: Arc<dyn EmbeddingStore>,
@@ -157,11 +189,7 @@ pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<
     let reconciled = {
         let store = Arc::clone(&state.store);
         let keys_for_lookup = keys.clone();
-        tokio::task::spawn_blocking(move || {
-            reconcile(&keys_for_lookup, |key| store.get(key).map_err(AppError::Store))
-        })
-        .await
-        .expect("store reconciliation task panicked")?
+        run_store_task(move || reconcile(&keys_for_lookup, |key| store.get(key).map_err(AppError::Store))).await?
     };
 
     let hits = reconciled.hits.len();
@@ -211,14 +239,13 @@ pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<
         }
 
         let store = Arc::clone(&state.store);
-        tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        run_store_task(move || -> Result<(), AppError> {
             for (key, vector) in writes {
                 store.put(key, vector).map_err(AppError::Store)?;
             }
             Ok(())
         })
-        .await
-        .expect("store write task panicked")?;
+        .await?;
     }
 
     let vectors = results
@@ -260,14 +287,13 @@ pub async fn delete_batch(state: &AppState, request: DeleteRequest<'_>) -> Resul
 
     let count = keys.len();
     let store = Arc::clone(&state.store);
-    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+    run_store_task(move || -> Result<(), AppError> {
         for key in keys {
             store.delete(&key).map_err(AppError::Store)?;
         }
         Ok(())
     })
-    .await
-    .expect("store delete task panicked")?;
+    .await?;
 
     Ok(count)
 }
@@ -288,9 +314,7 @@ fn readiness_check_key() -> CacheKey {
 pub async fn check_store_readiness(state: &AppState) -> Result<(), AppError> {
     let store = Arc::clone(&state.store);
     let key = readiness_check_key();
-    tokio::task::spawn_blocking(move || store.get(&key).map(|_| ()).map_err(AppError::Store))
-        .await
-        .expect("readiness check task panicked")
+    run_store_task(move || store.get(&key).map(|_| ()).map_err(AppError::Store)).await
 }
 
 #[cfg(test)]
