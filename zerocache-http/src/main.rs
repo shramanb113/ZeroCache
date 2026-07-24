@@ -54,6 +54,10 @@ async fn main() {
     let state = Arc::new(AppState {
         store,
         providers,
+        // Populated in a later task (handler wiring) -- empty here only
+        // keeps this pre-existing struct literal compiling now that
+        // AppState carries the new field.
+        image_providers: HashMap::new(),
         metrics: Metrics::new(),
         in_flight: std::sync::Mutex::new(HashMap::new()),
     });

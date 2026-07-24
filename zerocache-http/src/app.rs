@@ -10,7 +10,8 @@ use prometheus::{Encoder, IntCounterVec, Opts, Registry, TextEncoder};
 use tracing::Instrument;
 
 use zerocache_core::{normalize_text, reconcile, CacheKey};
-use zerocache_ports::{EmbeddingProvider, EmbeddingStore, ProviderError, ProviderUsage, StoreError};
+use zerocache_ports::{EmbeddingProvider, EmbeddingStore, ImageEmbeddingProvider, ProviderError, ProviderUsage, StoreError};
+use zerocache_ports::ImageInput;
 
 /// What a coalesced fetch resolves to: every claimed key's vector plus the
 /// usage from the one real provider call that produced them. `Arc`-wrapped
@@ -72,6 +73,10 @@ where
 pub struct AppState {
     pub store: Arc<dyn EmbeddingStore>,
     pub providers: HashMap<String, Arc<dyn EmbeddingProvider>>,
+    // Only ever populated with "gemini" -- see CLAUDE.md Deviations: OpenAI
+    // has no public image-embedding API, so this map is deliberately a
+    // strict subset of `providers`, not a parallel full registry.
+    pub image_providers: HashMap<String, Arc<dyn ImageEmbeddingProvider>>,
     pub metrics: Metrics,
     // Request coalescing (in-process only -- see fetch_coalesced): tracks
     // provider fetches currently in flight, keyed by CacheKey, so two
@@ -107,7 +112,7 @@ impl Metrics {
                 "zerocache_cache_hits_total",
                 "Total embedding requests served from cache without a provider call",
             ),
-            &["provider"],
+            &["provider", "content_type"],
         )
         .expect("metric name/help/labels are hardcoded and valid");
         let misses = IntCounterVec::new(
@@ -115,7 +120,7 @@ impl Metrics {
                 "zerocache_cache_misses_total",
                 "Total embedding requests that required a provider call",
             ),
-            &["provider"],
+            &["provider", "content_type"],
         )
         .expect("metric name/help/labels are hardcoded and valid");
         let prompt_tokens_billed = IntCounterVec::new(
@@ -123,7 +128,7 @@ impl Metrics {
                 "zerocache_provider_prompt_tokens_total",
                 "Total prompt tokens billed by the embedding provider",
             ),
-            &["provider"],
+            &["provider", "content_type"],
         )
         .expect("metric name/help/labels are hardcoded and valid");
 
@@ -140,11 +145,11 @@ impl Metrics {
         Self { registry, hits, misses, prompt_tokens_billed }
     }
 
-    fn record(&self, provider: &str, stats: &BatchStats) {
-        self.hits.with_label_values(&[provider]).inc_by(stats.hits as u64);
-        self.misses.with_label_values(&[provider]).inc_by(stats.misses as u64);
+    fn record(&self, provider: &str, content_type: &str, stats: &BatchStats) {
+        self.hits.with_label_values(&[provider, content_type]).inc_by(stats.hits as u64);
+        self.misses.with_label_values(&[provider, content_type]).inc_by(stats.misses as u64);
         self.prompt_tokens_billed
-            .with_label_values(&[provider])
+            .with_label_values(&[provider, content_type])
             .inc_by(stats.provider_prompt_tokens as u64);
     }
 
@@ -314,9 +319,159 @@ pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<
         .collect();
 
     let stats = BatchStats { hits, misses, provider_prompt_tokens, provider_total_tokens };
-    state.metrics.record(request.provider_name, &stats);
+    state.metrics.record(request.provider_name, "text", &stats);
 
     Ok((vectors, stats))
+}
+
+/// Everything one `POST /{provider}/v1/images/embeddings` call needs. Only
+/// ever constructed with a `gemini` provider today (see AppState's
+/// `image_providers` comment) -- kept generic over `ImageEmbeddingProvider`
+/// rather than hardcoded to `GeminiProvider` so a second provider can be
+/// added later without touching this struct or `embed_image_batch`.
+pub struct EmbedImageRequest<'a> {
+    pub provider: Arc<dyn ImageEmbeddingProvider>,
+    pub provider_name: &'a str,
+    pub api_key: &'a str,
+    pub owner_id: [u8; 32],
+    pub model: &'a str,
+    pub images: &'a [ImageInput],
+}
+
+/// The image-embedding counterpart to `embed_batch`. Deliberately simpler in
+/// three ways, all documented in this plan's Global Constraints: no text
+/// normalization (images aren't normalized), no dedup-by-identical-input
+/// within one batch (two images with identical bytes are rare enough in
+/// real ingestion that the added bookkeeping isn't worth it yet -- unlike
+/// text, where duplicate/near-duplicate strings in one batch are common),
+/// and no cross-request coalescing (fetch_coalesced stays text-only for now).
+#[tracing::instrument(skip_all, fields(provider = %request.provider_name, images = request.images.len(), hits, misses))]
+pub async fn embed_image_batch(
+    state: &AppState,
+    request: EmbedImageRequest<'_>,
+) -> Result<(Vec<Vec<f32>>, BatchStats), AppError> {
+    let provider_version = request.provider.version();
+    let keys: Vec<CacheKey> = request
+        .images
+        .iter()
+        .map(|image| {
+            CacheKey::derive_image(
+                request.owner_id,
+                request.provider_name,
+                request.model,
+                provider_version,
+                &image.mime_type,
+                &image.data,
+            )
+        })
+        .collect();
+
+    let reconciled = {
+        let store = Arc::clone(&state.store);
+        let keys_for_lookup = keys.clone();
+        run_store_task(move || reconcile(&keys_for_lookup, |key| store.get(key).map_err(AppError::Store)))
+            .instrument(tracing::info_span!("store_lookup"))
+            .await?
+    };
+
+    let hits = reconciled.hits.len();
+    let misses = reconciled.misses.len();
+    tracing::Span::current().record("hits", hits).record("misses", misses);
+
+    let mut results: Vec<Option<Vec<f32>>> = vec![None; request.images.len()];
+    for (index, vector) in reconciled.hits {
+        results[index] = Some(vector);
+    }
+
+    let mut provider_prompt_tokens = 0;
+    let mut provider_total_tokens = 0;
+
+    if !reconciled.misses.is_empty() {
+        let miss_images: Vec<ImageInput> = reconciled
+            .misses
+            .iter()
+            .map(|(index, _key)| ImageInput {
+                mime_type: request.images[*index].mime_type.clone(),
+                data: request.images[*index].data.clone(),
+            })
+            .collect();
+
+        let (vectors, usage) = request
+            .provider
+            .embed_image_batch(request.api_key, request.model, &miss_images)
+            .instrument(tracing::info_span!("provider_call", images = miss_images.len()))
+            .await
+            .map_err(AppError::Provider)?;
+        provider_prompt_tokens = usage.prompt_tokens;
+        provider_total_tokens = usage.total_tokens;
+
+        let mut writes = Vec::with_capacity(reconciled.misses.len());
+        for ((index, key), vector) in reconciled.misses.iter().zip(vectors) {
+            results[*index] = Some(vector.clone());
+            writes.push((*key, vector));
+        }
+
+        let store = Arc::clone(&state.store);
+        run_store_task(move || -> Result<(), AppError> {
+            for (key, vector) in writes {
+                store.put(key, vector).map_err(AppError::Store)?;
+            }
+            Ok(())
+        })
+        .instrument(tracing::info_span!("store_write_back"))
+        .await?;
+    }
+
+    let vectors = results
+        .into_iter()
+        .map(|v| v.expect("every index must be filled by a hit or a miss"))
+        .collect();
+
+    let stats = BatchStats { hits, misses, provider_prompt_tokens, provider_total_tokens };
+    state.metrics.record(request.provider_name, "image", &stats);
+
+    Ok((vectors, stats))
+}
+
+/// The image-embedding counterpart to `DeleteRequest`/`delete_batch`.
+pub struct DeleteImageRequest<'a> {
+    pub provider: &'a dyn ImageEmbeddingProvider,
+    pub provider_name: &'a str,
+    pub owner_id: [u8; 32],
+    pub model: &'a str,
+    pub images: &'a [ImageInput],
+}
+
+#[tracing::instrument(skip_all, fields(provider = %request.provider_name, images = request.images.len()))]
+pub async fn delete_image_batch(state: &AppState, request: DeleteImageRequest<'_>) -> Result<usize, AppError> {
+    let provider_version = request.provider.version();
+    let keys: Vec<CacheKey> = request
+        .images
+        .iter()
+        .map(|image| {
+            CacheKey::derive_image(
+                request.owner_id,
+                request.provider_name,
+                request.model,
+                provider_version,
+                &image.mime_type,
+                &image.data,
+            )
+        })
+        .collect();
+
+    let count = keys.len();
+    let store = Arc::clone(&state.store);
+    run_store_task(move || -> Result<(), AppError> {
+        for key in keys {
+            store.delete(&key).map_err(AppError::Store)?;
+        }
+        Ok(())
+    })
+    .instrument(tracing::info_span!("store_delete"))
+    .await?;
+
+    Ok(count)
 }
 
 /// Resolves every key in `unique_keys` to its embedding, coalescing with
@@ -597,6 +752,37 @@ mod tests {
         }
     }
 
+    struct MockImageProvider {
+        response: Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError>,
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MockImageProvider {
+        fn returning(response: Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError>) -> Self {
+            Self { response, call_count: std::sync::atomic::AtomicUsize::new(0) }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ImageEmbeddingProvider for MockImageProvider {
+        async fn embed_image_batch(
+            &self,
+            _api_key: &str,
+            _model: &str,
+            images: &[ImageInput],
+        ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
+            self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match &self.response {
+                Ok((vectors, usage)) => Ok((vectors[..images.len()].to_vec(), *usage)),
+                Err(e) => Err(e.clone()),
+            }
+        }
+
+        fn version(&self) -> &'static str {
+            "test-image-v1"
+        }
+    }
+
     const OWNER_A: [u8; 32] = [1u8; 32];
     const OWNER_B: [u8; 32] = [2u8; 32];
 
@@ -604,6 +790,7 @@ mod tests {
         AppState {
             store: Arc::new(store),
             providers: StdHashMap::new(),
+            image_providers: StdHashMap::new(),
             metrics: Metrics::new(),
             in_flight: Mutex::new(StdHashMap::new()),
         }
@@ -808,9 +995,9 @@ mod tests {
         .await;
 
         let metrics_text = state.metrics.encode();
-        assert!(metrics_text.contains("zerocache_cache_misses_total{provider=\"openai\"} 1"));
+        assert!(metrics_text.contains("zerocache_cache_misses_total{content_type=\"text\",provider=\"openai\"} 1"));
         assert!(
-            !metrics_text.contains("zerocache_cache_misses_total{provider=\"mistral\"}"),
+            !metrics_text.contains("zerocache_cache_misses_total{content_type=\"text\",provider=\"mistral\"}"),
             "a failed request must not record any metric for that provider"
         );
     }
@@ -1141,5 +1328,127 @@ mod tests {
             panic!("simulated store task panic");
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn image_all_misses_calls_provider_and_writes_back_to_store() {
+        let state = state_with(MockStore::empty());
+        let provider = Arc::new(MockImageProvider::returning(Ok((vec![vec![1.0], vec![2.0]], ProviderUsage::default()))));
+        let images = vec![
+            ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() },
+            ImageInput { mime_type: "image/png".to_string(), data: "d29ybGQ=".to_string() },
+        ];
+
+        let request = EmbedImageRequest {
+            provider: provider.clone() as Arc<dyn ImageEmbeddingProvider>,
+            provider_name: "gemini",
+            api_key: "test-key",
+            owner_id: [1u8; 32],
+            model: "gemini-embedding-2",
+            images: &images,
+        };
+
+        let (vectors, stats) = embed_image_batch(&state, request).await.unwrap();
+        assert_eq!(vectors, vec![vec![1.0], vec![2.0]]);
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 2);
+        assert_eq!(provider.call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn image_all_hits_skips_provider_entirely() {
+        let key = CacheKey::derive_image([1u8; 32], "gemini", "gemini-embedding-2", "test-image-v1", "image/png", "aGVsbG8=");
+        let state = state_with(MockStore::with(vec![(key, vec![9.0])]));
+
+        let provider = Arc::new(MockImageProvider::returning(Ok((vec![], ProviderUsage::default()))));
+        let images = vec![ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() }];
+
+        let request = EmbedImageRequest {
+            provider: provider.clone() as Arc<dyn ImageEmbeddingProvider>,
+            provider_name: "gemini",
+            api_key: "test-key",
+            owner_id: [1u8; 32],
+            model: "gemini-embedding-2",
+            images: &images,
+        };
+
+        let (vectors, stats) = embed_image_batch(&state, request).await.unwrap();
+        assert_eq!(vectors, vec![vec![9.0]]);
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 0);
+        assert_eq!(provider.call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn image_different_owners_never_share_a_cache_entry() {
+        let state = state_with(MockStore::empty());
+        let provider = Arc::new(MockImageProvider::returning(Ok((vec![vec![1.0]], ProviderUsage::default()))));
+        let images = vec![ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() }];
+
+        let request_a = EmbedImageRequest {
+            provider: provider.clone() as Arc<dyn ImageEmbeddingProvider>,
+            provider_name: "gemini",
+            api_key: "test-key",
+            owner_id: [1u8; 32],
+            model: "gemini-embedding-2",
+            images: &images,
+        };
+        embed_image_batch(&state, request_a).await.unwrap();
+
+        let request_b = EmbedImageRequest {
+            provider: provider.clone() as Arc<dyn ImageEmbeddingProvider>,
+            provider_name: "gemini",
+            api_key: "test-key",
+            owner_id: [2u8; 32],
+            model: "gemini-embedding-2",
+            images: &images,
+        };
+        let (_vectors, stats_b) = embed_image_batch(&state, request_b).await.unwrap();
+
+        assert_eq!(stats_b.misses, 1, "a different owner_id must never hit the first owner's cache entry");
+        assert_eq!(provider.call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn delete_image_batch_removes_entries_so_a_later_request_misses_again() {
+        let state = state_with(MockStore::empty());
+        let provider = Arc::new(MockImageProvider::returning(Ok((vec![vec![1.0]], ProviderUsage::default()))));
+        let images = vec![ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() }];
+
+        let embed_request = EmbedImageRequest {
+            provider: provider.clone() as Arc<dyn ImageEmbeddingProvider>,
+            provider_name: "gemini",
+            api_key: "test-key",
+            owner_id: [1u8; 32],
+            model: "gemini-embedding-2",
+            images: &images,
+        };
+        embed_image_batch(&state, embed_request).await.unwrap();
+        assert_eq!(provider.call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let delete_request = DeleteImageRequest {
+            provider: provider.as_ref(),
+            provider_name: "gemini",
+            owner_id: [1u8; 32],
+            model: "gemini-embedding-2",
+            images: &images,
+        };
+        let deleted = delete_image_batch(&state, delete_request).await.unwrap();
+        assert_eq!(deleted, 1);
+
+        let embed_request_again = EmbedImageRequest {
+            provider: provider.clone() as Arc<dyn ImageEmbeddingProvider>,
+            provider_name: "gemini",
+            api_key: "test-key",
+            owner_id: [1u8; 32],
+            model: "gemini-embedding-2",
+            images: &images,
+        };
+        embed_image_batch(&state, embed_request_again).await.unwrap();
+        assert_eq!(
+            provider.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "after deletion, the same image must miss again and call the provider a second time"
+        );
     }
 }
