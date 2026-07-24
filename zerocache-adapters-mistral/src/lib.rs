@@ -1,3 +1,5 @@
+use reqwest_middleware::ClientBuilder;
+use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use serde::{Deserialize, Serialize};
 use zerocache_ports::{EmbeddingProvider, ProviderError, ProviderUsage};
 
@@ -13,18 +15,27 @@ const MAX_BATCH_SIZE: usize = 100;
 // MAX_BATCH_SIZE is uniform: no verified per-provider number to tune to.
 const PROVIDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+// See zerocache-adapters-openai for the full rationale. reqwest-retry's
+// default strategy retries 5xx / 408 / 429 / connection errors, never
+// other 4xx -- exactly right with no custom configuration needed.
+const MAX_RETRIES: u32 = 3;
+
 pub struct MistralProvider {
-    client: reqwest::Client,
+    client: reqwest_middleware::ClientWithMiddleware,
     base_url: String,
 }
 
 impl MistralProvider {
     pub fn new(base_url: impl Into<String>) -> Self {
+        let inner = reqwest::Client::builder()
+            .timeout(PROVIDER_TIMEOUT)
+            .build()
+            .expect("reqwest client with a timeout is always constructible");
+        let retry_policy = ExponentialBackoff::builder().build_with_max_retries(MAX_RETRIES);
         Self {
-            client: reqwest::Client::builder()
-                .timeout(PROVIDER_TIMEOUT)
-                .build()
-                .expect("reqwest client with a timeout is always constructible"),
+            client: ClientBuilder::new(inner)
+                .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+                .build(),
             base_url: base_url.into(),
         }
     }
@@ -224,5 +235,47 @@ mod tests {
         assert_eq!(vectors[149], vec![1049.0]);
         assert_eq!(usage.prompt_tokens, 150);
         assert_eq!(usage.total_tokens, 150);
+    }
+
+    #[tokio::test]
+    async fn embed_batch_retries_on_transient_5xx_before_giving_up() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/embeddings");
+                then.status(503).body("service unavailable");
+            })
+            .await;
+
+        let provider = MistralProvider::new(server.base_url());
+        let result = provider.embed_batch("test-key", "mistral-embed", &["x".to_string()]).await;
+
+        assert!(result.is_err(), "must still fail once retries are exhausted, not hang or silently succeed");
+        assert_eq!(
+            mock.hits_async().await,
+            (MAX_RETRIES + 1) as usize,
+            "1 initial attempt + MAX_RETRIES retries -- proves retry actually happened, not just that failure was reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn embed_batch_does_not_retry_on_a_fatal_4xx_error() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/embeddings");
+                then.status(401).json_body(json!({ "message": "Unauthorized" }));
+            })
+            .await;
+
+        let provider = MistralProvider::new(server.base_url());
+        let result = provider.embed_batch("bad-key", "mistral-embed", &["x".to_string()]).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            mock.hits_async().await,
+            1,
+            "a 401 will never succeed on retry -- retrying it would only slow down a real auth failure for no benefit"
+        );
     }
 }

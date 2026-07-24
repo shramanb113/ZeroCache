@@ -8,6 +8,8 @@ zerocache-ports = { path = "../zerocache-ports" }
 reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 async-trait = "0.1"
+reqwest-retry = { version = "0.7", features = ["tracing"] }
+reqwest-middleware = { version = "0.4", features = ["json"] }
 
 [dev-dependencies]
 httpmock = "0.7"
