@@ -13,11 +13,13 @@
   },
   "dependencies": {
     "@mastra/core": "latest",
+    "@mastra/libsql": "^1.17.0",
     "ai": "^7.0.36"
   },
   "devDependencies": {
     "@types/node": "latest",
     "mastra": "latest",
+    "pngjs": "^7.0.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.10"
   }
