@@ -43,3 +43,19 @@ Any provider that's already OpenAI-wire-compatible (a self-hosted vLLM/Ollama se
 ### Metrics get a `provider` label, never an `owner` label
 
 `zerocache_cache_hits_total{provider="mistral"}` etc. Provider is a small, bounded, non-sensitive label — and this is incidentally the "per-consumer tagging" PRD §11 deferred, now available for free. Owner/tenant is explicitly excluded from metrics: it would leak tenant identity into a monitoring system and create one time series per tenant (unbounded cardinality).
+
+---
+
+## 2026-07-24: Real second-consumer testing found a real wire-contract bug mocks couldn't
+
+**What happened:** Built a real LangChain TypeScript RAG demo (`demo/langchain-ts/`) specifically to battle-test Zerocache from an unmodified real client's perspective, not just its own mocks. It found, within the first real-key run, that `embedQuery()` — LangChain's standard single-text embedding call, not an edge case — failed 100% of the time against Zerocache with a `422`.
+
+**Root cause:** `EmbeddingsRequest.input` in `zerocache-http/src/wire.rs` required a JSON array (`Vec<String>`). OpenAI's real `/v1/embeddings` endpoint accepts `input` as either a single string or an array of strings; `embedQuery()` sends the bare-string form, since that's the natural, documented shape for a single piece of text. Every existing Zerocache test — unit, integration, and the httpmock-stubbed provider tests — constructed `input` as an array, because that's what the plan/brief code and every hand-written test happened to use, not because anyone verified it against a real, unmodified client's actual wire behavior.
+
+**Why mocks and existing tests couldn't have caught this:** the bug is entirely in what shape of JSON Zerocache's *own* deserializer accepts on the way in — no mock of the store or provider is anywhere near this code path. It only surfaces when something outside the codebase's control (a real client library) sends a request shaped differently than every internal test assumed. This is the concrete argument for PRD §12's staged testing plan insisting on a real second consumer, not settling for #4's manual smoke test alone.
+
+**Real-world severity:** this didn't just fail an isolated call — `MemoryVectorStore.similaritySearch()` calls `embedQuery()` internally for the query text, so *every* RAG question-answering call failed, while document ingestion (which always batches, using the array form) worked fine. A demo — or a real production RAG app — would have looked completely functional through ingestion and then failed on literally the first real user question.
+
+**Fix:** `EmbeddingsRequest.input` now uses a custom `deserialize_with` (an untagged `String | Vec<String>` enum, wrapping a single string to a one-element `Vec`) so both shapes are accepted, matching OpenAI's actual contract. `DeleteRequest` shares the same struct, so it's fixed too, for free.
+
+**Also measured, not just reasoned about:** the same testing pass fired 5 concurrent requests for one never-before-seen text through Zerocache. All 5 independently missed the cache and called the provider — 4 of 5 calls were purely redundant spend. This is the first real, measured number behind the request-coalescing gap that's been discussed and deferred ("singleflight") across several sessions; previously it was only a theoretical concern.

@@ -3730,6 +3730,7 @@ dependencies = [
  "axum 0.7.9",
  "prometheus",
  "serde",
+ "serde_json",
  "tokio",
  "zerocache-adapters-gemini",
  "zerocache-adapters-mistral",
