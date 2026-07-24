@@ -20,12 +20,13 @@ use app::{check_store_readiness, delete_batch, embed_batch, AppError, AppState, 
 use config::{Config, StorageBackend};
 use wire::{DeleteResponse, EmbeddingObject, EmbeddingsRequest, EmbeddingsResponse, ErrorResponse, Usage};
 use zerocache_adapters_gemini::GeminiProvider;
+use zerocache_adapters_huggingface::HuggingFaceProvider;
 use zerocache_adapters_mistral::MistralProvider;
 use zerocache_adapters_openai::OpenAiProvider;
 use zerocache_adapters_redis::RedisStore;
 use zerocache_adapters_sled::SledStore;
 use zerocache_core::derive_owner_id;
-use zerocache_ports::{EmbeddingProvider, EmbeddingStore};
+use zerocache_ports::{EmbeddingProvider, EmbeddingStore, ImageEmbeddingProvider};
 
 #[tokio::main]
 async fn main() {
@@ -41,23 +42,26 @@ async fn main() {
         }
     };
 
+    let gemini_provider = Arc::new(GeminiProvider::new("https://generativelanguage.googleapis.com"));
+
     let mut providers: HashMap<String, Arc<dyn EmbeddingProvider>> = HashMap::new();
     providers.insert("openai".to_string(), Arc::new(OpenAiProvider::new("https://api.openai.com")));
     providers.insert("mistral".to_string(), Arc::new(MistralProvider::new("https://api.mistral.ai")));
+    providers.insert("gemini".to_string(), Arc::clone(&gemini_provider) as Arc<dyn EmbeddingProvider>);
     providers.insert(
-        "gemini".to_string(),
-        Arc::new(GeminiProvider::new("https://generativelanguage.googleapis.com")),
+        "huggingface".to_string(),
+        Arc::new(HuggingFaceProvider::new("https://router.huggingface.co/hf-inference")),
     );
+
+    let mut image_providers: HashMap<String, Arc<dyn ImageEmbeddingProvider>> = HashMap::new();
+    image_providers.insert("gemini".to_string(), gemini_provider as Arc<dyn ImageEmbeddingProvider>);
 
     let port = config.port;
 
     let state = Arc::new(AppState {
         store,
         providers,
-        // Populated in a later task (handler wiring) -- empty here only
-        // keeps this pre-existing struct literal compiling now that
-        // AppState carries the new field.
-        image_providers: HashMap::new(),
+        image_providers,
         metrics: Metrics::new(),
         in_flight: std::sync::Mutex::new(HashMap::new()),
     });
@@ -66,6 +70,10 @@ async fn main() {
         .route(
             "/:provider/v1/embeddings",
             post(embeddings_handler).delete(delete_handler),
+        )
+        .route(
+            "/:provider/v1/images/embeddings",
+            post(image_embeddings_handler).delete(delete_image_handler),
         )
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
@@ -256,6 +264,148 @@ async fn delete_handler(
     };
 
     let deleted = delete_batch(&state, delete_request).await.map_err(|err| {
+        let status = match &err {
+            AppError::Provider(_) => StatusCode::BAD_GATEWAY,
+            AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, Json(ErrorResponse { error: err.to_string() }))
+    })?;
+
+    Ok(Json(DeleteResponse { deleted }))
+}
+
+#[tracing::instrument(skip_all, fields(provider = %provider_name))]
+async fn image_embeddings_handler(
+    State(state): State<Arc<AppState>>,
+    Path(provider_name): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<EmbeddingsRequest>, JsonRejection>,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let Json(request) = body.map_err(json_rejection_to_error_response)?;
+
+    let api_key = extract_bearer_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "missing or malformed Authorization header (expected 'Bearer <key>')".to_string(),
+            }),
+        )
+    })?;
+
+    let provider = state.image_providers.get(&provider_name).cloned().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("provider '{provider_name}' does not support image embeddings"),
+            }),
+        )
+    })?;
+
+    let owner_id = derive_owner_id(&api_key);
+    let model = request.model;
+
+    let images: Vec<zerocache_ports::ImageInput> = request
+        .input
+        .iter()
+        .map(|uri| image::parse_data_uri(uri))
+        .collect::<Result<_, _>>()
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
+
+    let embed_request = app::EmbedImageRequest {
+        provider,
+        provider_name: &provider_name,
+        api_key: &api_key,
+        owner_id,
+        model: &model,
+        images: &images,
+    };
+
+    let result = app::embed_image_batch(&state, embed_request).await;
+
+    let (vectors, stats) = result.map_err(|err| {
+        let status = match &err {
+            AppError::Provider(_) => StatusCode::BAD_GATEWAY,
+            AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, Json(ErrorResponse { error: err.to_string() }))
+    })?;
+
+    let data = vectors
+        .into_iter()
+        .enumerate()
+        .map(|(index, embedding)| EmbeddingObject { object: "embedding", embedding, index })
+        .collect();
+
+    let mut response = Json(EmbeddingsResponse {
+        object: "list",
+        data,
+        model,
+        usage: Usage {
+            prompt_tokens: stats.provider_prompt_tokens,
+            total_tokens: stats.provider_total_tokens,
+        },
+    })
+    .into_response();
+
+    let headers = response.headers_mut();
+    headers.insert(
+        "x-zerocache-hits",
+        stats.hits.to_string().parse().expect("digit string is a valid header value"),
+    );
+    headers.insert(
+        "x-zerocache-misses",
+        stats.misses.to_string().parse().expect("digit string is a valid header value"),
+    );
+
+    Ok(response)
+}
+
+#[tracing::instrument(skip_all, fields(provider = %provider_name))]
+async fn delete_image_handler(
+    State(state): State<Arc<AppState>>,
+    Path(provider_name): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<EmbeddingsRequest>, JsonRejection>,
+) -> Result<Json<DeleteResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let Json(request) = body.map_err(json_rejection_to_error_response)?;
+
+    let api_key = extract_bearer_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "missing or malformed Authorization header (expected 'Bearer <key>')".to_string(),
+            }),
+        )
+    })?;
+
+    let provider = state.image_providers.get(&provider_name).cloned().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("provider '{provider_name}' does not support image embeddings"),
+            }),
+        )
+    })?;
+
+    let owner_id = derive_owner_id(&api_key);
+    let model = request.model;
+
+    let images: Vec<zerocache_ports::ImageInput> = request
+        .input
+        .iter()
+        .map(|uri| image::parse_data_uri(uri))
+        .collect::<Result<_, _>>()
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
+
+    let delete_request = app::DeleteImageRequest {
+        provider: provider.as_ref(),
+        provider_name: &provider_name,
+        owner_id,
+        model: &model,
+        images: &images,
+    };
+
+    let deleted = app::delete_image_batch(&state, delete_request).await.map_err(|err| {
         let status = match &err {
             AppError::Provider(_) => StatusCode::BAD_GATEWAY,
             AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
