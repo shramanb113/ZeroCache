@@ -6,6 +6,13 @@ use zerocache_ports::{EmbeddingProvider, ProviderError, ProviderUsage};
 // limit.
 const MAX_BATCH_SIZE: usize = 100;
 
+// A hung upstream connection must not block a request indefinitely -- 30s
+// is a conservative ceiling for a same-region HTTPS call to a major
+// provider's embeddings endpoint, not a measured SLA (none of the three
+// providers publish one). Uniform across adapters for the same reason
+// MAX_BATCH_SIZE is uniform: no verified per-provider number to tune to.
+const PROVIDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct GeminiProvider {
     client: reqwest::Client,
     base_url: String,
@@ -14,7 +21,10 @@ pub struct GeminiProvider {
 impl GeminiProvider {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(PROVIDER_TIMEOUT)
+                .build()
+                .expect("reqwest client with a timeout is always constructible"),
             base_url: base_url.into(),
         }
     }
