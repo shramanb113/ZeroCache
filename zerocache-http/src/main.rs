@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
 };
 
-use app::{delete_batch, embed_batch, AppError, AppState, DeleteRequest, EmbedRequest, Metrics};
+use app::{check_store_readiness, delete_batch, embed_batch, AppError, AppState, DeleteRequest, EmbedRequest, Metrics};
 use config::{Config, StorageBackend};
 use wire::{DeleteResponse, EmbeddingObject, EmbeddingsRequest, EmbeddingsResponse, ErrorResponse, Usage};
 use zerocache_adapters_gemini::GeminiProvider;
@@ -59,6 +59,8 @@ async fn main() {
             post(embeddings_handler).delete(delete_handler),
         )
         .route("/metrics", get(metrics_handler))
+        .route("/health", get(health_handler))
+        .route("/ready", get(ready_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
@@ -231,4 +233,15 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
         [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         state.metrics.encode(),
     )
+}
+
+async fn health_handler() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn ready_handler(State(state): State<Arc<AppState>>) -> StatusCode {
+    match check_store_readiness(&state).await {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
 }

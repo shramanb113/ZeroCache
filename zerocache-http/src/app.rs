@@ -272,6 +272,27 @@ pub async fn delete_batch(state: &AppState, request: DeleteRequest<'_>) -> Resul
     Ok(count)
 }
 
+/// A fixed, reserved cache key used only to prove the store is reachable --
+/// never a real cache entry a caller could hit or collide with, since no
+/// real request can produce owner_id = [0u8; 32] (a real owner_id is always
+/// derived from a hashed API key, which blake3 never maps to all-zero
+/// output in practice) combined with this reserved provider/model string.
+fn readiness_check_key() -> CacheKey {
+    CacheKey::derive([0u8; 32], "__zerocache_internal__", "__readiness_check__", "v1", "")
+}
+
+/// Proves the configured store backend is actually reachable, not just
+/// that the process is running. A miss is a healthy, expected result (the
+/// sentinel key is never written to) -- only a store-level error means
+/// "not ready."
+pub async fn check_store_readiness(state: &AppState) -> Result<(), AppError> {
+    let store = Arc::clone(&state.store);
+    let key = readiness_check_key();
+    tokio::task::spawn_blocking(move || store.get(&key).map(|_| ()).map_err(AppError::Store))
+        .await
+        .expect("readiness check task panicked")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap as StdHashMap;
@@ -809,5 +830,17 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(AppError::Store(_))));
+    }
+
+    #[tokio::test]
+    async fn readiness_check_succeeds_against_a_healthy_store() {
+        let state = state_with(MockStore::empty());
+        assert!(check_store_readiness(&state).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn readiness_check_fails_when_the_store_is_unreachable() {
+        let state = state_with(FailingStore);
+        assert!(matches!(check_store_readiness(&state).await, Err(AppError::Store(_))));
     }
 }
