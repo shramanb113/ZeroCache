@@ -1,7 +1,7 @@
 use reqwest_middleware::ClientBuilder;
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use serde::{Deserialize, Serialize};
-use zerocache_ports::{EmbeddingProvider, ProviderError, ProviderUsage};
+use zerocache_ports::{EmbeddingProvider, ImageEmbeddingProvider, ProviderError, ProviderUsage};
 
 // See zerocache-adapters-openai for why this is a single conservative
 // constant shared uniformly across adapters rather than a tuned per-provider
@@ -131,12 +131,104 @@ impl EmbeddingProvider for GeminiProvider {
     }
 }
 
+use zerocache_ports::ImageInput;
+
+#[derive(Serialize)]
+struct ImageBatchEmbedRequest {
+    requests: Vec<ImageEmbedContentRequest>,
+}
+
+#[derive(Serialize)]
+struct ImageEmbedContentRequest {
+    model: String,
+    content: ImageContent,
+}
+
+#[derive(Serialize)]
+struct ImageContent {
+    parts: Vec<ImagePart>,
+}
+
+#[derive(Serialize)]
+struct ImagePart {
+    inline_data: InlineImageData,
+}
+
+#[derive(Serialize)]
+struct InlineImageData {
+    mime_type: String,
+    data: String,
+}
+
+#[async_trait::async_trait]
+impl ImageEmbeddingProvider for GeminiProvider {
+    async fn embed_image_batch(
+        &self,
+        api_key: &str,
+        model: &str,
+        images: &[ImageInput],
+    ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
+        let qualified_model = format!("models/{model}");
+        let mut vectors = Vec::with_capacity(images.len());
+
+        for chunk in images.chunks(MAX_BATCH_SIZE) {
+            let body = ImageBatchEmbedRequest {
+                requests: chunk
+                    .iter()
+                    .map(|image| ImageEmbedContentRequest {
+                        model: qualified_model.clone(),
+                        content: ImageContent {
+                            parts: vec![ImagePart {
+                                inline_data: InlineImageData {
+                                    mime_type: image.mime_type.clone(),
+                                    data: image.data.clone(),
+                                },
+                            }],
+                        },
+                    })
+                    .collect(),
+            };
+
+            let response = self
+                .client
+                .post(format!("{}/v1beta/models/{model}:batchEmbedContents", self.base_url))
+                .header("x-goog-api-key", api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ProviderError(e.to_string()))?
+                .error_for_status()
+                .map_err(|e| ProviderError(e.to_string()))?
+                .json::<BatchEmbedResponse>()
+                .await
+                .map_err(|e| ProviderError(e.to_string()))?;
+
+            if response.embeddings.len() != chunk.len() {
+                return Err(ProviderError(format!(
+                    "expected {} embeddings in response, got {}",
+                    chunk.len(),
+                    response.embeddings.len()
+                )));
+            }
+
+            vectors.extend(response.embeddings.into_iter().map(|e| e.values));
+        }
+
+        Ok((vectors, ProviderUsage::default()))
+    }
+
+    fn version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
 
     use super::*;
+    use zerocache_ports::ImageInput;
 
     #[tokio::test]
     async fn embed_batch_sends_x_goog_api_key_not_bearer_auth() {
@@ -314,5 +406,104 @@ mod tests {
             1,
             "a 403 will never succeed on retry -- retrying it would only slow down a real auth failure for no benefit"
         );
+    }
+
+    #[tokio::test]
+    async fn embed_image_batch_sends_inline_data_with_correct_mime_type() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1beta/models/gemini-embedding-2:batchEmbedContents")
+                    .header("x-goog-api-key", "test-key")
+                    .json_body(json!({
+                        "requests": [
+                            {
+                                "model": "models/gemini-embedding-2",
+                                "content": { "parts": [{ "inline_data": { "mime_type": "image/png", "data": "aGVsbG8=" } }] }
+                            }
+                        ]
+                    }));
+                then.status(200).json_body(json!({ "embeddings": [{ "values": [0.5, 0.6] }] }));
+            })
+            .await;
+
+        let provider = GeminiProvider::new(server.base_url());
+        let images = vec![ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() }];
+        let (vectors, usage) = provider.embed_image_batch("test-key", "gemini-embedding-2", &images).await.unwrap();
+
+        mock.assert_async().await;
+        assert_eq!(vectors, vec![vec![0.5, 0.6]]);
+        assert_eq!(usage.prompt_tokens, 0, "Gemini embeddings never report usage, image path included");
+    }
+
+    #[tokio::test]
+    async fn embed_image_batch_produces_one_independent_vector_per_image_not_a_combined_one() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1beta/models/gemini-embedding-2:batchEmbedContents")
+                    .matches(|req| {
+                        let body: serde_json::Value =
+                            serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
+                        // Two requests entries, each with exactly one part --
+                        // proves images are batched as independent embed
+                        // requests, not combined into one interleaved part list.
+                        body["requests"].as_array().map(|a| a.len()) == Some(2)
+                            && body["requests"][0]["content"]["parts"].as_array().map(|a| a.len()) == Some(1)
+                    });
+                then.status(200).json_body(json!({
+                    "embeddings": [{ "values": [1.0] }, { "values": [2.0] }]
+                }));
+            })
+            .await;
+
+        let provider = GeminiProvider::new(server.base_url());
+        let images = vec![
+            ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() },
+            ImageInput { mime_type: "image/jpeg".to_string(), data: "d29ybGQ=".to_string() },
+        ];
+        let (vectors, _usage) = provider.embed_image_batch("test-key", "gemini-embedding-2", &images).await.unwrap();
+
+        mock.assert_async().await;
+        assert_eq!(vectors, vec![vec![1.0], vec![2.0]]);
+    }
+
+    #[tokio::test]
+    async fn embed_image_batch_returns_error_on_http_error_status() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1beta/models/gemini-embedding-2:batchEmbedContents");
+                then.status(403).json_body(json!({ "error": { "message": "API key not valid" } }));
+            })
+            .await;
+
+        let provider = GeminiProvider::new(server.base_url());
+        let images = vec![ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() }];
+        let result = provider.embed_image_batch("bad-key", "gemini-embedding-2", &images).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn embed_image_batch_returns_error_when_vector_count_does_not_match_image_count() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1beta/models/gemini-embedding-2:batchEmbedContents");
+                then.status(200).json_body(json!({ "embeddings": [{ "values": [1.0] }] }));
+            })
+            .await;
+
+        let provider = GeminiProvider::new(server.base_url());
+        let images = vec![
+            ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() },
+            ImageInput { mime_type: "image/png".to_string(), data: "d29ybGQ=".to_string() },
+        ];
+        let result = provider.embed_image_batch("test-key", "gemini-embedding-2", &images).await;
+
+        assert!(result.is_err(), "a count mismatch must be a hard error, same discipline as the text path");
     }
 }

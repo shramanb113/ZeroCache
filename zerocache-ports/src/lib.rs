@@ -56,3 +56,30 @@ pub trait EmbeddingProvider: Send + Sync {
     /// crate already needs.
     fn version(&self) -> &'static str;
 }
+
+/// One image to embed: raw base64 payload plus the MIME type Gemini's
+/// `inline_data` part needs to interpret it. The `data:...;base64,` prefix a
+/// caller sends over HTTP is stripped before this struct is built -- that
+/// parsing is wire-shape translation, so it lives in zerocache-http, not here.
+pub struct ImageInput {
+    pub mime_type: String,
+    pub data: String,
+}
+
+/// A separate trait from `EmbeddingProvider`, not an extension of it, because
+/// only one of the three provider adapters can implement it for real (see
+/// CLAUDE.md Deviations: OpenAI has no public image-embedding API at all) --
+/// a default-returns-"unsupported" method on `EmbeddingProvider` itself would
+/// force every future text-only adapter to carry dead code for a capability
+/// it can never have.
+#[async_trait::async_trait]
+pub trait ImageEmbeddingProvider: Send + Sync {
+    async fn embed_image_batch(
+        &self,
+        api_key: &str,
+        model: &str,
+        images: &[ImageInput],
+    ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError>;
+
+    fn version(&self) -> &'static str;
+}
