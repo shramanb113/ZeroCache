@@ -11,6 +11,7 @@ zerocache-adapters-redis = { path = "../zerocache-adapters-redis" }
 zerocache-adapters-openai = { path = "../zerocache-adapters-openai" }
 zerocache-adapters-mistral = { path = "../zerocache-adapters-mistral" }
 zerocache-adapters-gemini = { path = "../zerocache-adapters-gemini" }
+zerocache-adapters-huggingface = { path = "../zerocache-adapters-huggingface" }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 serde = { version = "1", features = ["derive"] }

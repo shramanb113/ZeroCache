@@ -3944,6 +3944,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "zerocache-adapters-huggingface"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "httpmock",
+ "reqwest",
+ "reqwest-middleware",
+ "reqwest-retry",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zerocache-ports",
+]
+
+[[package]]
 name = "zerocache-adapters-mistral"
 version = "0.1.0"
 dependencies = [
@@ -4019,6 +4034,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "zerocache-adapters-gemini",
+ "zerocache-adapters-huggingface",
  "zerocache-adapters-mistral",
  "zerocache-adapters-openai",
  "zerocache-adapters-redis",
