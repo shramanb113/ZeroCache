@@ -1,19 +1,13 @@
 import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
 import { embedText } from "../zerocache/client";
+import { requireEnv, ZEROCACHE_BASE_URL } from "../zerocache/env";
 import { query } from "../rag/vector-store";
 
 // Deliberately NOT importing from "../rag/ingest" -- that module calls
 // requireEnv("OPENAI_API_KEY")/requireEnv("GEMINI_API_KEY") at module load
 // time, so importing it here would throw at import time if either var is
 // unset, even for a run that only ever calls this text-only tool.
-const ZEROCACHE_BASE_URL = process.env.ZEROCACHE_BASE_URL ?? "http://localhost:8080";
-
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) throw new Error(`missing required env var ${name}`);
-  return value;
-}
 
 export const searchDocumentsTool = createTool({
   id: "searchDocuments",

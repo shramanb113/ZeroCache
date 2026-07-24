@@ -1,17 +1,11 @@
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { embedText, embedImage } from "../zerocache/client";
+import { requireEnv, ZEROCACHE_BASE_URL } from "../zerocache/env";
 import { createIndex, upsert } from "./vector-store";
 
-const ZEROCACHE_BASE_URL = process.env.ZEROCACHE_BASE_URL ?? "http://localhost:8080";
 const OPENAI_API_KEY = requireEnv("OPENAI_API_KEY");
 const GEMINI_API_KEY = requireEnv("GEMINI_API_KEY");
-
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) throw new Error(`missing required env var ${name}`);
-  return value;
-}
 
 function mimeTypeForExtension(ext: string): string {
   switch (ext) {

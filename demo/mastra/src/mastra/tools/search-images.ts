@@ -1,18 +1,12 @@
 import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
 import { embedImage } from "../zerocache/client";
+import { requireEnv, ZEROCACHE_BASE_URL } from "../zerocache/env";
 import { query } from "../rag/vector-store";
 
 // Deliberately NOT importing from "../rag/ingest" -- see search-documents.ts
 // for why (module-load-time requireEnv() calls in ingest.ts would throw at
 // import time for an unrelated code path).
-const ZEROCACHE_BASE_URL = process.env.ZEROCACHE_BASE_URL ?? "http://localhost:8080";
-
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) throw new Error(`missing required env var ${name}`);
-  return value;
-}
 
 export const searchImagesTool = createTool({
   id: "searchImages",
