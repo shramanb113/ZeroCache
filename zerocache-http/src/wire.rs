@@ -43,6 +43,14 @@ pub struct EmbeddingsResponse {
 
 #[derive(Serialize)]
 pub struct EmbeddingObject {
+    // The real OpenAI API sets this on every entry. TS/JS clients duck-type
+    // and never noticed it was missing here, but Python's openai SDK parses
+    // responses through Pydantic models where this is a required, typed
+    // field (Literal["embedding"], no default) -- omitting it would fail
+    // to parse on literally every response, not just an edge case.
+    // Anticipated ahead of the Python/LlamaIndex work rather than found by
+    // it, unlike the `input` bug.
+    pub object: &'static str,
     pub embedding: Vec<f32>,
     pub index: usize,
 }

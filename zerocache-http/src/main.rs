@@ -172,7 +172,7 @@ async fn embeddings_handler(
     let data = vectors
         .into_iter()
         .enumerate()
-        .map(|(index, embedding)| EmbeddingObject { embedding, index })
+        .map(|(index, embedding)| EmbeddingObject { object: "embedding", embedding, index })
         .collect();
 
     let mut response = Json(EmbeddingsResponse {
