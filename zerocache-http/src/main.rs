@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod otel;
 mod wire;
 
 use std::collections::HashMap;
@@ -12,6 +13,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use tower_http::trace::TraceLayer;
 
 use app::{check_store_readiness, delete_batch, embed_batch, AppError, AppState, DeleteRequest, EmbedRequest, Metrics};
 use config::{Config, StorageBackend};
@@ -26,6 +28,7 @@ use zerocache_ports::{EmbeddingProvider, EmbeddingStore};
 
 #[tokio::main]
 async fn main() {
+    let tracer_provider = otel::init();
     let config = Config::from_env();
 
     let store: Arc<dyn EmbeddingStore> = match config.storage_backend {
@@ -62,16 +65,26 @@ async fn main() {
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
+        .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .expect("failed to bind port");
-    println!("zerocache-http listening on 0.0.0.0:{port}");
+    tracing::info!(port, "zerocache-http listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server error");
+
+    // The batch span exporter buffers spans in memory; an unflushed exit
+    // can silently drop whatever hasn't been sent yet. Only relevant when
+    // OTLP export is actually enabled (otel::init returns None otherwise).
+    if let Some(provider) = tracer_provider {
+        if let Err(e) = provider.shutdown() {
+            eprintln!("warning: failed to flush OpenTelemetry spans on shutdown: {e}");
+        }
+    }
 }
 
 /// Resolves on Ctrl+C (works on every platform, including the Windows dev
@@ -101,7 +114,7 @@ async fn shutdown_signal() {
         _ = terminate => {}
     }
 
-    println!("shutdown signal received, finishing in-flight requests");
+    tracing::info!("shutdown signal received, finishing in-flight requests");
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -122,6 +135,7 @@ fn json_rejection_to_error_response(rejection: JsonRejection) -> (StatusCode, Js
     (rejection.status(), Json(ErrorResponse { error: rejection.body_text() }))
 }
 
+#[tracing::instrument(skip_all, fields(provider = %provider_name))]
 async fn embeddings_handler(
     State(state): State<Arc<AppState>>,
     Path(provider_name): Path<String>,
@@ -199,6 +213,7 @@ async fn embeddings_handler(
     Ok(response)
 }
 
+#[tracing::instrument(skip_all, fields(provider = %provider_name))]
 async fn delete_handler(
     State(state): State<Arc<AppState>>,
     Path(provider_name): Path<String>,

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use futures::future::{FutureExt, Shared};
 use prometheus::{Encoder, IntCounterVec, Opts, Registry, TextEncoder};
+use tracing::Instrument;
 
 use zerocache_core::{normalize_text, reconcile, CacheKey};
 use zerocache_ports::{EmbeddingProvider, EmbeddingStore, ProviderError, ProviderUsage, StoreError};
@@ -221,6 +222,7 @@ pub struct EmbedRequest<'a> {
 /// A store or provider failure aborts the whole batch rather than degrading
 /// silently into an extra miss or a dropped write — the caller is expected
 /// to surface it as an error response.
+#[tracing::instrument(skip_all, fields(provider = %request.provider_name, texts = request.texts.len(), hits, misses))]
 pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<(Vec<Vec<f32>>, BatchStats), AppError> {
     let provider_version = request.provider.version();
     let normalized_texts: Vec<String> = request.texts.iter().map(|text| normalize_text(text)).collect();
@@ -232,11 +234,14 @@ pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<
     let reconciled = {
         let store = Arc::clone(&state.store);
         let keys_for_lookup = keys.clone();
-        run_store_task(move || reconcile(&keys_for_lookup, |key| store.get(key).map_err(AppError::Store))).await?
+        run_store_task(move || reconcile(&keys_for_lookup, |key| store.get(key).map_err(AppError::Store)))
+            .instrument(tracing::info_span!("store_lookup"))
+            .await?
     };
 
     let hits = reconciled.hits.len();
     let misses = reconciled.misses.len();
+    tracing::Span::current().record("hits", hits).record("misses", misses);
 
     let mut results: Vec<Option<Vec<f32>>> = vec![None; request.texts.len()];
     for (index, vector) in reconciled.hits {
@@ -299,6 +304,7 @@ pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<
             }
             Ok(())
         })
+        .instrument(tracing::info_span!("store_write_back"))
         .await?;
     }
 
@@ -340,6 +346,7 @@ pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<
 /// fetched once per replica. Solving that needs a distributed coordination
 /// mechanism (e.g. a Redis-backed lock), which is real, separate, harder
 /// work -- deliberately out of scope here.
+#[tracing::instrument(skip_all, fields(unique_keys = unique_keys.len(), claimed, piggybacked))]
 async fn fetch_coalesced(
     state: &AppState,
     provider: Arc<dyn EmbeddingProvider>,
@@ -371,11 +378,15 @@ async fn fetch_coalesced(
             let claim_keys_for_future = claim_keys.clone();
             let claim_texts_for_future = claim_texts.clone();
 
-            let fut: Pin<Box<dyn Future<Output = SharedFetchOutput> + Send>> = Box::pin(async move {
-                let (vectors, usage) = provider.embed_batch(&api_key, &model, &claim_texts_for_future).await?;
-                let by_key = claim_keys_for_future.into_iter().zip(vectors).collect();
-                Ok((Arc::new(by_key), usage))
-            });
+            let claim_count = claim_keys.len();
+            let fut: Pin<Box<dyn Future<Output = SharedFetchOutput> + Send>> = Box::pin(
+                async move {
+                    let (vectors, usage) = provider.embed_batch(&api_key, &model, &claim_texts_for_future).await?;
+                    let by_key = claim_keys_for_future.into_iter().zip(vectors).collect();
+                    Ok((Arc::new(by_key), usage))
+                }
+                .instrument(tracing::info_span!("provider_call", texts = claim_count)),
+            );
             let shared: SharedFetch = fut.shared();
 
             for key in &claim_keys {
@@ -384,6 +395,10 @@ async fn fetch_coalesced(
             own_claim = Some(shared);
         }
     }
+
+    tracing::Span::current()
+        .record("claimed", claim_keys.len())
+        .record("piggybacked", piggyback_waiters.len());
 
     let mut resolved: HashMap<CacheKey, Vec<f32>> = HashMap::with_capacity(unique_keys.len());
     let mut claimed_usage = ProviderUsage::default();
@@ -428,6 +443,7 @@ pub struct DeleteRequest<'a> {
 /// provider/model/texts (and the same caller) would have hit. Returns the
 /// number of keys the delete was attempted for -- deletion is idempotent, so
 /// this is not "how many existed," just "how many were requested."
+#[tracing::instrument(skip_all, fields(provider = %request.provider_name, texts = request.texts.len()))]
 pub async fn delete_batch(state: &AppState, request: DeleteRequest<'_>) -> Result<usize, AppError> {
     let provider_version = request.provider.version();
     let keys: Vec<CacheKey> = request
@@ -444,6 +460,7 @@ pub async fn delete_batch(state: &AppState, request: DeleteRequest<'_>) -> Resul
         }
         Ok(())
     })
+    .instrument(tracing::info_span!("store_delete"))
     .await?;
 
     Ok(count)
