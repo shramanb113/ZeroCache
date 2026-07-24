@@ -18,6 +18,34 @@ impl CacheKey {
         Self(*hasher.finalize().as_bytes())
     }
 
+    /// Domain-separated from `derive` via the "image\0" literal below the
+    /// model-version field -- guarantees an image-derived key can never
+    /// collide with a text-derived key even if the image's base64 payload
+    /// happens to equal some unrelated text byte-for-byte.
+    pub fn derive_image(
+        owner_id: [u8; 32],
+        provider: &str,
+        model: &str,
+        model_version: &str,
+        mime_type: &str,
+        data_base64: &str,
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&owner_id);
+        hasher.update(b"\0");
+        hasher.update(provider.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(model.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(model_version.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(b"image\0");
+        hasher.update(mime_type.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(data_base64.as_bytes());
+        Self(*hasher.finalize().as_bytes())
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -63,5 +91,30 @@ mod tests {
         let a = CacheKey::derive(OWNER_A, "openai", "embed-v1", "v1", "same text");
         let b = CacheKey::derive(OWNER_A, "mistral", "embed-v1", "v1", "same text");
         assert_ne!(a, b, "two providers with an identically-named model must never collide");
+    }
+
+    #[test]
+    fn derive_image_same_inputs_produce_same_key() {
+        let a = CacheKey::derive_image(OWNER_A, "gemini", "gemini-embedding-2", "v1", "image/png", "YmFzZTY0");
+        let b = CacheKey::derive_image(OWNER_A, "gemini", "gemini-embedding-2", "v1", "image/png", "YmFzZTY0");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn derive_image_key_never_collides_with_a_text_key_of_identical_bytes() {
+        // Guards against the base64 payload of an image happening to match
+        // the literal text of an unrelated cache entry -- the "image\0"
+        // domain-separation byte inside derive_image must make this
+        // impossible even if every other field lines up exactly.
+        let text_key = CacheKey::derive(OWNER_A, "gemini", "gemini-embedding-2", "v1", "YmFzZTY0");
+        let image_key = CacheKey::derive_image(OWNER_A, "gemini", "gemini-embedding-2", "v1", "image/png", "YmFzZTY0");
+        assert_ne!(text_key, image_key);
+    }
+
+    #[test]
+    fn derive_image_different_mime_type_produces_different_key() {
+        let a = CacheKey::derive_image(OWNER_A, "gemini", "gemini-embedding-2", "v1", "image/png", "YmFzZTY0");
+        let b = CacheKey::derive_image(OWNER_A, "gemini", "gemini-embedding-2", "v1", "image/jpeg", "YmFzZTY0");
+        assert_ne!(a, b, "the same bytes decoded under a different mime type are a different image");
     }
 }
