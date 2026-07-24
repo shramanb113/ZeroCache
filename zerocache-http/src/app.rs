@@ -28,12 +28,29 @@ const STORE_TIMEOUT: Duration = Duration::from_secs(5);
 /// read/write timeouts, which do bound the underlying call itself; this
 /// wrapper is the uniform backstop for any backend, including ones that
 /// don't set their own.
+///
+/// When `task` loops over multiple keys (as `embed_batch`'s reconcile and
+/// write-back steps, and `delete_batch`, all do), `STORE_TIMEOUT` bounds the
+/// whole loop, not each individual key -- a per-batch budget, not a
+/// per-operation one. Fine given `MAX_BATCH_SIZE = 100`, but worth knowing
+/// if that constant ever grows.
 async fn run_store_task<T, F>(task: F) -> Result<T, AppError>
 where
     F: FnOnce() -> Result<T, AppError> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::time::timeout(STORE_TIMEOUT, tokio::task::spawn_blocking(task))
+    run_store_task_with_timeout(STORE_TIMEOUT, task).await
+}
+
+/// The actual timeout/panic-disambiguation logic, parameterized so tests can
+/// exercise the timeout-fires and panic-propagates branches in milliseconds
+/// instead of waiting on the real `STORE_TIMEOUT`.
+async fn run_store_task_with_timeout<T, F>(timeout: Duration, task: F) -> Result<T, AppError>
+where
+    F: FnOnce() -> Result<T, AppError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::time::timeout(timeout, tokio::task::spawn_blocking(task))
         .await
         .map_err(|_| AppError::Store(StoreError("store operation timed out".into())))?
         .expect("store task panicked")
@@ -169,11 +186,12 @@ pub struct EmbedRequest<'a> {
 /// provider is called once per unique text, not once per original index, and
 /// the same fetched vector is broadcast back to every matching position.
 ///
-/// Store reads and store writes each run inside their own
-/// `tokio::task::spawn_blocking`, since `sled`/`redis` are synchronous. The
-/// provider call in between is awaited directly — it's async now, not
-/// blocking, so it runs on the same runtime as the rest of the server
-/// instead of needing a thread-pool hop.
+/// Store reads and store writes each run via `run_store_task`, which puts
+/// them on their own `tokio::task::spawn_blocking` (since `sled`/`redis` are
+/// synchronous) bounded by `STORE_TIMEOUT`. The provider call in between is
+/// awaited directly — it's async now, not blocking, so it runs on the same
+/// runtime as the rest of the server instead of needing a thread-pool hop,
+/// and is bounded separately by each adapter's own `PROVIDER_TIMEOUT`.
 ///
 /// A store or provider failure aborts the whole batch rather than degrading
 /// silently into an extra miss or a dropped write — the caller is expected
@@ -866,5 +884,29 @@ mod tests {
     async fn readiness_check_fails_when_the_store_is_unreachable() {
         let state = state_with(FailingStore);
         assert!(matches!(check_store_readiness(&state).await, Err(AppError::Store(_))));
+    }
+
+    #[tokio::test]
+    async fn run_store_task_times_out_on_a_hung_closure() {
+        let result: Result<(), AppError> = run_store_task_with_timeout(Duration::from_millis(20), || {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(())
+        })
+        .await;
+
+        assert!(matches!(result, Err(AppError::Store(_))), "a closure that outlives the timeout must surface as a store timeout error");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "store task panicked")]
+    async fn run_store_task_propagates_a_panic_rather_than_reporting_it_as_a_timeout() {
+        // A generous timeout, so if this test ever fails by reporting a
+        // timeout instead of panicking, that's a real regression -- the
+        // panic resolves almost instantly, long before the timeout could
+        // fire on its own.
+        let _: Result<(), AppError> = run_store_task_with_timeout(Duration::from_secs(30), || {
+            panic!("simulated store task panic");
+        })
+        .await;
     }
 }
