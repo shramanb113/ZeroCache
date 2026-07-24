@@ -1,0 +1,25 @@
+{
+  "name": "zerocache-demo-langchain-ts",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "rag": "tsx src/rag.ts",
+    "battle-test": "tsx src/battle-test.ts"
+  },
+  "dependencies": {
+    "@langchain/classic": "^1.0.40",
+    "@langchain/core": "latest",
+    "@langchain/openai": "latest",
+    "@langchain/textsplitters": "^1.0.1",
+    "langchain": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "tsx": "latest",
+    "typescript": "latest"
+  }
+}
