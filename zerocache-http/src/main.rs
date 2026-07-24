@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod image;
 mod otel;
 mod wire;
 
