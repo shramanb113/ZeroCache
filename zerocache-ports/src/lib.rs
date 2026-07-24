@@ -13,7 +13,11 @@ impl fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
-#[derive(Debug)]
+// Clone is needed so a ProviderError can flow through a coalesced,
+// futures::future::Shared in-flight fetch (zerocache-http's request
+// coalescing) -- every waiter on a shared future gets its own clone of the
+// resolved Result, error included.
+#[derive(Debug, Clone)]
 pub struct ProviderError(pub String);
 
 impl fmt::Display for ProviderError {

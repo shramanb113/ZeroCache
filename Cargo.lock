@@ -3728,6 +3728,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
+ "futures",
  "prometheus",
  "serde",
  "serde_json",

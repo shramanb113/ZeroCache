@@ -1,12 +1,24 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::future::{FutureExt, Shared};
 use prometheus::{Encoder, IntCounterVec, Opts, Registry, TextEncoder};
 
 use zerocache_core::{normalize_text, reconcile, CacheKey};
-use zerocache_ports::{EmbeddingProvider, EmbeddingStore, ProviderError, StoreError};
+use zerocache_ports::{EmbeddingProvider, EmbeddingStore, ProviderError, ProviderUsage, StoreError};
+
+/// What a coalesced fetch resolves to: every claimed key's vector plus the
+/// usage from the one real provider call that produced them. `Arc`-wrapped
+/// so every waiter's clone of the `Shared` future is cheap regardless of
+/// batch size; `ProviderUsage` is already `Copy`, `ProviderError` is
+/// `Clone` (zerocache-ports) specifically so this type can satisfy
+/// `Shared`'s `Output: Clone` bound.
+type SharedFetchOutput = Result<(Arc<HashMap<CacheKey, Vec<f32>>>, ProviderUsage), ProviderError>;
+type SharedFetch = Shared<Pin<Box<dyn Future<Output = SharedFetchOutput> + Send>>>;
 
 // A store call is not bounded by PROVIDER_TIMEOUT, which only applies to
 // provider HTTP calls -- without this, a stuck store backend (e.g. a stale
@@ -60,6 +72,16 @@ pub struct AppState {
     pub store: Arc<dyn EmbeddingStore>,
     pub providers: HashMap<String, Arc<dyn EmbeddingProvider>>,
     pub metrics: Metrics,
+    // Request coalescing (in-process only -- see fetch_coalesced): tracks
+    // provider fetches currently in flight, keyed by CacheKey, so two
+    // concurrent requests missing on the exact same key share one provider
+    // call instead of each independently paying for it. A std Mutex, not
+    // tokio's: the critical section is pure HashMap bookkeeping, never
+    // holds the lock across an .await, so there's no reason to pay for an
+    // async-aware mutex. pub for the same reason every other AppState field
+    // is: this codebase constructs AppState via plain struct literals, not
+    // a constructor, everywhere it's built (main.rs, tests).
+    pub in_flight: Mutex<HashMap<CacheKey, SharedFetch>>,
 }
 
 // Cumulative counters since process start, in Prometheus text-exposition
@@ -166,7 +188,10 @@ pub struct BatchStats {
 /// registry is keyed by name, not by adapter identity), whose namespace this
 /// is, and the batch itself.
 pub struct EmbedRequest<'a> {
-    pub provider: &'a dyn EmbeddingProvider,
+    // Owned (Arc), not borrowed like the other fields: fetch_coalesced
+    // needs to build a 'static future that can outlive this request's own
+    // stack frame when another concurrent request piggybacks on it.
+    pub provider: Arc<dyn EmbeddingProvider>,
     pub provider_name: &'a str,
     pub api_key: &'a str,
     pub owner_id: [u8; 32],
@@ -228,32 +253,43 @@ pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<
         // unique text once, then broadcast its vector to every index that
         // shares its key.
         let mut unique_miss_texts: Vec<String> = Vec::new();
+        let mut unique_keys: Vec<CacheKey> = Vec::new();
         let mut key_to_unique_index: HashMap<CacheKey, usize> = HashMap::new();
         let mut index_to_unique_index: Vec<(usize, usize)> = Vec::with_capacity(reconciled.misses.len());
 
         for (index, key) in &reconciled.misses {
             let unique_index = *key_to_unique_index.entry(*key).or_insert_with(|| {
                 unique_miss_texts.push(normalized_texts[*index].clone());
+                unique_keys.push(*key);
                 unique_miss_texts.len() - 1
             });
             index_to_unique_index.push((*index, unique_index));
         }
 
-        let (fetched, usage) = request
-            .provider
-            .embed_batch(request.api_key, request.model, &unique_miss_texts)
-            .await
-            .map_err(AppError::Provider)?;
+        // Cross-request coalescing: if another concurrent request is
+        // already fetching one of our unique missing keys, piggyback on
+        // its result instead of independently calling the provider for the
+        // same text. See fetch_coalesced for the mechanics.
+        let (fetched, usage) = fetch_coalesced(
+            state,
+            Arc::clone(&request.provider),
+            request.api_key,
+            request.model,
+            &unique_keys,
+            &unique_miss_texts,
+        )
+        .await?;
         provider_prompt_tokens = usage.prompt_tokens;
         provider_total_tokens = usage.total_tokens;
 
         for (index, unique_index) in &index_to_unique_index {
-            results[*index] = Some(fetched[*unique_index].clone());
+            let key = &unique_keys[*unique_index];
+            results[*index] = Some(fetched[key].clone());
         }
 
-        let mut writes = Vec::with_capacity(key_to_unique_index.len());
-        for (key, unique_index) in key_to_unique_index {
-            writes.push((key, fetched[unique_index].clone()));
+        let mut writes = Vec::with_capacity(unique_keys.len());
+        for key in &unique_keys {
+            writes.push((*key, fetched[key].clone()));
         }
 
         let store = Arc::clone(&state.store);
@@ -275,6 +311,103 @@ pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<
     state.metrics.record(request.provider_name, &stats);
 
     Ok((vectors, stats))
+}
+
+/// Resolves every key in `unique_keys` to its embedding, coalescing with
+/// any identical concurrent in-flight fetch from another request instead of
+/// independently calling the provider for the same text twice.
+///
+/// This only dedupes the provider call itself -- every caller (whether it
+/// claimed the fetch or piggybacked on someone else's) still writes its own
+/// copy of the resolved vectors back to the store afterward. That's a
+/// deliberate simplification, not an oversight: redundant writes of an
+/// identical value are already an accepted correctness model in this
+/// codebase (see zerocache-adapters-redis's own last-write-wins rationale
+/// for concurrent replicas), so coalescing the write too isn't worth the
+/// extra complexity it would add here.
+///
+/// The returned `ProviderUsage` reflects only the subset of `unique_keys`
+/// this specific call actually caused a *new* provider call for -- keys
+/// resolved by piggybacking on another request's in-flight fetch
+/// contribute zero tokens, exactly like a cache hit, since no additional
+/// billing happened on this call's behalf. If this call claimed nothing
+/// (every key was already in flight elsewhere), it returns default (zero)
+/// usage, the same as an all-hit batch.
+///
+/// In-process only: each Zerocache instance coalesces its own concurrent
+/// requests, but two different replicas behind a load balancer each run
+/// their own independent `in_flight` map, so the same miss can still be
+/// fetched once per replica. Solving that needs a distributed coordination
+/// mechanism (e.g. a Redis-backed lock), which is real, separate, harder
+/// work -- deliberately out of scope here.
+async fn fetch_coalesced(
+    state: &AppState,
+    provider: Arc<dyn EmbeddingProvider>,
+    api_key: &str,
+    model: &str,
+    unique_keys: &[CacheKey],
+    unique_texts: &[String],
+) -> Result<(HashMap<CacheKey, Vec<f32>>, ProviderUsage), AppError> {
+    let mut piggyback_waiters: Vec<SharedFetch> = Vec::new();
+    let mut claim_keys: Vec<CacheKey> = Vec::new();
+    let mut claim_texts: Vec<String> = Vec::new();
+    let mut own_claim: Option<SharedFetch> = None;
+
+    {
+        let mut in_flight = state.in_flight.lock().expect("in_flight mutex poisoned");
+
+        for (key, text) in unique_keys.iter().zip(unique_texts) {
+            if let Some(existing) = in_flight.get(key) {
+                piggyback_waiters.push(existing.clone());
+            } else {
+                claim_keys.push(*key);
+                claim_texts.push(text.clone());
+            }
+        }
+
+        if !claim_keys.is_empty() {
+            let api_key = api_key.to_string();
+            let model = model.to_string();
+            let claim_keys_for_future = claim_keys.clone();
+            let claim_texts_for_future = claim_texts.clone();
+
+            let fut: Pin<Box<dyn Future<Output = SharedFetchOutput> + Send>> = Box::pin(async move {
+                let (vectors, usage) = provider.embed_batch(&api_key, &model, &claim_texts_for_future).await?;
+                let by_key = claim_keys_for_future.into_iter().zip(vectors).collect();
+                Ok((Arc::new(by_key), usage))
+            });
+            let shared: SharedFetch = fut.shared();
+
+            for key in &claim_keys {
+                in_flight.insert(*key, shared.clone());
+            }
+            own_claim = Some(shared);
+        }
+    }
+
+    let mut resolved: HashMap<CacheKey, Vec<f32>> = HashMap::with_capacity(unique_keys.len());
+    let mut claimed_usage = ProviderUsage::default();
+
+    if let Some(claim_fut) = own_claim {
+        let (vectors, usage) = claim_fut.await.map_err(AppError::Provider)?;
+        resolved.extend(vectors.iter().map(|(k, v)| (*k, v.clone())));
+        claimed_usage = usage;
+
+        // Remove our claimed keys now that they're resolved, so a later,
+        // genuinely new miss for the same key starts a fresh fetch instead
+        // of piggybacking on a completed, no-longer-useful future forever.
+        let mut in_flight = state.in_flight.lock().expect("in_flight mutex poisoned");
+        for key in &claim_keys {
+            in_flight.remove(key);
+        }
+    }
+
+    for waiter in piggyback_waiters {
+        let (vectors, _usage) = waiter.await.map_err(AppError::Provider)?;
+        resolved.extend(vectors.iter().map(|(k, v)| (*k, v.clone())));
+    }
+
+    Ok((resolved, claimed_usage))
 }
 
 /// Everything one `DELETE /{provider}/v1/embeddings` call needs: which
@@ -455,6 +588,7 @@ mod tests {
             store: Arc::new(store),
             providers: StdHashMap::new(),
             metrics: Metrics::new(),
+            in_flight: Mutex::new(StdHashMap::new()),
         }
     }
 
@@ -468,7 +602,7 @@ mod tests {
         let (vectors, stats) = embed_batch(
             &state,
             EmbedRequest {
-                provider: &provider,
+                provider: Arc::new(provider),
                 provider_name: "openai",
                 api_key: "key",
                 owner_id: OWNER_A,
@@ -494,7 +628,7 @@ mod tests {
         let (vectors, stats) = embed_batch(
             &state,
             EmbedRequest {
-                provider: &provider,
+                provider: Arc::new(provider),
                 provider_name: "openai",
                 api_key: "key",
                 owner_id: OWNER_A,
@@ -524,7 +658,7 @@ mod tests {
         let (vectors, stats) = embed_batch(
             &state,
             EmbedRequest {
-                provider: &provider,
+                provider: Arc::new(provider),
                 provider_name: "openai",
                 api_key: "key",
                 owner_id: OWNER_A,
@@ -543,13 +677,13 @@ mod tests {
     #[tokio::test]
     async fn different_owners_never_share_a_cache_entry() {
         let state = state_with(MockStore::empty());
-        let provider = MockProvider { response: vec![vec![7.0]] };
+        let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockProvider { response: vec![vec![7.0]] });
         let texts = vec!["identical text".to_string()];
 
         let (_, stats_a) = embed_batch(
             &state,
             EmbedRequest {
-                provider: &provider,
+                provider: Arc::clone(&provider),
                 provider_name: "openai",
                 api_key: "key-a",
                 owner_id: OWNER_A,
@@ -564,7 +698,7 @@ mod tests {
         let (_, stats_b) = embed_batch(
             &state,
             EmbedRequest {
-                provider: &provider,
+                provider: Arc::clone(&provider),
                 provider_name: "openai",
                 api_key: "key-b",
                 owner_id: OWNER_B,
@@ -586,7 +720,7 @@ mod tests {
         let result = embed_batch(
             &state,
             EmbedRequest {
-                provider: &provider,
+                provider: Arc::new(provider),
                 provider_name: "openai",
                 api_key: "key",
                 owner_id: OWNER_A,
@@ -608,7 +742,7 @@ mod tests {
         let result = embed_batch(
             &state,
             EmbedRequest {
-                provider: &provider,
+                provider: Arc::new(provider),
                 provider_name: "openai",
                 api_key: "key",
                 owner_id: OWNER_A,
@@ -630,7 +764,7 @@ mod tests {
         embed_batch(
             &state,
             EmbedRequest {
-                provider: &openai_provider,
+                provider: Arc::new(openai_provider),
                 provider_name: "openai",
                 api_key: "key",
                 owner_id: OWNER_A,
@@ -646,7 +780,7 @@ mod tests {
         let _ = embed_batch(
             &state,
             EmbedRequest {
-                provider: &failing_provider,
+                provider: Arc::new(failing_provider),
                 provider_name: "mistral",
                 api_key: "key",
                 owner_id: OWNER_A,
@@ -695,7 +829,7 @@ mod tests {
         let (_, stats_v1) = embed_batch(
             &state,
             EmbedRequest {
-                provider: &v1,
+                provider: Arc::new(v1),
                 provider_name: "openai",
                 api_key: "key",
                 owner_id: OWNER_A,
@@ -711,7 +845,7 @@ mod tests {
         let (_, stats_v2) = embed_batch(
             &state,
             EmbedRequest {
-                provider: &v2,
+                provider: Arc::new(v2),
                 provider_name: "openai",
                 api_key: "key",
                 owner_id: OWNER_A,
@@ -749,14 +883,17 @@ mod tests {
         }
 
         let state = state_with(MockStore::empty());
-        let provider = CountingProvider { call_count: std::sync::atomic::AtomicUsize::new(0) };
+        // Kept as a concrete Arc<CountingProvider>, not Arc<dyn
+        // EmbeddingProvider>, so call_count is still inspectable after the
+        // request -- EmbedRequest.provider gets its own coerced clone.
+        let provider = Arc::new(CountingProvider { call_count: std::sync::atomic::AtomicUsize::new(0) });
         // Same text three times in one batch.
         let texts = vec!["same text".to_string(), "same text".to_string(), "same text".to_string()];
 
         let (vectors, stats) = embed_batch(
             &state,
             EmbedRequest {
-                provider: &provider,
+                provider: Arc::clone(&provider) as Arc<dyn EmbeddingProvider>,
                 provider_name: "openai",
                 api_key: "key",
                 owner_id: OWNER_A,
@@ -773,6 +910,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_identical_misses_across_separate_requests_are_coalesced_into_one_provider_call() {
+        // Distinct from duplicate_texts_in_one_batch_call_provider_only_once
+        // above: that test dedupes duplicates *within* one batch. This one
+        // proves the harder case -- request coalescing *across* separate,
+        // genuinely concurrent embed_batch calls, which is what
+        // fetch_coalesced/AppState.in_flight exists for. This is the exact
+        // gap the LangChain TS battle-test measured live: 5 concurrent
+        // requests for one never-before-seen text produced 5 real provider
+        // calls, not 1.
+        struct SlowCountingProvider {
+            call_count: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl EmbeddingProvider for SlowCountingProvider {
+            async fn embed_batch(
+                &self,
+                _api_key: &str,
+                _model: &str,
+                texts: &[String],
+            ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
+                self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Long enough that all 5 concurrent callers below genuinely
+                // overlap in time rather than happening to run one after
+                // another -- without this, the test could pass even if
+                // coalescing were broken, just by getting lucky on timing.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok((vec![vec![99.0]; texts.len()], ProviderUsage { prompt_tokens: 7, total_tokens: 7 }))
+            }
+
+            fn version(&self) -> &'static str {
+                "mock-v1"
+            }
+        }
+
+        let state = state_with(MockStore::empty());
+        // Concrete Arc<SlowCountingProvider>, same reasoning as
+        // CountingProvider above: call_count needs to stay inspectable
+        // after the requests complete.
+        let provider = Arc::new(SlowCountingProvider { call_count: std::sync::atomic::AtomicUsize::new(0) });
+        let texts = vec!["never before seen concurrent text".to_string()];
+
+        let requests = (0..5).map(|_| {
+            embed_batch(
+                &state,
+                EmbedRequest {
+                    provider: Arc::clone(&provider) as Arc<dyn EmbeddingProvider>,
+                    provider_name: "openai",
+                    api_key: "key",
+                    owner_id: OWNER_A,
+                    model: "m",
+                    texts: &texts,
+                },
+            )
+        });
+
+        let results = futures::future::join_all(requests).await;
+
+        let mut total_prompt_tokens = 0;
+        for result in &results {
+            let (vectors, stats) = result.as_ref().expect("every concurrent request must still succeed");
+            assert_eq!(vectors, &vec![vec![99.0]], "every request must resolve to the correct vector, whether it claimed the fetch or piggybacked");
+            total_prompt_tokens += stats.provider_prompt_tokens;
+        }
+
+        assert_eq!(
+            provider.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "5 concurrent requests missing on the exact same never-before-seen key must coalesce into exactly one provider call, not 5"
+        );
+        // Only the one request that actually claimed the fetch attributes
+        // real usage to itself -- the other 4 piggybacked and correctly
+        // contribute zero, exactly like a cache hit would. Order-
+        // independent on purpose: which of the 5 wins the claim race isn't
+        // deterministic.
+        assert_eq!(total_prompt_tokens, 7, "usage must be attributed exactly once across all 5 requests, not once per request (double counting) or zero (lost)");
+    }
+
+    #[tokio::test]
     async fn whitespace_variants_of_the_same_text_share_a_cache_entry() {
         let state = state_with(MockStore::empty());
         let provider = MockProvider { response: vec![vec![1.0]] };
@@ -781,7 +997,7 @@ mod tests {
         embed_batch(
             &state,
             EmbedRequest {
-                provider: &provider,
+                provider: Arc::new(provider),
                 provider_name: "openai",
                 api_key: "key",
                 owner_id: OWNER_A,
@@ -800,7 +1016,7 @@ mod tests {
         let (vectors, stats) = embed_batch(
             &state,
             EmbedRequest {
-                provider: &panic_provider,
+                provider: Arc::new(panic_provider),
                 provider_name: "openai",
                 api_key: "key",
                 owner_id: OWNER_A,
@@ -819,13 +1035,13 @@ mod tests {
     async fn delete_batch_removes_entries_so_a_later_request_misses_again() {
         let key = CacheKey::derive(OWNER_A, "openai", "m", "mock-v1", "to be forgotten");
         let state = state_with(MockStore::with(vec![(key, vec![9.0]) ]));
-        let provider = MockProvider { response: vec![vec![1.0]] };
+        let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockProvider { response: vec![vec![1.0]] });
         let texts = vec!["to be forgotten".to_string()];
 
         let deleted = delete_batch(
             &state,
             DeleteRequest {
-                provider: &provider,
+                provider: provider.as_ref(),
                 provider_name: "openai",
                 owner_id: OWNER_A,
                 model: "m",
@@ -839,7 +1055,7 @@ mod tests {
         let (_, stats) = embed_batch(
             &state,
             EmbedRequest {
-                provider: &provider,
+                provider: Arc::clone(&provider),
                 provider_name: "openai",
                 api_key: "key",
                 owner_id: OWNER_A,
