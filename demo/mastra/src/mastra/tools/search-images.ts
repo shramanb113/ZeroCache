@@ -8,15 +8,33 @@ import { query } from "../rag/vector-store";
 // for why (module-load-time requireEnv() calls in ingest.ts would throw at
 // import time for an unrelated code path).
 
+// The image's bytes are read from `requestContext`, NOT from a model-generated
+// tool-call argument -- found via Task 12's battle test (a real bug, not a
+// hypothetical): asking the LLM to retype a base64 image blob verbatim as a
+// tool argument is unreliable even for a small (~600-char) test image --
+// gpt-4o-mini reproducibly truncated/corrupted it (624 -> 600 chars, mismatch)
+// on repeated runs, causing Zerocache's embed call to fail on the mangled
+// payload. `RequestContext` (@mastra/core/request-context, verified against
+// node_modules/@mastra/core/dist/tools/types.d.ts and
+// dist/docs/references/reference-agents-generate.md's `options.requestContext`
+// entry) is Mastra's real, current mechanism for exactly this: injecting
+// per-call data a tool can read directly in `execute()`, bypassing model
+// generation entirely. The caller populates requestContext with the image
+// before invoking `ragAgent.generate(prompt, { requestContext })`; the model
+// still decides *whether* to call searchImages (that's the agentic part,
+// unaffected), it just never has to transcribe the bytes itself.
+export interface SearchImagesRequestContext {
+  imageBase64: string;
+  imageMimeType: string;
+}
+
 export const searchImagesTool = createTool({
   id: "searchImages",
   description:
-    "Search the Aurora Cloud Storage knowledge base by image similarity. Use this when the user provides " +
-    "an image and asks what it shows or which stored image it resembles. Do not use this for text-only questions.",
-  inputSchema: z.object({
-    imageBase64: z.string().describe("Base64-encoded image data (no data:<mime>;base64, prefix)"),
-    imageMimeType: z.string().describe("The image's MIME type, e.g. image/png"),
-  }),
+    "Search the Aurora Cloud Storage knowledge base by image similarity, using the image attached to this " +
+    "request. Use this when the user's message asks what an attached image shows or which stored image it " +
+    "resembles. Do not use this for text-only questions, and do not invent image data yourself.",
+  inputSchema: z.object({}),
   outputSchema: z.object({
     results: z.array(
       z.object({
@@ -26,7 +44,16 @@ export const searchImagesTool = createTool({
       }),
     ),
   }),
-  execute: async ({ imageBase64, imageMimeType }) => {
+  execute: async (_input, { requestContext }) => {
+    const imageBase64 = requestContext.get("imageBase64") as string | undefined;
+    const imageMimeType = requestContext.get("imageMimeType") as string | undefined;
+    if (!imageBase64 || !imageMimeType) {
+      throw new Error(
+        "searchImages was called but no image was attached to this request " +
+          "(requestContext is missing imageBase64/imageMimeType)",
+      );
+    }
+
     const apiKey = requireEnv("GEMINI_API_KEY");
 
     const { embeddings } = await embedImage({
