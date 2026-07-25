@@ -26,7 +26,7 @@
 // billed provider calls. Run with: npx tsx battle-test.ts
 //
 // Safe to re-run: main() primes a cold cache first (see primeColdCache below) by
-// deleting every entry Parts A-C could have created, so Check 1/2's exact hit/miss
+// deleting every entry Parts A-C's ingestion could have created, so Check 1/2's exact hit/miss
 // counts hold on every invocation against a persistent store, not just the first
 // one ever made. Priming uses only DELETE calls (pure cache-key computation, no
 // provider call, no billing), so re-running does re-bill the real embed/generate
@@ -274,8 +274,8 @@ async function buildImageQuery(
 // hits and both checks would fail, not because anything broke but because the store
 // already had the entries. DELETE is pure cache-key computation (no provider call,
 // no billing -- see CLAUDE.md's API contract), and idempotent (deleting an
-// already-absent key still succeeds), so wiping every item Parts A-C could have
-// created, from both v1 and v2 (they overlap on 7 of 8 items but differ on
+// already-absent key still succeeds), so wiping every item Parts A-C's ingestion
+// could have created, from both v1 and v2 (they overlap on 7 of 8 items but differ on
 // pricing.md, and v2 adds bulk-export-feature.md), makes the script safely
 // re-runnable against a store in any prior state, not just a freshly wiped one.
 async function primeColdCache(): Promise<void> {

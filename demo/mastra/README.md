@@ -81,8 +81,8 @@ a running Zerocache instance — makes real, billed provider calls):
 npx tsx battle-test.ts
 ```
 
-`battle-test.ts` primes a cold cache itself (deletes every entry Parts A-C could have
-created, from both `v1/` and `v2/`) before Part A runs, so its exact hit/miss assertions
+`battle-test.ts` primes a cold cache itself (deletes every entry Parts A-C's ingestion
+could have created, from both `v1/` and `v2/`) before Part A runs, so its exact hit/miss assertions
 (Check 1: 8 misses; Check 2: 8 hits) hold whether this is the first run ever against your
 Zerocache instance or the fifth — you don't need a freshly wiped store to reproduce the
 18/18 result below. Re-running does make real, billed embed/generate calls again (the
