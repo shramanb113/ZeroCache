@@ -25,6 +25,13 @@
 // http://localhost:8080) and real OPENAI_API_KEY/GEMINI_API_KEY -- this makes real,
 // billed provider calls. Run with: npx tsx battle-test.ts
 //
+// Safe to re-run: main() primes a cold cache first (see primeColdCache below) by
+// deleting every entry Parts A-C could have created, so Check 1/2's exact hit/miss
+// counts hold on every invocation against a persistent store, not just the first
+// one ever made. Priming uses only DELETE calls (pure cache-key computation, no
+// provider call, no billing), so re-running does re-bill the real embed/generate
+// calls Parts A-C make, but not an extra ingestion's worth on top of that.
+//
 // Note: importing ingestSampleData (Task 10) pulls in src/mastra/rag/ingest.ts, which
 // itself calls requireEnv("OPENAI_API_KEY")/requireEnv("GEMINI_API_KEY") at module load
 // time (deliberately, per that file's own comments) -- so a missing key surfaces as an
@@ -32,7 +39,7 @@
 // llamaindex-python scripts' key-independent sections. That's consistent with this
 // task's premise: Part A-C all require real keys, there is no key-independent subset.
 
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 
 import { ingestSampleData } from "./src/mastra/rag/ingest";
@@ -257,6 +264,50 @@ async function buildImageQuery(
       "A user has attached an image and wants to know which stored image it matches and what it shows.",
     requestContext,
   };
+}
+
+// ---------- cold-cache priming (run before Part A) ----------
+
+// Checks 1-2 assert exact hit/miss counts against a *persistent* sled store, so
+// without this step Run 1 is only genuinely cold on the very first invocation ever
+// made against a given Zerocache instance -- any second run would see Run 1 as all
+// hits and both checks would fail, not because anything broke but because the store
+// already had the entries. DELETE is pure cache-key computation (no provider call,
+// no billing -- see CLAUDE.md's API contract), and idempotent (deleting an
+// already-absent key still succeeds), so wiping every item Parts A-C could have
+// created, from both v1 and v2 (they overlap on 7 of 8 items but differ on
+// pricing.md, and v2 adds bulk-export-feature.md), makes the script safely
+// re-runnable against a store in any prior state, not just a freshly wiped one.
+async function primeColdCache(): Promise<void> {
+  for (const dir of [SAMPLE_V1, SAMPLE_V2]) {
+    const files = await readdir(dir);
+    const textFiles = files.filter((f) => f.endsWith(".txt") || f.endsWith(".md"));
+    const imageFiles = files.filter(
+      (f) => f.endsWith(".png") || f.endsWith(".jpg") || f.endsWith(".jpeg"),
+    );
+
+    for (const file of textFiles) {
+      const text = await readFile(path.join(dir, file), "utf-8");
+      await deleteText({
+        baseUrl: ZEROCACHE_BASE_URL,
+        provider: "openai",
+        apiKey: OPENAI_API_KEY,
+        model: TEXT_MODEL,
+        input: text,
+      });
+    }
+
+    for (const file of imageFiles) {
+      const bytes = await readFile(path.join(dir, file));
+      const mimeType = file.endsWith(".png") ? "image/png" : "image/jpeg";
+      await deleteImage({
+        baseUrl: ZEROCACHE_BASE_URL,
+        apiKey: GEMINI_API_KEY,
+        model: IMAGE_MODEL,
+        images: [{ mimeType, base64: bytes.toString("base64") }],
+      });
+    }
+  }
 }
 
 // ---------- Part A: the cache-benefit story ----------
@@ -565,6 +616,9 @@ async function main() {
   // measured for Run 1's duration -- matches the warm-up pattern in
   // demo/langchain-ts/src/battle-test.ts and demo/llamaindex-python/src/battle_test.py.
   await fetch(`${ZEROCACHE_BASE_URL}/health`).catch(() => {});
+
+  console.log("Priming a cold cache (deleting any pre-existing v1/v2 entries)...");
+  await primeColdCache();
 
   await partA();
   await partB();

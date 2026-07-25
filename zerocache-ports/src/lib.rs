@@ -67,7 +67,7 @@ pub struct ImageInput {
 }
 
 /// A separate trait from `EmbeddingProvider`, not an extension of it, because
-/// only one of the three provider adapters can implement it for real (see
+/// only one of the four provider adapters can implement it for real (see
 /// CLAUDE.md Deviations: OpenAI has no public image-embedding API at all) --
 /// a default-returns-"unsupported" method on `EmbeddingProvider` itself would
 /// force every future text-only adapter to carry dead code for a capability

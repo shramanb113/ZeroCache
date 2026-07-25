@@ -55,7 +55,7 @@ async function deleteEmbeddings(url: string, apiKey: string, model: string, inpu
 
 export async function embedText(opts: {
   baseUrl: string;
-  provider: "openai" | "gemini" | "mistral";
+  provider: "openai" | "gemini" | "mistral" | "huggingface";
   apiKey: string;
   model: string;
   input: string | string[];
@@ -77,7 +77,7 @@ export async function embedImage(opts: {
 
 export async function deleteText(opts: {
   baseUrl: string;
-  provider: "openai" | "gemini" | "mistral";
+  provider: "openai" | "gemini" | "mistral" | "huggingface";
   apiKey: string;
   model: string;
   input: string | string[];

@@ -81,9 +81,13 @@ a running Zerocache instance — makes real, billed provider calls):
 npx tsx battle-test.ts
 ```
 
-`battle-test.ts` is the authoritative, already-executed proof for this demo (see below)
-— re-running it will re-bill real provider calls without producing new information, so
-there's no need to run it again just to "check."
+`battle-test.ts` primes a cold cache itself (deletes every entry Parts A-C could have
+created, from both `v1/` and `v2/`) before Part A runs, so its exact hit/miss assertions
+(Check 1: 8 misses; Check 2: 8 hits) hold whether this is the first run ever against your
+Zerocache instance or the fifth — you don't need a freshly wiped store to reproduce the
+18/18 result below. Re-running does make real, billed embed/generate calls again (the
+priming deletes themselves are free — no provider call), so there's a real cost to running
+it repeatedly, just not a risk of spurious failures from stale cache state.
 
 ## Why the cache actually helps here
 
@@ -91,9 +95,9 @@ The sample knowledge base ships in two generations to make the cache benefit con
 and measurable rather than illustrative:
 
 - `sample-data/v1/` — 6 text docs + 2 images (8 items total).
-- `sample-data/v2/` — the same 9 items except `pricing.md` is edited (updated pricing:
+- `sample-data/v2/` — the same 8 items, with `pricing.md` edited (updated pricing:
   $12/month, 750GB, up from v1's $9/month, 500GB) and one new file,
-  `bulk-export-feature.md`, is added. Every other file is byte-identical to v1.
+  `bulk-export-feature.md`, added (9 total). Every other file is byte-identical to v1.
 
 `battle-test.ts`'s Part A ingests v1 cold, re-ingests v1 unchanged, then ingests v2, and
 diffs Zerocache's `/metrics` hit/miss counters around each run. Here is the real summary
