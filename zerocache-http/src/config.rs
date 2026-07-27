@@ -15,6 +15,25 @@ pub struct Config {
     pub storage_path: String,
     pub redis_url: String,
     pub ttl: Option<Duration>,
+    pub openai_base_url: String,
+    pub mistral_base_url: String,
+    pub gemini_base_url: String,
+    pub huggingface_base_url: String,
+}
+
+/// Resolves an optional env-var override to a base URL, falling back to
+/// `default` when the var is unset or empty. Pulled out as a pure function
+/// (rather than inlined per call site) so it's unit-testable without
+/// mutating real process env vars -- same reasoning as parse_ttl_seconds
+/// below. An empty string is treated the same as unset, matching
+/// parse_ttl_seconds's treatment of an empty ZEROCACHE_TTL_SECONDS, rather
+/// than producing an empty base URL that would fail confusingly deep
+/// inside reqwest.
+fn base_url_or_default(raw: Option<&str>, default: &str) -> String {
+    match raw {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => default.to_string(),
+    }
 }
 
 impl Config {
@@ -32,6 +51,22 @@ impl Config {
             redis_url: std::env::var("ZEROCACHE_REDIS_URL")
                 .unwrap_or_else(|_| "redis://127.0.0.1:6379".into()),
             ttl: parse_ttl_seconds(std::env::var("ZEROCACHE_TTL_SECONDS").ok().as_deref()),
+            openai_base_url: base_url_or_default(
+                std::env::var("ZEROCACHE_OPENAI_BASE_URL").ok().as_deref(),
+                "https://api.openai.com",
+            ),
+            mistral_base_url: base_url_or_default(
+                std::env::var("ZEROCACHE_MISTRAL_BASE_URL").ok().as_deref(),
+                "https://api.mistral.ai",
+            ),
+            gemini_base_url: base_url_or_default(
+                std::env::var("ZEROCACHE_GEMINI_BASE_URL").ok().as_deref(),
+                "https://generativelanguage.googleapis.com",
+            ),
+            huggingface_base_url: base_url_or_default(
+                std::env::var("ZEROCACHE_HUGGINGFACE_BASE_URL").ok().as_deref(),
+                "https://router.huggingface.co/hf-inference",
+            ),
         }
     }
 }
@@ -96,5 +131,68 @@ mod tests {
     #[test]
     fn ttl_unset_var_is_none() {
         assert_eq!(parse_ttl_seconds(None), None);
+    }
+
+    #[test]
+    fn openai_base_url_defaults_to_real_endpoint_when_unset() {
+        assert_eq!(base_url_or_default(None, "https://api.openai.com"), "https://api.openai.com");
+    }
+
+    #[test]
+    fn openai_base_url_can_be_overridden() {
+        assert_eq!(
+            base_url_or_default(Some("http://localhost:11434"), "https://api.openai.com"),
+            "http://localhost:11434"
+        );
+    }
+
+    #[test]
+    fn mistral_base_url_defaults_to_real_endpoint_when_unset() {
+        assert_eq!(base_url_or_default(None, "https://api.mistral.ai"), "https://api.mistral.ai");
+    }
+
+    #[test]
+    fn mistral_base_url_can_be_overridden() {
+        assert_eq!(
+            base_url_or_default(Some("http://localhost:11435"), "https://api.mistral.ai"),
+            "http://localhost:11435"
+        );
+    }
+
+    #[test]
+    fn gemini_base_url_defaults_to_real_endpoint_when_unset() {
+        assert_eq!(
+            base_url_or_default(None, "https://generativelanguage.googleapis.com"),
+            "https://generativelanguage.googleapis.com"
+        );
+    }
+
+    #[test]
+    fn gemini_base_url_can_be_overridden() {
+        assert_eq!(
+            base_url_or_default(Some("http://localhost:11436"), "https://generativelanguage.googleapis.com"),
+            "http://localhost:11436"
+        );
+    }
+
+    #[test]
+    fn huggingface_base_url_defaults_to_real_endpoint_when_unset() {
+        assert_eq!(
+            base_url_or_default(None, "https://router.huggingface.co/hf-inference"),
+            "https://router.huggingface.co/hf-inference"
+        );
+    }
+
+    #[test]
+    fn huggingface_base_url_can_be_overridden() {
+        assert_eq!(
+            base_url_or_default(Some("http://localhost:11437"), "https://router.huggingface.co/hf-inference"),
+            "http://localhost:11437"
+        );
+    }
+
+    #[test]
+    fn empty_base_url_override_is_treated_as_unset() {
+        assert_eq!(base_url_or_default(Some(""), "https://api.openai.com"), "https://api.openai.com");
     }
 }
