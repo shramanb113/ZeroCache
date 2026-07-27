@@ -339,12 +339,13 @@ pub struct EmbedImageRequest<'a> {
 }
 
 /// The image-embedding counterpart to `embed_batch`. Deliberately simpler in
-/// three ways, all documented in this plan's Global Constraints: no text
-/// normalization (images aren't normalized), no dedup-by-identical-input
-/// within one batch (two images with identical bytes are rare enough in
-/// real ingestion that the added bookkeeping isn't worth it yet -- unlike
-/// text, where duplicate/near-duplicate strings in one batch are common),
-/// and no cross-request coalescing (fetch_coalesced stays text-only for now).
+/// two ways, documented in this plan's Global Constraints: no text
+/// normalization (images aren't normalized), and no cross-request
+/// coalescing (fetch_coalesced stays text-only for now). It does dedupe
+/// misses that share a CacheKey within one batch -- two images with
+/// identical bytes+mime type are rare, but not rare enough to justify
+/// paying the provider twice for one, and the bookkeeping is the same
+/// shape `embed_batch` already pays for text.
 #[tracing::instrument(skip_all, fields(provider = %request.provider_name, images = request.images.len(), hits, misses))]
 pub async fn embed_image_batch(
     state: &AppState,
@@ -387,30 +388,43 @@ pub async fn embed_image_batch(
     let mut provider_total_tokens = 0;
 
     if !reconciled.misses.is_empty() {
-        let miss_images: Vec<ImageInput> = reconciled
-            .misses
-            .iter()
-            .map(|(index, _key)| ImageInput {
-                mime_type: request.images[*index].mime_type.clone(),
-                data: request.images[*index].data.clone(),
-            })
-            .collect();
+        // Dedupe misses by CacheKey: several original indices can share an
+        // identical image (same bytes + mime type), and each such group
+        // shares one CacheKey via CacheKey::derive_image. Fetch each unique
+        // image once, then broadcast its vector to every index that shares
+        // its key -- same pattern as embed_batch's text-dedup, minus
+        // cross-request coalescing (see the doc comment above).
+        let mut unique_miss_images: Vec<ImageInput> = Vec::new();
+        let mut unique_keys: Vec<CacheKey> = Vec::new();
+        let mut key_to_unique_index: HashMap<CacheKey, usize> = HashMap::new();
+        let mut index_to_unique_index: Vec<(usize, usize)> = Vec::with_capacity(reconciled.misses.len());
+
+        for (index, key) in &reconciled.misses {
+            let unique_index = *key_to_unique_index.entry(*key).or_insert_with(|| {
+                unique_miss_images.push(ImageInput {
+                    mime_type: request.images[*index].mime_type.clone(),
+                    data: request.images[*index].data.clone(),
+                });
+                unique_keys.push(*key);
+                unique_miss_images.len() - 1
+            });
+            index_to_unique_index.push((*index, unique_index));
+        }
 
         let (vectors, usage) = request
             .provider
-            .embed_image_batch(request.api_key, request.model, &miss_images)
-            .instrument(tracing::info_span!("provider_call", images = miss_images.len()))
+            .embed_image_batch(request.api_key, request.model, &unique_miss_images)
+            .instrument(tracing::info_span!("provider_call", images = unique_miss_images.len()))
             .await
             .map_err(AppError::Provider)?;
         provider_prompt_tokens = usage.prompt_tokens;
         provider_total_tokens = usage.total_tokens;
 
-        let mut writes = Vec::with_capacity(reconciled.misses.len());
-        for ((index, key), vector) in reconciled.misses.iter().zip(vectors) {
-            results[*index] = Some(vector.clone());
-            writes.push((*key, vector));
+        for (index, unique_index) in &index_to_unique_index {
+            results[*index] = Some(vectors[*unique_index].clone());
         }
 
+        let writes: Vec<(CacheKey, Vec<f32>)> = unique_keys.into_iter().zip(vectors).collect();
         let store = Arc::clone(&state.store);
         run_store_task(move || -> Result<(), AppError> {
             for (key, vector) in writes {
@@ -1353,6 +1367,55 @@ mod tests {
         assert_eq!(stats.hits, 0);
         assert_eq!(stats.misses, 2);
         assert_eq!(provider.call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_images_in_one_batch_call_provider_only_once() {
+        struct CountingImageProvider {
+            call_count: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl ImageEmbeddingProvider for CountingImageProvider {
+            async fn embed_image_batch(
+                &self,
+                _api_key: &str,
+                _model: &str,
+                images: &[ImageInput],
+            ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
+                self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(images.len(), 1, "duplicate images in the batch must be deduplicated before calling the provider");
+                Ok((vec![vec![42.0]], ProviderUsage::default()))
+            }
+
+            fn version(&self) -> &'static str {
+                "test-image-v1"
+            }
+        }
+
+        let state = state_with(MockStore::empty());
+        let provider = Arc::new(CountingImageProvider { call_count: std::sync::atomic::AtomicUsize::new(0) });
+        // Same image (identical bytes + mime type) three times in one batch.
+        let images = vec![
+            ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() },
+            ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() },
+            ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() },
+        ];
+
+        let request = EmbedImageRequest {
+            provider: Arc::clone(&provider) as Arc<dyn ImageEmbeddingProvider>,
+            provider_name: "gemini",
+            api_key: "test-key",
+            owner_id: [1u8; 32],
+            model: "gemini-embedding-2",
+            images: &images,
+        };
+
+        let (vectors, stats) = embed_image_batch(&state, request).await.unwrap();
+
+        assert_eq!(provider.call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(vectors, vec![vec![42.0], vec![42.0], vec![42.0]], "the same vector must be broadcast to every duplicate position");
+        assert_eq!(stats.misses, 3, "hit/miss accounting still reflects all three original positions");
     }
 
     #[tokio::test]
