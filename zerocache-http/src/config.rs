@@ -1,5 +1,10 @@
 use std::time::Duration;
 
+pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
+pub const DEFAULT_MISTRAL_BASE_URL: &str = "https://api.mistral.ai";
+pub const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
+pub const DEFAULT_HUGGINGFACE_BASE_URL: &str = "https://router.huggingface.co/hf-inference";
+
 pub enum StorageBackend {
     // Embedded, single-process. Fine for local dev or a single-replica
     // deployment; cannot be shared across multiple Kubernetes pods.
@@ -53,19 +58,19 @@ impl Config {
             ttl: parse_ttl_seconds(std::env::var("ZEROCACHE_TTL_SECONDS").ok().as_deref()),
             openai_base_url: base_url_or_default(
                 std::env::var("ZEROCACHE_OPENAI_BASE_URL").ok().as_deref(),
-                "https://api.openai.com",
+                DEFAULT_OPENAI_BASE_URL,
             ),
             mistral_base_url: base_url_or_default(
                 std::env::var("ZEROCACHE_MISTRAL_BASE_URL").ok().as_deref(),
-                "https://api.mistral.ai",
+                DEFAULT_MISTRAL_BASE_URL,
             ),
             gemini_base_url: base_url_or_default(
                 std::env::var("ZEROCACHE_GEMINI_BASE_URL").ok().as_deref(),
-                "https://generativelanguage.googleapis.com",
+                DEFAULT_GEMINI_BASE_URL,
             ),
             huggingface_base_url: base_url_or_default(
                 std::env::var("ZEROCACHE_HUGGINGFACE_BASE_URL").ok().as_deref(),
-                "https://router.huggingface.co/hf-inference",
+                DEFAULT_HUGGINGFACE_BASE_URL,
             ),
         }
     }
@@ -135,26 +140,26 @@ mod tests {
 
     #[test]
     fn openai_base_url_defaults_to_real_endpoint_when_unset() {
-        assert_eq!(base_url_or_default(None, "https://api.openai.com"), "https://api.openai.com");
+        assert_eq!(base_url_or_default(None, DEFAULT_OPENAI_BASE_URL), DEFAULT_OPENAI_BASE_URL);
     }
 
     #[test]
     fn openai_base_url_can_be_overridden() {
         assert_eq!(
-            base_url_or_default(Some("http://localhost:11434"), "https://api.openai.com"),
+            base_url_or_default(Some("http://localhost:11434"), DEFAULT_OPENAI_BASE_URL),
             "http://localhost:11434"
         );
     }
 
     #[test]
     fn mistral_base_url_defaults_to_real_endpoint_when_unset() {
-        assert_eq!(base_url_or_default(None, "https://api.mistral.ai"), "https://api.mistral.ai");
+        assert_eq!(base_url_or_default(None, DEFAULT_MISTRAL_BASE_URL), DEFAULT_MISTRAL_BASE_URL);
     }
 
     #[test]
     fn mistral_base_url_can_be_overridden() {
         assert_eq!(
-            base_url_or_default(Some("http://localhost:11435"), "https://api.mistral.ai"),
+            base_url_or_default(Some("http://localhost:11435"), DEFAULT_MISTRAL_BASE_URL),
             "http://localhost:11435"
         );
     }
@@ -162,15 +167,15 @@ mod tests {
     #[test]
     fn gemini_base_url_defaults_to_real_endpoint_when_unset() {
         assert_eq!(
-            base_url_or_default(None, "https://generativelanguage.googleapis.com"),
-            "https://generativelanguage.googleapis.com"
+            base_url_or_default(None, DEFAULT_GEMINI_BASE_URL),
+            DEFAULT_GEMINI_BASE_URL
         );
     }
 
     #[test]
     fn gemini_base_url_can_be_overridden() {
         assert_eq!(
-            base_url_or_default(Some("http://localhost:11436"), "https://generativelanguage.googleapis.com"),
+            base_url_or_default(Some("http://localhost:11436"), DEFAULT_GEMINI_BASE_URL),
             "http://localhost:11436"
         );
     }
@@ -178,21 +183,21 @@ mod tests {
     #[test]
     fn huggingface_base_url_defaults_to_real_endpoint_when_unset() {
         assert_eq!(
-            base_url_or_default(None, "https://router.huggingface.co/hf-inference"),
-            "https://router.huggingface.co/hf-inference"
+            base_url_or_default(None, DEFAULT_HUGGINGFACE_BASE_URL),
+            DEFAULT_HUGGINGFACE_BASE_URL
         );
     }
 
     #[test]
     fn huggingface_base_url_can_be_overridden() {
         assert_eq!(
-            base_url_or_default(Some("http://localhost:11437"), "https://router.huggingface.co/hf-inference"),
+            base_url_or_default(Some("http://localhost:11437"), DEFAULT_HUGGINGFACE_BASE_URL),
             "http://localhost:11437"
         );
     }
 
     #[test]
     fn empty_base_url_override_is_treated_as_unset() {
-        assert_eq!(base_url_or_default(Some(""), "https://api.openai.com"), "https://api.openai.com");
+        assert_eq!(base_url_or_default(Some(""), DEFAULT_OPENAI_BASE_URL), DEFAULT_OPENAI_BASE_URL);
     }
 }

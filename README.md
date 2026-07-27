@@ -58,6 +58,11 @@ No provider API key is configured on the server — every caller brings their ow
 | `ZEROCACHE_STORAGE_BACKEND` | no | `sled` (or `redis`) |
 | `ZEROCACHE_STORAGE_PATH` | no, sled only | `./data` |
 | `ZEROCACHE_REDIS_URL` | no, redis only | `redis://127.0.0.1:6379` |
+| `ZEROCACHE_TTL_SECONDS` | no | unset (entries never expire) — optional per-store-instance expiry; `0` or an unparseable value is treated as unset, with a startup warning |
+| `ZEROCACHE_OPENAI_BASE_URL` | no | `https://api.openai.com` — optional override, e.g. for a self-hosted vLLM/LM Studio instance speaking OpenAI's `/v1/embeddings` wire shape. Must be a bare origin (scheme + host + optional port) with no `/v1` suffix and no trailing slash — the adapter appends its own path |
+| `ZEROCACHE_MISTRAL_BASE_URL` | no | `https://api.mistral.ai` — optional override, e.g. for an on-prem Mistral-compatible proxy. Must be a bare origin with no `/v1` suffix and no trailing slash — the adapter appends its own path |
+| `ZEROCACHE_GEMINI_BASE_URL` | no | `https://generativelanguage.googleapis.com` — optional override. Must be a bare origin with no `/v1` suffix and no trailing slash — the adapter appends its own path |
+| `ZEROCACHE_HUGGINGFACE_BASE_URL` | no | `https://router.huggingface.co/hf-inference` — optional override, e.g. for a self-hosted HuggingFace TEI instance. Must be a bare origin with no `/v1` suffix and no trailing slash — the adapter appends its own path |
 
 `ZEROCACHE_STORAGE_BACKEND=sled` (the default) is embedded and single-process — fine for local dev, but each replica would keep its own private cache. Use `redis` for any deployment with more than one instance (e.g. Kubernetes) so all replicas share one cache; it's connection-pooled with no distributed locking, since the content-addressed key means concurrent writes from different replicas are never conflicting.
 

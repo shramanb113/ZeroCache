@@ -17,7 +17,10 @@ use axum::{
 use tower_http::trace::TraceLayer;
 
 use app::{check_store_readiness, delete_batch, embed_batch, AppError, AppState, DeleteRequest, EmbedRequest, Metrics};
-use config::{Config, StorageBackend};
+use config::{
+    Config, StorageBackend, DEFAULT_GEMINI_BASE_URL, DEFAULT_HUGGINGFACE_BASE_URL, DEFAULT_MISTRAL_BASE_URL,
+    DEFAULT_OPENAI_BASE_URL,
+};
 use wire::{DeleteResponse, EmbeddingObject, EmbeddingsRequest, EmbeddingsResponse, ErrorResponse, Usage};
 use zerocache_adapters_gemini::GeminiProvider;
 use zerocache_adapters_huggingface::HuggingFaceProvider;
@@ -32,6 +35,7 @@ use zerocache_ports::{EmbeddingProvider, EmbeddingStore, ImageEmbeddingProvider}
 async fn main() {
     let tracer_provider = otel::init();
     let config = Config::from_env();
+    warn_on_overridden_base_urls(&config);
 
     let store: Arc<dyn EmbeddingStore> = match config.storage_backend {
         StorageBackend::Sled => {
@@ -96,6 +100,36 @@ async fn main() {
     if let Some(provider) = tracer_provider {
         if let Err(e) = provider.shutdown() {
             eprintln!("warning: failed to flush OpenTelemetry spans on shutdown: {e}");
+        }
+    }
+}
+
+/// Warns at startup when an operator has repointed a provider's base URL
+/// away from its real default -- e.g. at a self-hosted vLLM/LM Studio/TGI
+/// instance instead of the real upstream provider. This does NOT change the
+/// cache key: `CacheKey::derive` (zerocache-core) hashes `owner_id +
+/// provider + model + model_version + text`, where `provider` is just the
+/// URL path segment (e.g. "openai"), not the actual base URL. So repointing
+/// `ZEROCACHE_OPENAI_BASE_URL` at a different endpoint silently reuses
+/// whatever was already cached under `owner_id+"openai"+model+...`, even
+/// though the new endpoint may be a completely different model/weights. A
+/// redesigned cache key is out of scope here (deferred to a future
+/// adapter-layer project) -- this is just a startup warning so an operator
+/// making that switch knows to flush the store (or point at a distinct
+/// ZEROCACHE_STORAGE_PATH / Redis DB) instead of finding out the hard way.
+fn warn_on_overridden_base_urls(config: &Config) {
+    let overrides = [
+        ("ZEROCACHE_OPENAI_BASE_URL", &config.openai_base_url, DEFAULT_OPENAI_BASE_URL),
+        ("ZEROCACHE_MISTRAL_BASE_URL", &config.mistral_base_url, DEFAULT_MISTRAL_BASE_URL),
+        ("ZEROCACHE_GEMINI_BASE_URL", &config.gemini_base_url, DEFAULT_GEMINI_BASE_URL),
+        ("ZEROCACHE_HUGGINGFACE_BASE_URL", &config.huggingface_base_url, DEFAULT_HUGGINGFACE_BASE_URL),
+    ];
+
+    for (env_var_name, actual, default) in overrides {
+        if actual != default {
+            tracing::warn!(
+                "{env_var_name} is overridden to '{actual}' -- cache entries are not keyed by endpoint, so if you're repointing at a different upstream than before, flush the store (or use a distinct ZEROCACHE_STORAGE_PATH / Redis DB) to avoid serving vectors computed by the previous endpoint as if they came from this one"
+            );
         }
     }
 }
