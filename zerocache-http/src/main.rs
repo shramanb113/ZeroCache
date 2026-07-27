@@ -42,15 +42,15 @@ async fn main() {
         }
     };
 
-    let gemini_provider = Arc::new(GeminiProvider::new("https://generativelanguage.googleapis.com"));
+    let gemini_provider = Arc::new(GeminiProvider::new(config.gemini_base_url.clone()));
 
     let mut providers: HashMap<String, Arc<dyn EmbeddingProvider>> = HashMap::new();
-    providers.insert("openai".to_string(), Arc::new(OpenAiProvider::new("https://api.openai.com")));
-    providers.insert("mistral".to_string(), Arc::new(MistralProvider::new("https://api.mistral.ai")));
+    providers.insert("openai".to_string(), Arc::new(OpenAiProvider::new(config.openai_base_url.clone())));
+    providers.insert("mistral".to_string(), Arc::new(MistralProvider::new(config.mistral_base_url.clone())));
     providers.insert("gemini".to_string(), Arc::clone(&gemini_provider) as Arc<dyn EmbeddingProvider>);
     providers.insert(
         "huggingface".to_string(),
-        Arc::new(HuggingFaceProvider::new("https://router.huggingface.co/hf-inference")),
+        Arc::new(HuggingFaceProvider::new(config.huggingface_base_url.clone())),
     );
 
     let mut image_providers: HashMap<String, Arc<dyn ImageEmbeddingProvider>> = HashMap::new();
