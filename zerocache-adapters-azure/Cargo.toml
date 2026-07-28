@@ -1,0 +1,6 @@
+[package]
+name = "zerocache-adapters-azure"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

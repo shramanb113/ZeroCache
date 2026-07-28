@@ -9,6 +9,10 @@ members = [
     "zerocache-adapters-mistral",
     "zerocache-adapters-gemini",
     "zerocache-adapters-huggingface",
+    "zerocache-adapters-cloud",
+    "zerocache-adapters-azure",
+    "zerocache-adapters-bedrock",
+    "zerocache-adapters-vertexai",
     "zerocache-http",
 ]
 

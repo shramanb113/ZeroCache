@@ -1,0 +1,6 @@
+[package]
+name = "zerocache-adapters-vertexai"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

@@ -1,0 +1,6 @@
+[package]
+name = "zerocache-adapters-bedrock"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
