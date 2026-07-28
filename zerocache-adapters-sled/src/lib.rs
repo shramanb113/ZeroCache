@@ -106,7 +106,7 @@ mod tests {
     fn put_then_get_roundtrips() {
         let dir = temp_dir();
         let store = SledStore::open(&dir, None).unwrap();
-        let key = CacheKey::derive([1u8; 32], "openai", "m", "v1", "hello");
+        let key = CacheKey::derive([1u8; 32], "openai", "test-scope", "m", "v1", "hello");
 
         assert_eq!(store.get(&key).unwrap(), None);
         store.put(key, vec![1.0, 2.5, -3.25]).unwrap();
@@ -120,7 +120,7 @@ mod tests {
     fn delete_removes_an_entry() {
         let dir = temp_dir();
         let store = SledStore::open(&dir, None).unwrap();
-        let key = CacheKey::derive([1u8; 32], "openai", "m", "v1", "to be deleted");
+        let key = CacheKey::derive([1u8; 32], "openai", "test-scope", "m", "v1", "to be deleted");
 
         store.put(key, vec![1.0]).unwrap();
         assert_eq!(store.get(&key).unwrap(), Some(vec![1.0]));
@@ -136,7 +136,7 @@ mod tests {
     fn delete_on_a_missing_key_is_not_an_error() {
         let dir = temp_dir();
         let store = SledStore::open(&dir, None).unwrap();
-        let key = CacheKey::derive([1u8; 32], "openai", "m", "v1", "never existed");
+        let key = CacheKey::derive([1u8; 32], "openai", "test-scope", "m", "v1", "never existed");
 
         assert!(store.delete(&key).is_ok());
 
@@ -149,7 +149,7 @@ mod tests {
         let dir = temp_dir();
         // A TTL of zero duration means "already expired" the moment it's written.
         let store = SledStore::open(&dir, Some(Duration::from_secs(0))).unwrap();
-        let key = CacheKey::derive([1u8; 32], "openai", "m", "v1", "expires immediately");
+        let key = CacheKey::derive([1u8; 32], "openai", "test-scope", "m", "v1", "expires immediately");
 
         store.put(key, vec![1.0]).unwrap();
         // The clock must advance past the expiry instant, which a zero-second
@@ -165,7 +165,7 @@ mod tests {
     fn entry_within_its_ttl_still_reads_as_a_hit() {
         let dir = temp_dir();
         let store = SledStore::open(&dir, Some(Duration::from_secs(3600))).unwrap();
-        let key = CacheKey::derive([1u8; 32], "openai", "m", "v1", "expires in an hour");
+        let key = CacheKey::derive([1u8; 32], "openai", "test-scope", "m", "v1", "expires in an hour");
 
         store.put(key, vec![1.0]).unwrap();
         assert_eq!(store.get(&key).unwrap(), Some(vec![1.0]), "an entry well within its TTL must still hit");
@@ -178,7 +178,7 @@ mod tests {
     fn no_ttl_configured_means_entries_never_expire() {
         let dir = temp_dir();
         let store = SledStore::open(&dir, None).unwrap();
-        let key = CacheKey::derive([1u8; 32], "openai", "m", "v1", "lives forever");
+        let key = CacheKey::derive([1u8; 32], "openai", "test-scope", "m", "v1", "lives forever");
 
         store.put(key, vec![1.0]).unwrap();
         std::thread::sleep(Duration::from_millis(10));

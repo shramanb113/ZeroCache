@@ -230,10 +230,23 @@ pub struct EmbedRequest<'a> {
 #[tracing::instrument(skip_all, fields(provider = %request.provider_name, texts = request.texts.len(), hits, misses))]
 pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<(Vec<Vec<f32>>, BatchStats), AppError> {
     let provider_version = request.provider.version();
+    // Resolved once per batch, not once per text: for a cloud adapter this
+    // parses the caller's model string, which is pure but not free, and the
+    // answer is identical for every text in the batch.
+    let cache_scope = request.provider.cache_scope(request.model).map_err(AppError::Provider)?;
     let normalized_texts: Vec<String> = request.texts.iter().map(|text| normalize_text(text)).collect();
     let keys: Vec<CacheKey> = normalized_texts
         .iter()
-        .map(|text| CacheKey::derive(request.owner_id, request.provider_name, request.model, provider_version, text))
+        .map(|text| {
+            CacheKey::derive(
+                request.owner_id,
+                request.provider_name,
+                &cache_scope,
+                request.model,
+                provider_version,
+                text,
+            )
+        })
         .collect();
 
     let reconciled = {
@@ -352,6 +365,7 @@ pub async fn embed_image_batch(
     request: EmbedImageRequest<'_>,
 ) -> Result<(Vec<Vec<f32>>, BatchStats), AppError> {
     let provider_version = request.provider.version();
+    let cache_scope = request.provider.cache_scope(request.model).map_err(AppError::Provider)?;
     let keys: Vec<CacheKey> = request
         .images
         .iter()
@@ -359,6 +373,7 @@ pub async fn embed_image_batch(
             CacheKey::derive_image(
                 request.owner_id,
                 request.provider_name,
+                &cache_scope,
                 request.model,
                 provider_version,
                 &image.mime_type,
@@ -459,6 +474,7 @@ pub struct DeleteImageRequest<'a> {
 #[tracing::instrument(skip_all, fields(provider = %request.provider_name, images = request.images.len()))]
 pub async fn delete_image_batch(state: &AppState, request: DeleteImageRequest<'_>) -> Result<usize, AppError> {
     let provider_version = request.provider.version();
+    let cache_scope = request.provider.cache_scope(request.model).map_err(AppError::Provider)?;
     let keys: Vec<CacheKey> = request
         .images
         .iter()
@@ -466,6 +482,7 @@ pub async fn delete_image_batch(state: &AppState, request: DeleteImageRequest<'_
             CacheKey::derive_image(
                 request.owner_id,
                 request.provider_name,
+                &cache_scope,
                 request.model,
                 provider_version,
                 &image.mime_type,
@@ -615,10 +632,20 @@ pub struct DeleteRequest<'a> {
 #[tracing::instrument(skip_all, fields(provider = %request.provider_name, texts = request.texts.len()))]
 pub async fn delete_batch(state: &AppState, request: DeleteRequest<'_>) -> Result<usize, AppError> {
     let provider_version = request.provider.version();
+    let cache_scope = request.provider.cache_scope(request.model).map_err(AppError::Provider)?;
     let keys: Vec<CacheKey> = request
         .texts
         .iter()
-        .map(|text| CacheKey::derive(request.owner_id, request.provider_name, request.model, provider_version, &normalize_text(text)))
+        .map(|text| {
+            CacheKey::derive(
+                request.owner_id,
+                request.provider_name,
+                &cache_scope,
+                request.model,
+                provider_version,
+                &normalize_text(text),
+            )
+        })
         .collect();
 
     let count = keys.len();
@@ -641,7 +668,14 @@ pub async fn delete_batch(state: &AppState, request: DeleteRequest<'_>) -> Resul
 /// derived from a hashed API key, which blake3 never maps to all-zero
 /// output in practice) combined with this reserved provider/model string.
 fn readiness_check_key() -> CacheKey {
-    CacheKey::derive([0u8; 32], "__zerocache_internal__", "__readiness_check__", "v1", "")
+    CacheKey::derive(
+        [0u8; 32],
+        "__zerocache_internal__",
+        "__readiness_check__",
+        "__readiness_check__",
+        "v1",
+        "",
+    )
 }
 
 /// Proves the configured store backend is actually reachable, not just
@@ -728,6 +762,10 @@ mod tests {
         fn version(&self) -> &'static str {
             "mock-v1"
         }
+
+        fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+            Ok("mock-scope".to_string())
+        }
     }
 
     struct FailingProvider;
@@ -746,6 +784,10 @@ mod tests {
         fn version(&self) -> &'static str {
             "mock-v1"
         }
+
+        fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+            Ok("mock-scope".to_string())
+        }
     }
 
     struct PanicProvider;
@@ -763,6 +805,10 @@ mod tests {
 
         fn version(&self) -> &'static str {
             "mock-v1"
+        }
+
+        fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+            Ok("mock-scope".to_string())
         }
     }
 
@@ -795,6 +841,10 @@ mod tests {
         fn version(&self) -> &'static str {
             "test-image-v1"
         }
+
+        fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+            Ok("mock-scope".to_string())
+        }
     }
 
     const OWNER_A: [u8; 32] = [1u8; 32];
@@ -812,7 +862,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_hits_skips_provider_entirely() {
-        let key = CacheKey::derive(OWNER_A, "openai", "m", "mock-v1", "cached text");
+        let key = CacheKey::derive(OWNER_A, "openai", "mock-scope", "m", "mock-v1", "cached text");
         let state = state_with(MockStore::with(vec![(key, vec![1.0, 2.0])]));
         let provider = PanicProvider;
         let texts = vec!["cached text".to_string()];
@@ -862,13 +912,13 @@ mod tests {
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.provider_prompt_tokens, 10);
 
-        let key = CacheKey::derive(OWNER_A, "openai", "m", "mock-v1", "fresh text");
+        let key = CacheKey::derive(OWNER_A, "openai", "mock-scope", "m", "mock-v1", "fresh text");
         assert_eq!(state.store.get(&key).unwrap(), Some(vec![9.0, 9.0]));
     }
 
     #[tokio::test]
     async fn mixed_batch_preserves_original_order() {
-        let hit_key = CacheKey::derive(OWNER_A, "openai", "m", "mock-v1", "old");
+        let hit_key = CacheKey::derive(OWNER_A, "openai", "mock-scope", "m", "mock-v1", "old");
         let state = state_with(MockStore::with(vec![(hit_key, vec![1.0])]));
         let provider = MockProvider { response: vec![vec![2.0]] };
         let texts = vec!["new".to_string(), "old".to_string()];
@@ -1038,6 +1088,10 @@ mod tests {
             fn version(&self) -> &'static str {
                 self.version
             }
+
+            fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+                Ok("mock-scope".to_string())
+            }
         }
 
         let state = state_with(MockStore::empty());
@@ -1097,6 +1151,10 @@ mod tests {
 
             fn version(&self) -> &'static str {
                 "mock-v1"
+            }
+
+            fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+                Ok("mock-scope".to_string())
             }
         }
 
@@ -1160,6 +1218,10 @@ mod tests {
 
             fn version(&self) -> &'static str {
                 "mock-v1"
+            }
+
+            fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+                Ok("mock-scope".to_string())
             }
         }
 
@@ -1251,7 +1313,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_batch_removes_entries_so_a_later_request_misses_again() {
-        let key = CacheKey::derive(OWNER_A, "openai", "m", "mock-v1", "to be forgotten");
+        let key = CacheKey::derive(OWNER_A, "openai", "mock-scope", "m", "mock-v1", "to be forgotten");
         let state = state_with(MockStore::with(vec![(key, vec![9.0]) ]));
         let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockProvider { response: vec![vec![1.0]] });
         let texts = vec!["to be forgotten".to_string()];
@@ -1391,6 +1453,10 @@ mod tests {
             fn version(&self) -> &'static str {
                 "test-image-v1"
             }
+
+            fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+                Ok("mock-scope".to_string())
+            }
         }
 
         let state = state_with(MockStore::empty());
@@ -1420,7 +1486,7 @@ mod tests {
 
     #[tokio::test]
     async fn image_all_hits_skips_provider_entirely() {
-        let key = CacheKey::derive_image([1u8; 32], "gemini", "gemini-embedding-2", "test-image-v1", "image/png", "aGVsbG8=");
+        let key = CacheKey::derive_image([1u8; 32], "gemini", "mock-scope", "gemini-embedding-2", "test-image-v1", "image/png", "aGVsbG8=");
         let state = state_with(MockStore::with(vec![(key, vec![9.0])]));
 
         let provider = Arc::new(MockImageProvider::returning(Ok((vec![], ProviderUsage::default()))));
@@ -1513,5 +1579,76 @@ mod tests {
             2,
             "after deletion, the same image must miss again and call the provider a second time"
         );
+    }
+
+    #[tokio::test]
+    async fn two_providers_with_different_cache_scopes_never_share_a_cache_entry() {
+        // The application-level statement of what zerocache-core proves in
+        // isolation: same owner, same provider name, same model, same text --
+        // but two adapter instances pointed at different upstreams. The
+        // second must miss, not inherit the first's vector.
+        struct ScopedProvider {
+            scope: &'static str,
+            response: Vec<Vec<f32>>,
+        }
+
+        #[async_trait::async_trait]
+        impl EmbeddingProvider for ScopedProvider {
+            async fn embed_batch(
+                &self,
+                _api_key: &str,
+                _model: &str,
+                _texts: &[String],
+            ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
+                Ok((self.response.clone(), ProviderUsage { prompt_tokens: 1, total_tokens: 1 }))
+            }
+
+            fn version(&self) -> &'static str {
+                "mock-v1"
+            }
+
+            fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+                Ok(self.scope.to_string())
+            }
+        }
+
+        let state = state_with(MockStore::empty());
+        let texts = vec!["identical text".to_string()];
+
+        let first: Arc<dyn EmbeddingProvider> =
+            Arc::new(ScopedProvider { scope: "https://api.openai.com", response: vec![vec![1.0]] });
+        let (_, stats_first) = embed_batch(
+            &state,
+            EmbedRequest {
+                provider: Arc::clone(&first),
+                provider_name: "openai",
+                api_key: "key",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &texts,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats_first.misses, 1, "first call against a cold store must miss");
+
+        let second: Arc<dyn EmbeddingProvider> =
+            Arc::new(ScopedProvider { scope: "http://localhost:8000", response: vec![vec![2.0]] });
+        let (vectors, stats_second) = embed_batch(
+            &state,
+            EmbedRequest {
+                provider: Arc::clone(&second),
+                provider_name: "openai",
+                api_key: "key",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &texts,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats_second.misses, 1, "a different upstream endpoint must not hit the first one's entry");
+        assert_eq!(vectors, vec![vec![2.0]], "and must return its own vector, not the cached one");
     }
 }
