@@ -129,6 +129,12 @@ impl EmbeddingProvider for GeminiProvider {
     fn version(&self) -> &'static str {
         env!("CARGO_PKG_VERSION")
     }
+
+    fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+        // This adapter's wire shape is fixed, so the only thing that can vary
+        // between two instances is which endpoint they talk to.
+        Ok(self.base_url.clone())
+    }
 }
 
 use zerocache_ports::ImageInput;
@@ -219,6 +225,12 @@ impl ImageEmbeddingProvider for GeminiProvider {
 
     fn version(&self) -> &'static str {
         env!("CARGO_PKG_VERSION")
+    }
+
+    fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+        // This adapter's wire shape is fixed, so the only thing that can vary
+        // between two instances is which endpoint they talk to.
+        Ok(self.base_url.clone())
     }
 }
 

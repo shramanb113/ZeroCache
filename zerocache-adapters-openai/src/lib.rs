@@ -119,6 +119,12 @@ impl EmbeddingProvider for OpenAiProvider {
     fn version(&self) -> &'static str {
         env!("CARGO_PKG_VERSION")
     }
+
+    fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+        // This adapter's wire shape is fixed, so the only thing that can vary
+        // between two instances is which endpoint they talk to.
+        Ok(self.base_url.clone())
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +297,18 @@ mod tests {
             mock.hits_async().await,
             1,
             "a 401 will never succeed on retry -- retrying it would only slow down a real auth failure for no benefit"
+        );
+    }
+
+    #[test]
+    fn cache_scope_is_the_configured_base_url_so_repointing_invalidates_the_cache() {
+        let a = OpenAiProvider::new("https://api.openai.com");
+        let b = OpenAiProvider::new("http://localhost:8000");
+        assert_eq!(a.cache_scope("text-embedding-3-small").unwrap(), "https://api.openai.com");
+        assert_ne!(
+            a.cache_scope("text-embedding-3-small").unwrap(),
+            b.cache_scope("text-embedding-3-small").unwrap(),
+            "a self-hosted endpoint must not inherit vectors cached from the real provider"
         );
     }
 }

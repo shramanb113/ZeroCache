@@ -109,6 +109,12 @@ impl EmbeddingProvider for MistralProvider {
     fn version(&self) -> &'static str {
         env!("CARGO_PKG_VERSION")
     }
+
+    fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+        // This adapter's wire shape is fixed, so the only thing that can vary
+        // between two instances is which endpoint they talk to.
+        Ok(self.base_url.clone())
+    }
 }
 
 #[cfg(test)]
