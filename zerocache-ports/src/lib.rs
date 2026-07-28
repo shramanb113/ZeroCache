@@ -62,14 +62,22 @@ pub trait EmbeddingProvider: Send + Sync {
     ///
     /// Two adapter configurations that could return different vectors for the
     /// same (owner, provider, model, version, text) tuple MUST return
-    /// different strings here; two that are guaranteed to return the same
-    /// vector MUST return the same string. For the four wire-shape-fixed
-    /// adapters this is just the configured base URL -- repointing
-    /// ZEROCACHE_OPENAI_BASE_URL at a self-hosted vLLM must not silently
-    /// reuse vectors computed by api.openai.com. For a cloud adapter it also
-    /// carries whatever per-request coordinates the caller encoded in
+    /// different strings here -- this direction is a hard requirement, since
+    /// getting it wrong risks serving a wrong vector as if it were correct.
+    /// The reverse is only a *should*, not a MUST: two configurations that
+    /// are guaranteed to return the same vector should return the same
+    /// string, but returning different strings for them is always safe (it
+    /// just costs an unnecessary cold miss, never a wrong answer), so a more
+    /// conservative implementation is free to over-distinguish. For the four
+    /// wire-shape-fixed adapters this is just the configured base URL --
+    /// repointing ZEROCACHE_OPENAI_BASE_URL at a self-hosted vLLM must not
+    /// silently reuse vectors computed by api.openai.com. For a cloud adapter
+    /// it also carries whatever per-request coordinates the caller encoded in
     /// `model` (region, project, deployment, task type), since those select
-    /// different weights behind an identical model name.
+    /// different weights behind an identical model name -- and may also fold
+    /// in coarser-grained implementation details (e.g. a shared client
+    /// library's own version) that over-invalidate rather than risk
+    /// under-invalidating.
     ///
     /// Fallible because a cloud adapter derives it by parsing `model`, which
     /// the caller can get wrong.
@@ -108,14 +116,22 @@ pub trait ImageEmbeddingProvider: Send + Sync {
     ///
     /// Two adapter configurations that could return different vectors for the
     /// same (owner, provider, model, version, text) tuple MUST return
-    /// different strings here; two that are guaranteed to return the same
-    /// vector MUST return the same string. For the four wire-shape-fixed
-    /// adapters this is just the configured base URL -- repointing
-    /// ZEROCACHE_OPENAI_BASE_URL at a self-hosted vLLM must not silently
-    /// reuse vectors computed by api.openai.com. For a cloud adapter it also
-    /// carries whatever per-request coordinates the caller encoded in
+    /// different strings here -- this direction is a hard requirement, since
+    /// getting it wrong risks serving a wrong vector as if it were correct.
+    /// The reverse is only a *should*, not a MUST: two configurations that
+    /// are guaranteed to return the same vector should return the same
+    /// string, but returning different strings for them is always safe (it
+    /// just costs an unnecessary cold miss, never a wrong answer), so a more
+    /// conservative implementation is free to over-distinguish. For the four
+    /// wire-shape-fixed adapters this is just the configured base URL --
+    /// repointing ZEROCACHE_OPENAI_BASE_URL at a self-hosted vLLM must not
+    /// silently reuse vectors computed by api.openai.com. For a cloud adapter
+    /// it also carries whatever per-request coordinates the caller encoded in
     /// `model` (region, project, deployment, task type), since those select
-    /// different weights behind an identical model name.
+    /// different weights behind an identical model name -- and may also fold
+    /// in coarser-grained implementation details (e.g. a shared client
+    /// library's own version) that over-invalidate rather than risk
+    /// under-invalidating.
     ///
     /// Fallible because a cloud adapter derives it by parsing `model`, which
     /// the caller can get wrong.

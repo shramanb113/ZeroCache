@@ -97,7 +97,7 @@ impl<R: CloudRouter + 'static> EmbeddingProvider for CloudProvider<R> {
 
     fn cache_scope(&self, model: &str) -> Result<String, ProviderError> {
         let resolved = self.router.resolve(model)?;
-        Ok(format!("{}|{}|kit{}", resolved.endpoint_base, resolved.canonical, KIT_VERSION))
+        Ok(format!("{}\0{}\0kit{}", resolved.endpoint_base, resolved.canonical, KIT_VERSION))
     }
 }
 

@@ -11,7 +11,16 @@ use zerocache_ports::{ProviderError, ProviderUsage};
 pub struct ResolvedModel {
     /// Fully-qualified, normalized form. Two spellings of the same target
     /// must produce the same `canonical`; two different targets must never
-    /// produce the same one. This is what lands in `cache_scope`.
+    /// produce the same one. This is what lands in `cache_scope` (via
+    /// `CloudProvider::cache_scope` in `driver.rs`) -- `qualifier` does NOT
+    /// separately feed into `cache_scope`, so if `qualifier` (or anything
+    /// else about this request) can change the returned vector, that fact
+    /// MUST be folded into `canonical` itself, not left to live only in
+    /// `qualifier`. A `CloudRouter` implementation that sets a
+    /// vector-affecting `qualifier` but leaves it out of `canonical` will
+    /// silently collapse two requests that produce different vectors into
+    /// one cache entry -- the exact wrong-vector hazard this whole
+    /// `ResolvedModel`/`cache_scope` design exists to prevent.
     pub canonical: String,
     /// The bare model/deployment identifier the wire body or URL path needs.
     pub model_id: String,
@@ -19,6 +28,16 @@ pub struct ResolvedModel {
     pub endpoint_base: String,
     /// Cloud-specific extra the strategy needs and the driver never inspects
     /// -- Bedrock's `input_type`, Vertex's `task_type`, Azure's surface.
+    ///
+    /// IMPORTANT: this field is invisible to the cache key. Only `canonical`
+    /// feeds `cache_scope`; `qualifier` does not. If a value placed here can
+    /// change the OUTPUT VECTOR for otherwise-identical input text (e.g.
+    /// Cohere's `input_type=search_query` vs `search_document` on the same
+    /// text produces different embeddings), setting `qualifier` alone does
+    /// NOT protect the cache -- the same distinguishing information must
+    /// also be encoded into `canonical` (see its doc comment), or two
+    /// requests that should never share a cache entry will collide and one
+    /// will silently be served the other's vector.
     pub qualifier: Option<String>,
 }
 

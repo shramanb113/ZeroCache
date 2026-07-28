@@ -106,17 +106,19 @@ async fn main() {
 
 /// Warns at startup when an operator has repointed a provider's base URL
 /// away from its real default -- e.g. at a self-hosted vLLM/LM Studio/TGI
-/// instance instead of the real upstream provider. This does NOT change the
-/// cache key: `CacheKey::derive` (zerocache-core) hashes `owner_id +
-/// provider + model + model_version + text`, where `provider` is just the
-/// URL path segment (e.g. "openai"), not the actual base URL. So repointing
-/// `ZEROCACHE_OPENAI_BASE_URL` at a different endpoint silently reuses
-/// whatever was already cached under `owner_id+"openai"+model+...`, even
-/// though the new endpoint may be a completely different model/weights. A
-/// redesigned cache key is out of scope here (deferred to a future
-/// adapter-layer project) -- this is just a startup warning so an operator
-/// making that switch knows to flush the store (or point at a distinct
-/// ZEROCACHE_STORAGE_PATH / Redis DB) instead of finding out the hard way.
+/// instance instead of the real upstream provider. Cache entries ARE keyed
+/// by endpoint: `CacheKey::derive`/`derive_image` (zerocache-core) hash
+/// `owner_id + provider + model + model_version + text + cache_scope`, and
+/// every adapter's `cache_scope` includes its own configured `base_url` (see
+/// `EmbeddingProvider::cache_scope` in zerocache-ports). So repointing
+/// `ZEROCACHE_OPENAI_BASE_URL` at a different endpoint automatically produces
+/// a distinct `cache_scope`, which produces a distinct cache key -- the new
+/// endpoint starts cold rather than silently reusing vectors computed by the
+/// old one. No manual store flush is needed for that reason. This is just a
+/// startup warning so an operator making that switch is aware their store
+/// will accumulate entries under both the old and new endpoint's scopes
+/// (each strictly correct on its own, just not deduplicated against each
+/// other) rather than being surprised by it.
 fn warn_on_overridden_base_urls(config: &Config) {
     let overrides = [
         ("ZEROCACHE_OPENAI_BASE_URL", &config.openai_base_url, DEFAULT_OPENAI_BASE_URL),
@@ -128,7 +130,7 @@ fn warn_on_overridden_base_urls(config: &Config) {
     for (env_var_name, actual, default) in overrides {
         if actual != default {
             tracing::warn!(
-                "{env_var_name} is overridden to '{actual}' -- cache entries are not keyed by endpoint, so if you're repointing at a different upstream than before, flush the store (or use a distinct ZEROCACHE_STORAGE_PATH / Redis DB) to avoid serving vectors computed by the previous endpoint as if they came from this one"
+                "{env_var_name} is overridden to '{actual}' -- since this feeds into the adapter's cache_scope, cache entries for the new endpoint are automatically distinct from whatever was cached under the previous one, so this starts cold rather than reusing stale vectors; no manual store flush is needed"
             );
         }
     }
