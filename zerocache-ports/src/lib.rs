@@ -55,6 +55,25 @@ pub trait EmbeddingProvider: Send + Sync {
     /// the crate version wasn't bumped, the same discipline every published
     /// crate already needs.
     fn version(&self) -> &'static str;
+
+    /// A string that fully identifies *which upstream weights* would answer a
+    /// request for `model` through this adapter instance. Folded into the
+    /// cache key alongside owner/provider/model/version.
+    ///
+    /// Two adapter configurations that could return different vectors for the
+    /// same (owner, provider, model, version, text) tuple MUST return
+    /// different strings here; two that are guaranteed to return the same
+    /// vector MUST return the same string. For the four wire-shape-fixed
+    /// adapters this is just the configured base URL -- repointing
+    /// ZEROCACHE_OPENAI_BASE_URL at a self-hosted vLLM must not silently
+    /// reuse vectors computed by api.openai.com. For a cloud adapter it also
+    /// carries whatever per-request coordinates the caller encoded in
+    /// `model` (region, project, deployment, task type), since those select
+    /// different weights behind an identical model name.
+    ///
+    /// Fallible because a cloud adapter derives it by parsing `model`, which
+    /// the caller can get wrong.
+    fn cache_scope(&self, model: &str) -> Result<String, ProviderError>;
 }
 
 /// One image to embed: raw base64 payload plus the MIME type Gemini's
@@ -82,4 +101,23 @@ pub trait ImageEmbeddingProvider: Send + Sync {
     ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError>;
 
     fn version(&self) -> &'static str;
+
+    /// A string that fully identifies *which upstream weights* would answer a
+    /// request for `model` through this adapter instance. Folded into the
+    /// cache key alongside owner/provider/model/version.
+    ///
+    /// Two adapter configurations that could return different vectors for the
+    /// same (owner, provider, model, version, text) tuple MUST return
+    /// different strings here; two that are guaranteed to return the same
+    /// vector MUST return the same string. For the four wire-shape-fixed
+    /// adapters this is just the configured base URL -- repointing
+    /// ZEROCACHE_OPENAI_BASE_URL at a self-hosted vLLM must not silently
+    /// reuse vectors computed by api.openai.com. For a cloud adapter it also
+    /// carries whatever per-request coordinates the caller encoded in
+    /// `model` (region, project, deployment, task type), since those select
+    /// different weights behind an identical model name.
+    ///
+    /// Fallible because a cloud adapter derives it by parsing `model`, which
+    /// the caller can get wrong.
+    fn cache_scope(&self, model: &str) -> Result<String, ProviderError>;
 }
