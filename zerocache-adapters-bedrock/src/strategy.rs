@@ -149,3 +149,236 @@ impl TextWireStrategy for CohereEmbedStrategy {
         Ok(EmbedOutcome { vectors, usage: ProviderUsage::default() })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use httpmock::prelude::*;
+    use serde_json::json;
+    use zerocache_ports::EmbeddingProvider;
+
+    use crate::{new_provider, BedrockProvider};
+
+    fn provider(base: String) -> BedrockProvider {
+        new_provider("us-east-1", base)
+    }
+
+    #[tokio::test]
+    async fn titan_sends_scalar_input_text_with_bearer_auth_and_reports_its_token_count() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/model/amazon.titan-embed-text-v2:0/invoke")
+                    .header("Authorization", "Bearer test-key")
+                    .json_body(json!({ "inputText": "hello" }));
+                then.status(200)
+                    .json_body(json!({ "embedding": [1.0, 2.0], "inputTextTokenCount": 3 }));
+            })
+            .await;
+
+        let (vectors, usage) = provider(server.base_url())
+            .embed_batch("test-key", "amazon.titan-embed-text-v2:0", &["hello".to_string()])
+            .await
+            .unwrap();
+
+        mock.assert_async().await;
+        assert_eq!(vectors, vec![vec![1.0, 2.0]]);
+        assert_eq!(usage.prompt_tokens, 3, "Titan does report token usage -- it must not be dropped");
+        assert_eq!(usage.total_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn titan_issues_one_call_per_text_and_sums_usage_across_them() {
+        // inputText is a scalar, so N texts is genuinely N calls.
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/model/amazon.titan-embed-text-v1/invoke");
+                then.status(200)
+                    .json_body(json!({ "embedding": [7.0], "inputTextTokenCount": 4 }));
+            })
+            .await;
+
+        let texts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let (vectors, usage) = provider(server.base_url())
+            .embed_batch("test-key", "amazon.titan-embed-text-v1", &texts)
+            .await
+            .unwrap();
+
+        assert_eq!(mock.hits_async().await, 3);
+        assert_eq!(vectors.len(), 3);
+        assert_eq!(usage.prompt_tokens, 12);
+    }
+
+    #[tokio::test]
+    async fn cohere_sends_a_texts_array_with_the_required_input_type() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/model/cohere.embed-english-v3/invoke")
+                    .header("Authorization", "Bearer test-key")
+                    .json_body(json!({ "texts": ["a", "b"], "input_type": "search_document" }));
+                then.status(200).json_body(json!({
+                    "id": "abc",
+                    "response_type": "embeddings_floats",
+                    "embeddings": [[1.0], [2.0]],
+                    "texts": ["a", "b"]
+                }));
+            })
+            .await;
+
+        let (vectors, usage) = provider(server.base_url())
+            .embed_batch("test-key", "cohere.embed-english-v3", &["a".to_string(), "b".to_string()])
+            .await
+            .unwrap();
+
+        mock.assert_async().await;
+        assert_eq!(vectors, vec![vec![1.0], vec![2.0]]);
+        assert_eq!(
+            usage.prompt_tokens, 0,
+            "Cohere on Bedrock reports no usage at all -- must stay zero, not fabricated"
+        );
+    }
+
+    #[tokio::test]
+    async fn cohere_input_type_qualifier_reaches_the_wire() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/model/cohere.embed-english-v3/invoke")
+                    .json_body(json!({ "texts": ["q"], "input_type": "search_query" }));
+                then.status(200)
+                    .json_body(json!({ "response_type": "embeddings_floats", "embeddings": [[5.0]] }));
+            })
+            .await;
+
+        provider(server.base_url())
+            .embed_batch("test-key", "cohere.embed-english-v3#search_query", &["q".to_string()])
+            .await
+            .unwrap();
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cohere_also_parses_the_embeddings_by_type_response_shape() {
+        // This strategy never asks for embedding_types, so it should always
+        // get the flat form -- but a Bedrock-side default change must degrade
+        // into a working parse, not a deserialization error in production.
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/model/cohere.embed-v4:0/invoke");
+                then.status(200).json_body(json!({
+                    "response_type": "embeddings_by_type",
+                    "embeddings": { "float": [[1.5], [2.5]] }
+                }));
+            })
+            .await;
+
+        let (vectors, _usage) = provider(server.base_url())
+            .embed_batch("test-key", "cohere.embed-v4:0", &["a".to_string(), "b".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(vectors, vec![vec![1.5], vec![2.5]]);
+    }
+
+    #[tokio::test]
+    async fn cohere_chunks_at_ninety_six_and_concatenates_in_order() {
+        let server = MockServer::start_async().await;
+        let first = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/model/cohere.embed-english-v3/invoke").matches(|req| {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
+                    body["texts"].as_array().map(|a| a.len()) == Some(96)
+                });
+                then.status(200).json_body_obj(&json!({
+                    "embeddings": (0..96).map(|i| json!([i as f64])).collect::<Vec<_>>()
+                }));
+            })
+            .await;
+        let second = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/model/cohere.embed-english-v3/invoke").matches(|req| {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
+                    body["texts"].as_array().map(|a| a.len()) == Some(4)
+                });
+                then.status(200).json_body_obj(&json!({
+                    "embeddings": (0..4).map(|i| json!([1000.0 + i as f64])).collect::<Vec<_>>()
+                }));
+            })
+            .await;
+
+        let texts: Vec<String> = (0..100).map(|i| format!("text-{i}")).collect();
+        let (vectors, _usage) = provider(server.base_url())
+            .embed_batch("test-key", "cohere.embed-english-v3", &texts)
+            .await
+            .unwrap();
+
+        first.assert_async().await;
+        second.assert_async().await;
+        assert_eq!(vectors.len(), 100);
+        assert_eq!(vectors[0], vec![0.0]);
+        assert_eq!(vectors[95], vec![95.0]);
+        assert_eq!(vectors[96], vec![1000.0]);
+        assert_eq!(vectors[99], vec![1003.0]);
+    }
+
+    #[tokio::test]
+    async fn an_http_error_status_surfaces_as_an_error() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/model/cohere.embed-english-v3/invoke");
+                then.status(403).json_body(json!({ "message": "not authorized" }));
+            })
+            .await;
+
+        let result = provider(server.base_url())
+            .embed_batch("bad-key", "cohere.embed-english-v3", &["x".to_string()])
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_response_count_mismatch_is_a_hard_error() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/model/cohere.embed-english-v3/invoke");
+                then.status(200).json_body(json!({ "embeddings": [[1.0]] }));
+            })
+            .await;
+
+        let result = provider(server.base_url())
+            .embed_batch("test-key", "cohere.embed-english-v3", &["a".to_string(), "b".to_string()])
+            .await;
+
+        assert!(result.is_err(), "a count mismatch must be a hard error, not a silent misalignment");
+    }
+
+    #[test]
+    fn cache_scope_separates_regions_vendors_and_input_types() {
+        let p = provider("https://bedrock-runtime.{region}.amazonaws.com".to_string());
+        let east = p.cache_scope("us-east-1/cohere.embed-english-v3").unwrap();
+        let west = p.cache_scope("eu-west-1/cohere.embed-english-v3").unwrap();
+        let query = p.cache_scope("us-east-1/cohere.embed-english-v3#search_query").unwrap();
+        let titan = p.cache_scope("us-east-1/amazon.titan-embed-text-v2:0").unwrap();
+
+        assert_ne!(east, west, "region must not be cached across");
+        assert_ne!(east, query, "input_type must not be cached across");
+        assert_ne!(east, titan, "vendor must not be cached across");
+    }
+
+    #[test]
+    fn cache_scope_rejects_an_unsupported_model_rather_than_inventing_a_scope() {
+        let p = provider("https://bedrock-runtime.{region}.amazonaws.com".to_string());
+        assert!(p.cache_scope("meta.llama3-8b").is_err());
+    }
+}

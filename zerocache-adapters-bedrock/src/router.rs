@@ -134,3 +134,115 @@ impl CloudRouter for BedrockRouter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn router() -> BedrockRouter {
+        BedrockRouter::new(DEFAULT_BEDROCK_REGION, DEFAULT_BEDROCK_ENDPOINT_TEMPLATE)
+    }
+
+    #[test]
+    fn bare_model_id_uses_the_default_region() {
+        let r = router().resolve("amazon.titan-embed-text-v2:0").unwrap();
+        assert_eq!(r.model_id, "amazon.titan-embed-text-v2:0");
+        assert_eq!(r.endpoint_base, "https://bedrock-runtime.us-east-1.amazonaws.com");
+        assert_eq!(r.canonical, "us-east-1/amazon.titan-embed-text-v2:0");
+    }
+
+    #[test]
+    fn explicit_region_overrides_the_default_and_reaches_a_different_host() {
+        let r = router().resolve("eu-west-1/amazon.titan-embed-text-v2:0").unwrap();
+        assert_eq!(r.endpoint_base, "https://bedrock-runtime.eu-west-1.amazonaws.com");
+        assert_eq!(r.canonical, "eu-west-1/amazon.titan-embed-text-v2:0");
+    }
+
+    #[test]
+    fn a_bare_model_id_and_its_explicitly_qualified_form_collapse_to_one_cache_entry() {
+        // Same target, two spellings -- must produce identical canonical form,
+        // or the cache splits in two for no reason.
+        let bare = router().resolve("cohere.embed-english-v3").unwrap();
+        let qualified = router().resolve("us-east-1/cohere.embed-english-v3").unwrap();
+        assert_eq!(bare.canonical, qualified.canonical);
+    }
+
+    #[test]
+    fn the_same_model_in_two_regions_never_collapses_to_one_cache_entry() {
+        let east = router().resolve("us-east-1/cohere.embed-english-v3").unwrap();
+        let west = router().resolve("eu-west-1/cohere.embed-english-v3").unwrap();
+        assert_ne!(
+            east.canonical, west.canonical,
+            "two regional deployments are two upstreams and must not share cached vectors"
+        );
+    }
+
+    #[test]
+    fn cohere_defaults_to_search_document_and_records_it_in_the_canonical_form() {
+        let r = router().resolve("cohere.embed-english-v3").unwrap();
+        assert_eq!(r.qualifier.as_deref(), Some("search_document"));
+        assert_eq!(r.canonical, "us-east-1/cohere.embed-english-v3#search_document");
+    }
+
+    #[test]
+    fn cohere_input_type_changes_the_canonical_form_so_query_and_document_vectors_never_collide() {
+        let doc = router().resolve("cohere.embed-english-v3#search_document").unwrap();
+        let query = router().resolve("cohere.embed-english-v3#search_query").unwrap();
+        assert_ne!(
+            doc.canonical, query.canonical,
+            "input_type changes the vector, so it has to change the cache identity"
+        );
+        assert_eq!(query.qualifier.as_deref(), Some("search_query"));
+    }
+
+    #[test]
+    fn titan_has_no_qualifier_and_rejects_one_rather_than_ignoring_it() {
+        let r = router().resolve("amazon.titan-embed-text-v2:0").unwrap();
+        assert_eq!(r.qualifier, None);
+
+        let err = router().resolve("amazon.titan-embed-text-v2:0#search_query").unwrap_err();
+        assert!(
+            err.0.contains("no input_type parameter"),
+            "silently ignoring a qualifier would let a caller believe it took effect: {}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn an_unknown_vendor_prefix_is_rejected_with_a_message_naming_the_supported_ones() {
+        let err = router().resolve("meta.llama3-8b").unwrap_err();
+        assert!(err.0.contains("amazon.titan-embed"), "{}", err.0);
+        assert!(err.0.contains("cohere.embed"), "{}", err.0);
+    }
+
+    #[test]
+    fn a_malformed_model_string_is_rejected() {
+        assert!(router().resolve("").is_err());
+        assert!(router().resolve("/cohere.embed-english-v3").is_err());
+        assert!(router().resolve("us-east-1/").is_err());
+        assert!(router().resolve("cohere.embed-english-v3#").is_err());
+    }
+
+    #[test]
+    fn strategy_selection_follows_the_vendor_prefix_including_batch_size() {
+        let r = router();
+        let titan = r.resolve("amazon.titan-embed-text-v2:0").unwrap();
+        assert_eq!(r.strategy_for(&titan).unwrap().max_batch(), 1);
+
+        let cohere_v3 = r.resolve("cohere.embed-english-v3").unwrap();
+        assert_eq!(r.strategy_for(&cohere_v3).unwrap().max_batch(), 96);
+
+        let cohere_v4 = r.resolve("cohere.embed-v4:0").unwrap();
+        assert_eq!(r.strategy_for(&cohere_v4).unwrap().max_batch(), 96);
+    }
+
+    #[test]
+    fn an_endpoint_template_without_a_region_placeholder_is_used_verbatim() {
+        // What makes httpmock testing and a PrivateLink endpoint both work.
+        let r = BedrockRouter::new("us-east-1", "http://127.0.0.1:9999");
+        assert_eq!(
+            r.resolve("cohere.embed-english-v3").unwrap().endpoint_base,
+            "http://127.0.0.1:9999"
+        );
+    }
+}
