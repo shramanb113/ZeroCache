@@ -172,3 +172,123 @@ impl CloudRouter for VertexRouter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn router_with_project() -> VertexRouter {
+        VertexRouter::new(
+            Some("my-project".to_string()),
+            DEFAULT_VERTEX_LOCATION,
+            DEFAULT_VERTEX_ENDPOINT_TEMPLATE,
+        )
+    }
+
+    fn router_without_project() -> VertexRouter {
+        VertexRouter::new(None, DEFAULT_VERTEX_LOCATION, DEFAULT_VERTEX_ENDPOINT_TEMPLATE)
+    }
+
+    #[test]
+    fn bare_model_id_uses_the_default_project_and_location() {
+        let r = router_with_project().resolve("text-embedding-005").unwrap();
+        assert_eq!(r.model_id, "text-embedding-005");
+        assert_eq!(
+            r.endpoint_base,
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models"
+        );
+        assert_eq!(r.canonical, "us-central1/my-project/text-embedding-005");
+    }
+
+    #[test]
+    fn a_fully_qualified_model_overrides_both_defaults() {
+        let r = router_with_project()
+            .resolve("europe-west4/other-project/text-embedding-005")
+            .unwrap();
+        assert_eq!(
+            r.endpoint_base,
+            "https://europe-west4-aiplatform.googleapis.com/v1/projects/other-project/locations/europe-west4/publishers/google/models"
+        );
+        assert_eq!(r.canonical, "europe-west4/other-project/text-embedding-005");
+    }
+
+    #[test]
+    fn a_bare_model_id_and_its_explicitly_qualified_form_collapse_to_one_cache_entry() {
+        let bare = router_with_project().resolve("text-embedding-005").unwrap();
+        let qualified = router_with_project()
+            .resolve("us-central1/my-project/text-embedding-005")
+            .unwrap();
+        assert_eq!(bare.canonical, qualified.canonical);
+    }
+
+    #[test]
+    fn two_projects_never_collapse_to_one_cache_entry() {
+        let a = router_with_project().resolve("us-central1/proj-a/text-embedding-005").unwrap();
+        let b = router_with_project().resolve("us-central1/proj-b/text-embedding-005").unwrap();
+        assert_ne!(
+            a.canonical, b.canonical,
+            "two projects are two billing and deployment boundaries and must not share cached vectors"
+        );
+    }
+
+    #[test]
+    fn a_missing_project_with_no_default_is_an_error_naming_both_fixes() {
+        let err = router_without_project().resolve("text-embedding-005").unwrap_err();
+        assert!(err.0.contains("ZEROCACHE_VERTEX_PROJECT"), "{}", err.0);
+        assert!(err.0.contains("<location>/<project>/"), "{}", err.0);
+    }
+
+    #[test]
+    fn task_type_changes_the_canonical_form_so_query_and_document_vectors_never_collide() {
+        let doc = router_with_project()
+            .resolve("text-embedding-005#RETRIEVAL_DOCUMENT")
+            .unwrap();
+        let query = router_with_project()
+            .resolve("text-embedding-005#RETRIEVAL_QUERY")
+            .unwrap();
+        assert_ne!(doc.canonical, query.canonical);
+        assert_eq!(query.qualifier.as_deref(), Some("RETRIEVAL_QUERY"));
+    }
+
+    #[test]
+    fn an_omitted_task_type_stays_omitted_rather_than_being_defaulted_here() {
+        let r = router_with_project().resolve("text-embedding-005").unwrap();
+        assert_eq!(r.qualifier, None, "Google's own default must apply, not one invented by this adapter");
+    }
+
+    #[test]
+    fn gemini_embedding_selects_the_single_instance_strategy() {
+        let r = router_with_project();
+        let gemini = r.resolve("gemini-embedding-001").unwrap();
+        assert_eq!(
+            r.strategy_for(&gemini).unwrap().max_batch(),
+            1,
+            "gemini-embedding-001 accepts exactly one input per request"
+        );
+
+        let standard = r.resolve("text-embedding-005").unwrap();
+        assert_eq!(r.strategy_for(&standard).unwrap().max_batch(), 250);
+
+        let multilingual = r.resolve("text-multilingual-embedding-002").unwrap();
+        assert_eq!(r.strategy_for(&multilingual).unwrap().max_batch(), 250);
+    }
+
+    #[test]
+    fn a_malformed_model_string_is_rejected() {
+        let r = router_with_project();
+        assert!(r.resolve("").is_err());
+        assert!(r.resolve("my-project/text-embedding-005").is_err(), "two segments is ambiguous");
+        assert!(r.resolve("a/b/c/d").is_err());
+        assert!(r.resolve("us-central1//text-embedding-005").is_err());
+        assert!(r.resolve("text-embedding-005#").is_err());
+    }
+
+    #[test]
+    fn an_endpoint_template_without_a_location_placeholder_is_used_verbatim() {
+        let r = VertexRouter::new(Some("p".to_string()), "us-central1", "http://127.0.0.1:9999");
+        assert_eq!(
+            r.resolve("text-embedding-005").unwrap().endpoint_base,
+            "http://127.0.0.1:9999/v1/projects/p/locations/us-central1/publishers/google/models"
+        );
+    }
+}
