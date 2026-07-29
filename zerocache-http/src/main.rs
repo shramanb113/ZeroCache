@@ -22,12 +22,15 @@ use config::{
     DEFAULT_OPENAI_BASE_URL,
 };
 use wire::{DeleteResponse, EmbeddingObject, EmbeddingsRequest, EmbeddingsResponse, ErrorResponse, Usage};
+use zerocache_adapters_azure::new_provider as new_azure_provider;
+use zerocache_adapters_bedrock::new_provider as new_bedrock_provider;
 use zerocache_adapters_gemini::GeminiProvider;
 use zerocache_adapters_huggingface::HuggingFaceProvider;
 use zerocache_adapters_mistral::MistralProvider;
 use zerocache_adapters_openai::OpenAiProvider;
 use zerocache_adapters_redis::RedisStore;
 use zerocache_adapters_sled::SledStore;
+use zerocache_adapters_vertexai::new_provider as new_vertexai_provider;
 use zerocache_core::derive_owner_id;
 use zerocache_ports::{EmbeddingProvider, EmbeddingStore, ImageEmbeddingProvider};
 
@@ -35,7 +38,7 @@ use zerocache_ports::{EmbeddingProvider, EmbeddingStore, ImageEmbeddingProvider}
 async fn main() {
     let tracer_provider = otel::init();
     let config = Config::from_env();
-    warn_on_overridden_base_urls(&config);
+    log_overridden_base_urls(&config);
 
     let store: Arc<dyn EmbeddingStore> = match config.storage_backend {
         StorageBackend::Sled => {
@@ -59,6 +62,50 @@ async fn main() {
 
     let mut image_providers: HashMap<String, Arc<dyn ImageEmbeddingProvider>> = HashMap::new();
     image_providers.insert("gemini".to_string(), gemini_provider as Arc<dyn ImageEmbeddingProvider>);
+
+    // Registered unconditionally: both are constructible from pure defaults,
+    // and a missing per-request coordinate (Vertex project, Bedrock region)
+    // is a per-request resolution error, not a startup one.
+    providers.insert(
+        "bedrock".to_string(),
+        Arc::new(new_bedrock_provider(
+            config.bedrock_region.clone(),
+            config.bedrock_endpoint_template.clone(),
+        )),
+    );
+    providers.insert(
+        "vertexai".to_string(),
+        Arc::new(new_vertexai_provider(
+            config.vertex_project.clone(),
+            config.vertex_location.clone(),
+            config.vertex_endpoint_template.clone(),
+        )),
+    );
+
+    // Azure is the exception: an Azure resource name *is* its hostname, so
+    // there is no default endpoint to fall back to. With the env var unset,
+    // POST /azure/v1/embeddings returns the existing 404 "unknown provider"
+    // straight out of the missing map key -- the same structural mechanism
+    // that already makes /openai/v1/images/embeddings 404, with no extra
+    // enforcement code.
+    match &config.azure_openai_base_url {
+        Some(base_url) => {
+            providers.insert(
+                "azure".to_string(),
+                Arc::new(new_azure_provider(
+                    base_url.clone(),
+                    config.azure_foundry_base_url.clone(),
+                    config.azure_foundry_api_version.clone(),
+                    config.azure_auth_mode,
+                )),
+            );
+        }
+        None => {
+            tracing::info!(
+                "ZEROCACHE_AZURE_OPENAI_BASE_URL is unset -- the 'azure' provider is not registered and /azure/v1/embeddings will return 404"
+            );
+        }
+    }
 
     let port = config.port;
 
@@ -104,22 +151,18 @@ async fn main() {
     }
 }
 
-/// Warns at startup when an operator has repointed a provider's base URL
-/// away from its real default -- e.g. at a self-hosted vLLM/LM Studio/TGI
-/// instance instead of the real upstream provider. Cache entries ARE keyed
-/// by endpoint: `CacheKey::derive`/`derive_image` (zerocache-core) hash
-/// `owner_id + provider + model + model_version + text + cache_scope`, and
-/// every adapter's `cache_scope` includes its own configured `base_url` (see
-/// `EmbeddingProvider::cache_scope` in zerocache-ports). So repointing
-/// `ZEROCACHE_OPENAI_BASE_URL` at a different endpoint automatically produces
-/// a distinct `cache_scope`, which produces a distinct cache key -- the new
-/// endpoint starts cold rather than silently reusing vectors computed by the
-/// old one. No manual store flush is needed for that reason. This is just a
-/// startup warning so an operator making that switch is aware their store
-/// will accumulate entries under both the old and new endpoint's scopes
-/// (each strictly correct on its own, just not deduplicated against each
-/// other) rather than being surprised by it.
-fn warn_on_overridden_base_urls(config: &Config) {
+/// Notes at startup when an operator has repointed a provider's base URL away
+/// from its real default -- e.g. at a self-hosted vLLM/LM Studio/TGI instance.
+///
+/// This used to be a `warn!` about stale cache hits: `CacheKey::derive` did
+/// not include the endpoint, so repointing an adapter silently reused vectors
+/// computed by the previous upstream. That hazard is gone -- the cache key now
+/// carries `EmbeddingProvider::cache_scope`, which for these four adapters is
+/// the configured base URL, so repointing produces a clean cold cache instead
+/// of a wrong hit. Kept at `info` because "your hit rate is about to drop to
+/// zero" is still worth saying out loud once at startup; it just is not a
+/// correctness warning anymore.
+fn log_overridden_base_urls(config: &Config) {
     let overrides = [
         ("ZEROCACHE_OPENAI_BASE_URL", &config.openai_base_url, DEFAULT_OPENAI_BASE_URL),
         ("ZEROCACHE_MISTRAL_BASE_URL", &config.mistral_base_url, DEFAULT_MISTRAL_BASE_URL),
@@ -129,8 +172,8 @@ fn warn_on_overridden_base_urls(config: &Config) {
 
     for (env_var_name, actual, default) in overrides {
         if actual != default {
-            tracing::warn!(
-                "{env_var_name} is overridden to '{actual}' -- since this feeds into the adapter's cache_scope, cache entries for the new endpoint are automatically distinct from whatever was cached under the previous one, so this starts cold rather than reusing stale vectors; no manual store flush is needed"
+            tracing::info!(
+                "{env_var_name} is overridden to '{actual}' -- cache entries are keyed by endpoint, so requests against this endpoint start from a cold cache rather than reusing anything cached under the default endpoint"
             );
         }
     }
