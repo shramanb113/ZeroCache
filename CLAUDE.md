@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-The Cargo workspace is scaffolded and builds/tests clean (9 crates). Treat `PRD.md` as the spec of intent, but **do not assume the port trait signatures or scope in PRD §6.2/§4 are verbatim in the code** — see "Deviations from the PRD" below; check `zerocache-ports/src/lib.rs` directly when in doubt. No CI workflow or Dockerfile exist yet (deliberately deferred — see Phasing).
+The Cargo workspace is scaffolded and builds/tests clean (13 crates — the original 9 plus a shared `zerocache-adapters-cloud` kit and three cloud-provider adapter crates, `-azure`/`-bedrock`/`-vertexai`, added 2026-07-28; see the Workspace structure table below for each one's current implementation status). Treat `PRD.md` as the spec of intent, but **do not assume the port trait signatures or scope in PRD §6.2/§4 are verbatim in the code** — see "Deviations from the PRD" below; check `zerocache-ports/src/lib.rs` directly when in doubt. No CI workflow or Dockerfile exist yet (deliberately deferred — see Phasing).
 
 ### Commands
 
@@ -81,8 +81,14 @@ zerocache-adapters-openai  EmbeddingProvider impl (OpenAI) — depends on ports
 zerocache-adapters-mistral EmbeddingProvider impl (Mistral) — depends on ports
 zerocache-adapters-gemini  EmbeddingProvider impl (Gemini), also ImageEmbeddingProvider — depends on ports
 zerocache-adapters-huggingface EmbeddingProvider impl (HuggingFace) — depends on ports
-zerocache-http             axum transport, wire-shape translation, provider registry, application wiring — depends on all of the above
+zerocache-adapters-cloud   shared cloud adapter kit: CloudRouter/TextWireStrategy traits + transport driver — depends on ports
+zerocache-adapters-bedrock EmbeddingProvider impl (Amazon Bedrock: Titan, Cohere) — depends on ports, adapters-cloud. Implemented and merged 2026-07-29.
+zerocache-adapters-vertexai EmbeddingProvider impl (GCP Vertex AI :predict) — depends on ports, adapters-cloud. In progress as of 2026-07-29.
+zerocache-adapters-azure   EmbeddingProvider impl (Azure OpenAI v1 + Foundry Models) — depends on ports, adapters-cloud. Not yet implemented — placeholder crate only.
+zerocache-http             axum transport, wire-shape translation, provider registry, application wiring — depends on all of the above. Bedrock/Vertex AI/Azure are not yet registered here (a separate "wiring" plan, not yet run).
 ```
+
+Full design and per-cloud implementation plans: `docs/superpowers/specs/2026-07-28-cloud-provider-adapter-layer-design.md` and `docs/superpowers/plans/2026-07-28-cloud-provider-adapter-layer-*.md` (local-only, gitignored). Formal `CLAUDE.md` Deviations entries for the cloud adapter layer land once all three cloud crates and the wiring plan are complete, in the wiring plan's own documentation task — this note is an interim pointer, not that final writeup.
 
 `zerocache-adapters-redis` is not in the PRD §13 list — see "Deviations" below. Neither are `zerocache-adapters-mistral`/`zerocache-adapters-gemini`/`zerocache-adapters-huggingface` — PRD §6.4 lists them as "Future" work; see the BYOK deviation entry above and `decisions.md`.
 

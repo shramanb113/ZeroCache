@@ -4,11 +4,11 @@ Zerocache is a standalone, Rust-native embedding cache that sits between an appl
 
 It is API-compatible with the OpenAI `/v1/embeddings` endpoint shape, so any TS or Python agent orchestration framework (Mastra, LangChain, LlamaIndex, LangGraph, CrewAI, Haystack, ...) can adopt it by pointing its existing embedding client at a different `base_url` — no SDK to install, no framework-specific integration code.
 
-Multi-provider, multi-tenant: pick OpenAI, Mistral, or Gemini per request via the URL path, bringing your own API key for that provider. Zerocache holds no provider credentials of its own, and the cache is scoped per-caller — two different callers' identical requests never share a cache entry.
+Multi-provider, multi-tenant: pick OpenAI, Mistral, Gemini, or HuggingFace per request via the URL path, bringing your own API key for that provider. Zerocache holds no provider credentials of its own, and the cache is scoped per-caller — two different callers' identical requests never share a cache entry. Gemini also supports image embeddings via a parallel `/gemini/v1/images/embeddings` route.
 
 ## Status
 
-Early Phase 1: the Cargo workspace is scaffolded and builds/tests clean, but it has not yet been wired up to a live ingestion pipeline. See [`PRD.md`](./PRD.md) for the full product spec, phasing, and success criteria, [`CLAUDE.md`](./CLAUDE.md) for architecture notes aimed at future contributors (human or AI), and [`decisions.md`](./decisions.md) for the reasoning behind the multi-tenant, multi-provider design.
+Phase 1 complete and validated against three independently-built, real consumers: a TypeScript/Mastra RAG pipeline (including an agentic battle-test driving Zerocache through `Agent` tool calls, not just a direct embedding client), a second TypeScript project on LangChain, and a Python/LlamaIndex pipeline against a different provider (Gemini) — proving the "any framework, any language" neutrality claim rather than just asserting it. Production-trust basics (provider timeouts, graceful shutdown, `/health` + `/ready`, request coalescing, retry/backoff, OpenTelemetry tracing) are in place. Cloud-provider adapters (Azure OpenAI, Amazon Bedrock, GCP Vertex AI) are in active development as of 2026-07-29 — see the Architecture table below for current per-crate status. See [`PRD.md`](./PRD.md) for the full product spec, phasing, and success criteria, [`CLAUDE.md`](./CLAUDE.md) for architecture notes aimed at future contributors (human or AI), and [`decisions.md`](./decisions.md) for the reasoning behind the multi-tenant, multi-provider design.
 
 ## Why
 
@@ -26,10 +26,15 @@ Dependencies point inward only, enforced via Cargo workspace crate boundaries:
 | `zerocache-adapters-redis` | `EmbeddingStore` implementation backed by Redis — shared, network-accessible. Use this for multi-replica (e.g. Kubernetes) deployments. |
 | `zerocache-adapters-openai` | `EmbeddingProvider` implementation for OpenAI. |
 | `zerocache-adapters-mistral` | `EmbeddingProvider` implementation for Mistral. |
-| `zerocache-adapters-gemini` | `EmbeddingProvider` implementation for Gemini (different auth scheme — `x-goog-api-key`, not a bearer token — and a different wire shape entirely). |
-| `zerocache-http` | axum HTTP server, wire-shape translation, provider registry, and application wiring. |
+| `zerocache-adapters-gemini` | `EmbeddingProvider` and `ImageEmbeddingProvider` implementation for Gemini (different auth scheme — `x-goog-api-key`, not a bearer token — and a different wire shape entirely; the only provider with image-embedding support so far). |
+| `zerocache-adapters-huggingface` | `EmbeddingProvider` implementation for HuggingFace Inference Providers. |
+| `zerocache-adapters-cloud` | Shared kit for the cloud-provider adapters below: HTTP transport driver plus a `CloudRouter`/`TextWireStrategy` strategy-pattern abstraction, since each cloud is one API in front of several independent model vendors. |
+| `zerocache-adapters-bedrock` | `EmbeddingProvider` implementation for Amazon Bedrock (Titan, Cohere). **Implemented.** |
+| `zerocache-adapters-vertexai` | `EmbeddingProvider` implementation for GCP Vertex AI's native `:predict` endpoint. **In progress.** |
+| `zerocache-adapters-azure` | `EmbeddingProvider` implementation for Azure OpenAI + Foundry Models. **Not yet implemented** — placeholder crate. |
+| `zerocache-http` | axum HTTP server, wire-shape translation, provider registry, and application wiring. The three cloud adapters above are not yet registered here. |
 
-The cache key is `blake3(owner_id, provider, model, model_version, text)`. `owner_id` is a hash of the caller's own forwarded API key (never the raw key), scoping the cache per-caller; `provider` and model identity are included so a different provider, model, or version can never silently return a stale-but-plausible vector.
+The cache key is `blake3(owner_id, provider, cache_scope, model, model_version, text)`. `owner_id` is a hash of the caller's own forwarded API key (never the raw key), scoping the cache per-caller; `provider`, `cache_scope`, and model identity are all included so a different provider, endpoint/deployment, model, or version can never silently return a stale-but-plausible vector. `cache_scope` (added 2026-07-28) is provider-specific — for the four base adapters it's the configured base URL, so repointing one at a different endpoint (e.g. a self-hosted vLLM instance) starts from a cold cache instead of risking a wrong hit.
 
 ## Getting started
 
@@ -108,24 +113,38 @@ Authorization: Bearer <your own API key for that provider>
 { "object": "list", "data": [ { "embedding": [...], "index": 0 }, ... ], "model": "...", "usage": {...} }
 ```
 
-`{provider}` is `openai`, `mistral`, or `gemini`. Every major orchestrator (Mastra, LangChain, LlamaIndex, LangGraph, CrewAI, Haystack) configures its embedding client with exactly three knobs — `base_url`, `api_key`, `model` — so pointing at Zerocache is just `base_url: "https://<your-zerocache>/mistral"` with your own Mistral key and `model: "mistral-embed"`. No plugin, no custom headers, no body-shape change.
+`{provider}` is `openai`, `mistral`, `gemini`, or `huggingface`. `input` accepts either a JSON array of strings or a single bare string, matching OpenAI's real `input: string | string[]` contract. Every major orchestrator (Mastra, LangChain, LlamaIndex, LangGraph, CrewAI, Haystack) configures its embedding client with exactly three knobs — `base_url`, `api_key`, `model` — so pointing at Zerocache is just `base_url: "https://<your-zerocache>/mistral"` with your own Mistral key and `model: "mistral-embed"`. No plugin, no custom headers, no body-shape change.
 
-Missing/malformed `Authorization` → `401`. Unknown `{provider}` → `404`. The cache is scoped per-caller: two different API keys requesting the same text under the same model never share a cache entry, even though a single caller's repeated requests always do. Each response also carries `X-Zerocache-Hits` / `X-Zerocache-Misses` headers, and `usage` reflects only what was actually billed by the provider for this request (0 for an all-cache-hit batch, and always 0 for Gemini, which does not report usage at all).
+A matching `DELETE /{provider}/v1/embeddings` (same body shape) removes the cache entries a matching `POST` would have hit, scoped to the caller's own `owner_id`.
 
-### Metrics
+Missing/malformed `Authorization` → `401`. Unknown `{provider}` → `404`. Valid JSON with a missing/wrong-typed required field → `422`; malformed JSON → `400` — both come back as `{"error": "..."}`, same shape as every other error path. The cache is scoped per-caller: two different API keys requesting the same text under the same model never share a cache entry, even though a single caller's repeated requests always do. Concurrent requests that miss on the exact same key within one instance are coalesced into a single provider call. Each response also carries `X-Zerocache-Hits` / `X-Zerocache-Misses` headers, and `usage` reflects only what was actually billed by the provider for this request (0 for an all-cache-hit batch, 0 for a coalesced request that piggybacked, and always 0 for Gemini, which does not report usage at all).
+
+### Image embeddings
 
 ```text
-GET /metrics
+POST /gemini/v1/images/embeddings
+Authorization: Bearer <your Gemini API key>
+{ "model": "gemini-embedding-001", "input": ["data:image/png;base64,<...>", ...] }
 ```
 
-Cumulative counters in Prometheus text exposition format, labeled by `provider`: `zerocache_cache_hits_total{provider="..."}`, `zerocache_cache_misses_total{provider="..."}`, `zerocache_provider_prompt_tokens_total{provider="..."}`. No owner/tenant label — that would leak tenant identity into a monitoring system and create unbounded cardinality. Per-instance — with multiple replicas (`ZEROCACHE_STORAGE_BACKEND=redis`), point your Prometheus scrape config at each pod and aggregate with `sum()` for a fleet-wide view.
+Gemini only, via `AppState.image_providers` — every other provider correctly `404`s with `{"error": "provider '<name>' does not support image embeddings"}`. Same `DELETE`, error-shape, and per-caller isolation semantics as the text endpoint.
+
+### Operational endpoints (unauthenticated)
+
+```text
+GET /health    liveness — 200 OK means only the process/router is up
+GET /ready     readiness — 200 OK if the configured store backend answers a get(); 503 otherwise
+GET /metrics   Prometheus text format
+```
+
+`/metrics` gives cumulative counters labeled by `provider` and `content_type` (`text`/`image`): `zerocache_cache_hits_total`, `zerocache_cache_misses_total`, `zerocache_provider_prompt_tokens_total`. No owner/tenant label — that would leak tenant identity into a monitoring system and create unbounded cardinality. Per-instance — with multiple replicas (`ZEROCACHE_STORAGE_BACKEND=redis`), point your Prometheus scrape config at each pod and aggregate with `sum()` for a fleet-wide view.
 
 ## Non-goals (v1)
 
 - Live/conversational query embedding caching
 - Semantic/fuzzy similarity matching (exact-match only)
 - Vector quantization/compression, eviction
-- Multi-provider *failover* (automatic fallback to a second provider if the first fails) — multi-provider *support* itself is implemented (OpenAI, Mistral, Gemini)
+- Multi-provider *failover* (automatic fallback to a second provider if the first fails) — multi-provider *support* itself is implemented (OpenAI, Mistral, Gemini, HuggingFace; Azure/Bedrock/Vertex AI in progress)
 - Per-tenant rate limiting or quota enforcement
 - Any Zerocache-specific SDK or client package
 
