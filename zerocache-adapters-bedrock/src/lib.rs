@@ -11,7 +11,9 @@
 //! `.../userguide/api-keys-use.html`,
 //! `.../userguide/model-parameters-titan-embed-text.html`,
 //! `.../userguide/model-parameters-embed-v3.html`, and
-//! `.../userguide/model-parameters-embed-v4.html`.
+//! `.../userguide/model-parameters-embed-v4.html`. That verification covers
+//! only the documentation, not this code: the adapter itself is mock-only,
+//! it has not yet had a live-key smoke test against a real AWS endpoint.
 
 mod router;
 mod strategy;

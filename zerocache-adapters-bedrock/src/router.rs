@@ -47,7 +47,10 @@ impl BedrockRouter {
 ///
 /// Splitting is unambiguous: Bedrock model IDs contain `.` and `:` (e.g.
 /// `amazon.titan-embed-text-v2:0`) but never `/`, and `#` is not legal in a
-/// model ID at all.
+/// model ID at all. `region` and `model_id` are further character-validated
+/// since both flow verbatim into the outbound request URL -- an unvalidated
+/// value would be an SSRF vector, letting a caller-supplied `model` string
+/// redirect the request to an arbitrary host/path.
 struct BedrockModelParts {
     region: String,
     model_id: String,
@@ -73,6 +76,24 @@ fn split_model(model: &str, default_region: &str) -> Result<BedrockModelParts, P
     if region.is_empty() || model_id.is_empty() {
         return Err(ProviderError(format!(
             "bedrock model '{model}' is malformed -- expected '[<region>/]<modelId>[#<input_type>]', e.g. 'us-east-1/cohere.embed-english-v3#search_query'"
+        )));
+    }
+
+    // Both fields are interpolated verbatim into the outbound request URL
+    // (endpoint host for `region`, path segment for `model_id`) -- reject
+    // anything containing URL-structural characters rather than let a
+    // caller-supplied `model` string smuggle a different host/path/query
+    // through, which is a real SSRF vector against e.g. link-local metadata
+    // endpoints, not a hypothetical one.
+    if !region.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        return Err(ProviderError(format!(
+            "bedrock model '{model}' has an invalid region -- expected an AWS region like 'us-east-1'"
+        )));
+    }
+
+    if model_id.contains('/') || model_id.contains('?') || model_id.contains('#') {
+        return Err(ProviderError(format!(
+            "bedrock model '{model}' has an invalid model id -- '/', '?', and '#' are not allowed"
         )));
     }
 
@@ -234,6 +255,21 @@ mod tests {
 
         let cohere_v4 = r.resolve("cohere.embed-v4:0").unwrap();
         assert_eq!(r.strategy_for(&cohere_v4).unwrap().max_batch(), 96);
+    }
+
+    #[test]
+    fn a_region_containing_url_structural_characters_is_rejected() {
+        let err = router().resolve("@169.254.169.254?/cohere.embed-english-v3").unwrap_err();
+        assert!(err.0.contains("invalid region"), "{}", err.0);
+    }
+
+    #[test]
+    fn a_model_id_containing_url_structural_characters_is_rejected() {
+        // Region splits at the first '/', so everything after it -- including
+        // this embedded '/' -- lands in model_id, which must reject it rather
+        // than let it escape the intended URL path segment.
+        let err = router().resolve("us-east-1/cohere.embed-x/evil").unwrap_err();
+        assert!(err.0.contains("invalid model id"), "{}", err.0);
     }
 
     #[test]

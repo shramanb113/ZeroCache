@@ -193,7 +193,7 @@ mod tests {
         let server = MockServer::start_async().await;
         let mock = server
             .mock_async(|when, then| {
-                when.method(POST).path("/model/amazon.titan-embed-text-v1/invoke");
+                when.method(POST).path("/model/amazon.titan-embed-text-v2:0/invoke");
                 then.status(200)
                     .json_body(json!({ "embedding": [7.0], "inputTextTokenCount": 4 }));
             })
@@ -201,7 +201,7 @@ mod tests {
 
         let texts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let (vectors, usage) = provider(server.base_url())
-            .embed_batch("test-key", "amazon.titan-embed-text-v1", &texts)
+            .embed_batch("test-key", "amazon.titan-embed-text-v2:0", &texts)
             .await
             .unwrap();
 
