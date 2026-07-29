@@ -50,6 +50,10 @@ impl VertexRouter {
 /// Location and project travel together -- a project without a location is
 /// ambiguous, since the location appears in both the hostname and the resource
 /// path. Splitting is unambiguous: Vertex model IDs never contain `/` or `#`.
+/// `location`, `project`, and `model_id` are further character-validated
+/// since all three flow verbatim into the outbound request URL -- an
+/// unvalidated value would be an SSRF vector, letting a caller-supplied
+/// `model` string redirect the request to an arbitrary host/path.
 struct VertexModelParts {
     location: String,
     project: String,
@@ -95,6 +99,33 @@ fn split_model(
     if location.is_empty() || project.is_empty() || model_id.is_empty() {
         return Err(ProviderError(format!(
             "vertexai model '{model}' has an empty location, project, or model id"
+        )));
+    }
+
+    // All three fields are interpolated verbatim into the outbound request
+    // URL (endpoint host and resource path for `location`/`project`, the
+    // final path segment for `model_id`) -- reject anything containing
+    // URL-structural characters rather than let a caller-supplied `model`
+    // string smuggle a different host/path/query through, which is a real
+    // SSRF vector, not a hypothetical one. Applied here, after both match
+    // arms above have resolved their values, so neither the bare-model-id
+    // form (with a malicious default) nor the explicit-location/project form
+    // can bypass it.
+    if !location.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        return Err(ProviderError(format!(
+            "vertexai model '{model}' has an invalid location -- expected a GCP location like 'us-central1'"
+        )));
+    }
+
+    if !project.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        return Err(ProviderError(format!(
+            "vertexai model '{model}' has an invalid project -- expected a GCP project id like 'my-project'"
+        )));
+    }
+
+    if model_id.contains('/') || model_id.contains('?') || model_id.contains('#') {
+        return Err(ProviderError(format!(
+            "vertexai model '{model}' has an invalid model id -- '/', '?', and '#' are not allowed"
         )));
     }
 
