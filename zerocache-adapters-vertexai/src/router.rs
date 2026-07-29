@@ -284,6 +284,26 @@ mod tests {
     }
 
     #[test]
+    fn a_location_containing_url_structural_characters_is_rejected() {
+        let err = router_with_project().resolve("evil.com/p/text-embedding-005").unwrap_err();
+        assert!(err.0.contains("invalid location"), "{}", err.0);
+    }
+
+    #[test]
+    fn a_project_containing_url_structural_characters_is_rejected() {
+        let err = router_with_project()
+            .resolve("us-central1/p@evil/text-embedding-005")
+            .unwrap_err();
+        assert!(err.0.contains("invalid project"), "{}", err.0);
+    }
+
+    #[test]
+    fn a_model_id_containing_url_structural_characters_is_rejected() {
+        let err = router_with_project().resolve("us-central1/p/model?x=1").unwrap_err();
+        assert!(err.0.contains("invalid model id"), "{}", err.0);
+    }
+
+    #[test]
     fn an_endpoint_template_without_a_location_placeholder_is_used_verbatim() {
         let r = VertexRouter::new(Some("p".to_string()), "us-central1", "http://127.0.0.1:9999");
         assert_eq!(

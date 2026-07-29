@@ -17,7 +17,9 @@
 //! `.../docs/model-reference/text-embeddings-api`, and
 //! `.../vertex-ai/docs/reference/rest/v1beta1/projects.locations.endpoints.chat/completions`
 //! (which is what establishes that the OpenAI-compat surface excludes
-//! embeddings).
+//! embeddings). That verification covers only the documentation, not this
+//! code: the adapter itself is mock-only, it has not yet had a live-key
+//! smoke test against a real GCP endpoint.
 
 mod router;
 mod strategy;
