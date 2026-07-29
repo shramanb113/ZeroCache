@@ -168,3 +168,303 @@ impl TextWireStrategy for AzureFoundryStrategy {
         parse_openai_shaped(expected, body)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use httpmock::prelude::*;
+    use serde_json::json;
+    use zerocache_ports::EmbeddingProvider;
+
+    use crate::{new_provider, AzureAuthMode, AzureProvider};
+
+    fn provider(base: String, auth_mode: AzureAuthMode) -> AzureProvider {
+        new_provider(base.clone(), Some(base), "2024-05-01-preview", auth_mode)
+    }
+
+    #[tokio::test]
+    async fn openai_v1_sends_the_deployment_as_model_and_reorders_by_index() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/openai/v1/embeddings")
+                    .header("Authorization", "Bearer entra-token")
+                    .json_body(json!({ "model": "my-deployment", "input": ["a", "b"] }));
+                then.status(200).json_body(json!({
+                    "object": "list",
+                    "model": "text-embedding-3-small",
+                    "data": [
+                        { "object": "embedding", "embedding": [2.0], "index": 1 },
+                        { "object": "embedding", "embedding": [1.0], "index": 0 }
+                    ],
+                    "usage": { "prompt_tokens": 5, "total_tokens": 5 }
+                }));
+            })
+            .await;
+
+        let (vectors, usage) = provider(server.base_url(), AzureAuthMode::Bearer)
+            .embed_batch("entra-token", "my-deployment", &["a".to_string(), "b".to_string()])
+            .await
+            .unwrap();
+
+        mock.assert_async().await;
+        assert_eq!(vectors, vec![vec![1.0], vec![2.0]], "an out-of-order response must be reordered by index");
+        assert_eq!(usage.prompt_tokens, 5);
+        assert_eq!(usage.total_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn openai_v1_sends_no_api_version_query_parameter() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/openai/v1/embeddings").matches(|req| {
+                    req.query_params
+                        .as_ref()
+                        .map(|params| params.iter().all(|(k, _)| k != "api-version"))
+                        .unwrap_or(true)
+                });
+                then.status(200).json_body(json!({
+                    "data": [{ "embedding": [1.0], "index": 0 }],
+                    "usage": { "prompt_tokens": 1, "total_tokens": 1 }
+                }));
+            })
+            .await;
+
+        provider(server.base_url(), AzureAuthMode::Bearer)
+            .embed_batch("tok", "my-deployment", &["a".to_string()])
+            .await
+            .unwrap();
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn api_key_auth_mode_sends_the_api_key_header_instead_of_a_bearer_token() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/openai/v1/embeddings").header("api-key", "resource-key");
+                then.status(200).json_body(json!({
+                    "data": [{ "embedding": [1.0], "index": 0 }],
+                    "usage": { "prompt_tokens": 1, "total_tokens": 1 }
+                }));
+            })
+            .await;
+
+        provider(server.base_url(), AzureAuthMode::ApiKey)
+            .embed_batch("resource-key", "my-deployment", &["a".to_string()])
+            .await
+            .unwrap();
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn foundry_sends_input_type_when_the_caller_asked_and_omits_it_otherwise() {
+        let server = MockServer::start_async().await;
+        let with_type = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/models/embeddings")
+                    .query_param("api-version", "2024-05-01-preview")
+                    .json_body(json!({
+                        "model": "cohere-embed-v3-english",
+                        "input": ["a"],
+                        "input_type": "query"
+                    }));
+                then.status(200).json_body(json!({
+                    "data": [{ "embedding": [1.0], "index": 0 }],
+                    "usage": { "prompt_tokens": 2, "total_tokens": 2 }
+                }));
+            })
+            .await;
+
+        provider(server.base_url(), AzureAuthMode::Bearer)
+            .embed_batch("tok", "foundry:cohere-embed-v3-english#query", &["a".to_string()])
+            .await
+            .unwrap();
+        with_type.assert_async().await;
+
+        let without_type = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/models/embeddings").matches(|req| {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
+                    body.get("input_type").is_none()
+                });
+                then.status(200).json_body(json!({
+                    "data": [{ "embedding": [3.0], "index": 0 }],
+                    "usage": { "prompt_tokens": 2, "total_tokens": 2 }
+                }));
+            })
+            .await;
+
+        provider(server.base_url(), AzureAuthMode::Bearer)
+            .embed_batch("tok", "foundry:cohere-embed-v3-english", &["a".to_string()])
+            .await
+            .unwrap();
+        without_type.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_missing_usage_object_reports_zero_rather_than_failing() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/openai/v1/embeddings");
+                then.status(200).json_body(json!({ "data": [{ "embedding": [1.0], "index": 0 }] }));
+            })
+            .await;
+
+        let (vectors, usage) = provider(server.base_url(), AzureAuthMode::Bearer)
+            .embed_batch("tok", "my-deployment", &["a".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(vectors, vec![vec![1.0]]);
+        assert_eq!(usage.prompt_tokens, 0, "absent usage must be zero, not fabricated");
+    }
+
+    #[tokio::test]
+    async fn chunks_at_one_hundred_and_concatenates_in_order() {
+        let server = MockServer::start_async().await;
+        let first = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/openai/v1/embeddings").matches(|req| {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
+                    body["input"].as_array().map(|a| a.len()) == Some(100)
+                });
+                then.status(200).json_body_obj(&json!({
+                    "data": (0..100)
+                        .map(|i| json!({ "embedding": [i as f64], "index": i }))
+                        .collect::<Vec<_>>(),
+                    "usage": { "prompt_tokens": 100, "total_tokens": 100 }
+                }));
+            })
+            .await;
+        let second = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/openai/v1/embeddings").matches(|req| {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
+                    body["input"].as_array().map(|a| a.len()) == Some(20)
+                });
+                then.status(200).json_body_obj(&json!({
+                    "data": (0..20)
+                        .map(|i| json!({ "embedding": [1000.0 + i as f64], "index": i }))
+                        .collect::<Vec<_>>(),
+                    "usage": { "prompt_tokens": 20, "total_tokens": 20 }
+                }));
+            })
+            .await;
+
+        let texts: Vec<String> = (0..120).map(|i| format!("text-{i}")).collect();
+        let (vectors, usage) = provider(server.base_url(), AzureAuthMode::Bearer)
+            .embed_batch("tok", "my-deployment", &texts)
+            .await
+            .unwrap();
+
+        first.assert_async().await;
+        second.assert_async().await;
+        assert_eq!(vectors.len(), 120);
+        assert_eq!(vectors[0], vec![0.0]);
+        assert_eq!(vectors[99], vec![99.0]);
+        assert_eq!(vectors[100], vec![1000.0]);
+        assert_eq!(usage.prompt_tokens, 120, "usage must accumulate across chunks");
+    }
+
+    #[tokio::test]
+    async fn an_http_error_status_surfaces_as_an_error() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/openai/v1/embeddings");
+                then.status(401).json_body(json!({ "error": { "message": "invalid token" } }));
+            })
+            .await;
+
+        let result = provider(server.base_url(), AzureAuthMode::Bearer)
+            .embed_batch("stale", "my-deployment", &["x".to_string()])
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_response_count_mismatch_is_a_hard_error() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/openai/v1/embeddings");
+                then.status(200).json_body(json!({ "data": [{ "embedding": [1.0], "index": 0 }] }));
+            })
+            .await;
+
+        let result = provider(server.base_url(), AzureAuthMode::Bearer)
+            .embed_batch("tok", "my-deployment", &["a".to_string(), "b".to_string()])
+            .await;
+
+        assert!(result.is_err(), "a count mismatch must be a hard error, not a silent misalignment");
+    }
+
+    #[tokio::test]
+    async fn an_out_of_range_index_is_an_error_not_a_panic() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/openai/v1/embeddings");
+                then.status(200).json_body(json!({
+                    "data": [
+                        { "embedding": [1.0], "index": 0 },
+                        { "embedding": [2.0], "index": 7 }
+                    ]
+                }));
+            })
+            .await;
+
+        let result = provider(server.base_url(), AzureAuthMode::Bearer)
+            .embed_batch("tok", "my-deployment", &["a".to_string(), "b".to_string()])
+            .await;
+
+        assert!(result.is_err(), "a bogus index must be reported, never used to index out of bounds");
+    }
+
+    #[test]
+    fn cache_scope_separates_resources_surfaces_and_input_types() {
+        let a = new_provider(
+            "https://res-a.openai.azure.com",
+            Some("https://res-a.services.ai.azure.com".to_string()),
+            "2024-05-01-preview",
+            AzureAuthMode::Bearer,
+        );
+        let b = new_provider(
+            "https://res-b.openai.azure.com",
+            Some("https://res-b.services.ai.azure.com".to_string()),
+            "2024-05-01-preview",
+            AzureAuthMode::Bearer,
+        );
+
+        assert_ne!(
+            a.cache_scope("shared-deployment-name").unwrap(),
+            b.cache_scope("shared-deployment-name").unwrap(),
+            "two Azure resources can name two different models identically"
+        );
+        assert_ne!(
+            a.cache_scope("shared-name").unwrap(),
+            a.cache_scope("foundry:shared-name").unwrap()
+        );
+        assert_ne!(
+            a.cache_scope("foundry:m#document").unwrap(),
+            a.cache_scope("foundry:m#query").unwrap()
+        );
+    }
+
+    #[test]
+    fn cache_scope_rejects_a_malformed_model_rather_than_inventing_a_scope() {
+        let p = new_provider("https://res.openai.azure.com", None, "2024-05-01-preview", AzureAuthMode::Bearer);
+        assert!(p.cache_scope("foundry:cohere-embed-v3-english").is_err());
+        assert!(p.cache_scope("").is_err());
+    }
+}

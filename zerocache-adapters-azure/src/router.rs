@@ -157,3 +157,126 @@ impl CloudRouter for AzureRouter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn router() -> AzureRouter {
+        AzureRouter::new(
+            "https://my-res.openai.azure.com",
+            Some("https://my-res.services.ai.azure.com".to_string()),
+            DEFAULT_AZURE_FOUNDRY_API_VERSION,
+            AzureAuthMode::Bearer,
+        )
+    }
+
+    fn router_without_foundry() -> AzureRouter {
+        AzureRouter::new(
+            "https://my-res.openai.azure.com",
+            None,
+            DEFAULT_AZURE_FOUNDRY_API_VERSION,
+            AzureAuthMode::Bearer,
+        )
+    }
+
+    #[test]
+    fn a_bare_deployment_name_targets_the_openai_v1_surface_with_no_api_version() {
+        let r = router().resolve("text-embedding-3-small").unwrap();
+        assert_eq!(r.model_id, "text-embedding-3-small");
+        assert_eq!(r.endpoint_base, "https://my-res.openai.azure.com/openai/v1/embeddings");
+        assert!(
+            !r.endpoint_base.contains("api-version"),
+            "the GA v1 path takes no api-version; adding one only opts into preview behavior"
+        );
+        assert_eq!(r.canonical, "openai:text-embedding-3-small");
+    }
+
+    #[test]
+    fn a_foundry_prefix_targets_the_foundry_surface_with_its_api_version() {
+        let r = router().resolve("foundry:cohere-embed-v3-english").unwrap();
+        assert_eq!(r.model_id, "cohere-embed-v3-english");
+        assert_eq!(
+            r.endpoint_base,
+            "https://my-res.services.ai.azure.com/models/embeddings?api-version=2024-05-01-preview"
+        );
+        assert_eq!(r.canonical, "foundry:cohere-embed-v3-english@2024-05-01-preview");
+    }
+
+    #[test]
+    fn the_two_surfaces_never_collapse_to_one_cache_entry_even_for_the_same_name() {
+        let openai = router().resolve("shared-name").unwrap();
+        let foundry = router().resolve("foundry:shared-name").unwrap();
+        assert_ne!(openai.canonical, foundry.canonical);
+        assert_ne!(openai.endpoint_base, foundry.endpoint_base);
+    }
+
+    #[test]
+    fn the_foundry_api_version_is_part_of_the_cache_identity() {
+        let old = AzureRouter::new(
+            "https://my-res.openai.azure.com",
+            Some("https://my-res.services.ai.azure.com".to_string()),
+            "2024-05-01-preview",
+            AzureAuthMode::Bearer,
+        );
+        let new = AzureRouter::new(
+            "https://my-res.openai.azure.com",
+            Some("https://my-res.services.ai.azure.com".to_string()),
+            "2025-01-01-preview",
+            AzureAuthMode::Bearer,
+        );
+        assert_ne!(
+            old.resolve("foundry:m").unwrap().canonical,
+            new.resolve("foundry:m").unwrap().canonical,
+            "bumping the api-version can change the vectors, so it must invalidate the cache"
+        );
+    }
+
+    #[test]
+    fn foundry_input_type_changes_the_canonical_form() {
+        let doc = router().resolve("foundry:cohere-embed-v3-english#document").unwrap();
+        let query = router().resolve("foundry:cohere-embed-v3-english#query").unwrap();
+        assert_ne!(doc.canonical, query.canonical);
+        assert_eq!(query.qualifier.as_deref(), Some("query"));
+    }
+
+    #[test]
+    fn an_input_type_on_the_openai_surface_is_rejected_rather_than_ignored() {
+        let err = router().resolve("text-embedding-3-small#document").unwrap_err();
+        assert!(err.0.contains("do not accept an input_type"), "{}", err.0);
+        assert!(err.0.contains(FOUNDRY_MODEL_PREFIX), "the message should name the fix: {}", err.0);
+    }
+
+    #[test]
+    fn a_foundry_model_with_no_foundry_endpoint_configured_names_the_env_var() {
+        let err = router_without_foundry().resolve("foundry:cohere-embed-v3-english").unwrap_err();
+        assert!(err.0.contains("ZEROCACHE_AZURE_FOUNDRY_BASE_URL"), "{}", err.0);
+    }
+
+    #[test]
+    fn a_malformed_model_string_is_rejected() {
+        assert!(router().resolve("").is_err());
+        assert!(router().resolve("foundry:").is_err());
+        assert!(router().resolve("text-embedding-3-small#").is_err());
+    }
+
+    #[test]
+    fn strategy_selection_follows_the_surface_prefix() {
+        let r = router();
+        let openai = r.resolve("text-embedding-3-small").unwrap();
+        let foundry = r.resolve("foundry:cohere-embed-v3-english").unwrap();
+        // Both surfaces batch identically; what differs is which struct
+        // serializes the body, proven on the wire in the strategy tests.
+        assert_eq!(r.strategy_for(&openai).unwrap().max_batch(), 100);
+        assert_eq!(r.strategy_for(&foundry).unwrap().max_batch(), 100);
+    }
+
+    #[test]
+    fn auth_mode_produces_the_right_header_pair() {
+        assert_eq!(
+            AzureAuthMode::Bearer.header("tok"),
+            ("Authorization", "Bearer tok".to_string())
+        );
+        assert_eq!(AzureAuthMode::ApiKey.header("k"), ("api-key", "k".to_string()));
+    }
+}
