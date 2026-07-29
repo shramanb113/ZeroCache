@@ -32,17 +32,6 @@ impl AzureAuthMode {
             AzureAuthMode::ApiKey => ("api-key", credential.to_string()),
         }
     }
-
-    /// Stable identifier folded into the canonical model form. Two auth modes
-    /// against the same resource reach the same weights, so this is NOT part
-    /// of the cache identity -- it exists only so the strategies can report
-    /// what they did in tests.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AzureAuthMode::Bearer => "bearer",
-            AzureAuthMode::ApiKey => "api-key",
-        }
-    }
 }
 
 pub struct AzureRouter {
@@ -278,5 +267,39 @@ mod tests {
             ("Authorization", "Bearer tok".to_string())
         );
         assert_eq!(AzureAuthMode::ApiKey.header("k"), ("api-key", "k".to_string()));
+    }
+
+    #[test]
+    fn hostile_model_strings_never_change_the_resolved_endpoint_base() {
+        // Unlike Bedrock/VertexAI, no caller-controlled substring is ever
+        // interpolated into a URL here -- deployment/input_type only ever
+        // reach the JSON body. This test exists to catch a *future*
+        // regression (e.g. someone folding model_id into endpoint_base "for
+        // logging" or similar), not a present vulnerability: it is green
+        // today precisely because endpoint_base is built purely from
+        // operator config.
+        let r = router();
+        let expected = "https://my-res.openai.azure.com/openai/v1/embeddings";
+        for hostile in [
+            "@169.254.169.254/x",
+            "../../evil",
+            "a?x=1",
+            "https://evil.example/y",
+        ] {
+            assert_eq!(
+                r.resolve(hostile).unwrap().endpoint_base,
+                expected,
+                "hostile model string '{hostile}' must not affect endpoint_base"
+            );
+        }
+
+        let expected_foundry = "https://my-res.services.ai.azure.com/models/embeddings?api-version=2024-05-01-preview";
+        for hostile in ["foundry:@evil.example/x", "foundry:m#a&api-version=hacked"] {
+            assert_eq!(
+                r.resolve(hostile).unwrap().endpoint_base,
+                expected_foundry,
+                "hostile model string '{hostile}' must not affect endpoint_base"
+            );
+        }
     }
 }

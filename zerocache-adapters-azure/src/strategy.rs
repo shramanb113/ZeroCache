@@ -49,6 +49,7 @@ fn parse_openai_shaped(expected: usize, body: &[u8]) -> Result<EmbedOutcome, Pro
     }
 
     let mut ordered = vec![Vec::new(); expected];
+    let mut filled = vec![false; expected];
     for item in parsed.data {
         if item.index >= expected {
             return Err(ProviderError(format!(
@@ -56,6 +57,16 @@ fn parse_openai_shaped(expected: usize, body: &[u8]) -> Result<EmbedOutcome, Pro
                 item.index
             )));
         }
+        if filled[item.index] {
+            // A duplicate index means some other slot in `expected` never got
+            // written -- silently accepting this would return (and cache) an
+            // empty Vec<f32> for that text as if it were a real embedding.
+            return Err(ProviderError(format!(
+                "response embedding index {} appears more than once in a batch of {expected}",
+                item.index
+            )));
+        }
+        filled[item.index] = true;
         ordered[item.index] = item.embedding;
     }
 
@@ -429,6 +440,31 @@ mod tests {
             .await;
 
         assert!(result.is_err(), "a bogus index must be reported, never used to index out of bounds");
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_index_is_an_error_not_a_silently_empty_embedding() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/openai/v1/embeddings");
+                then.status(200).json_body(json!({
+                    "data": [
+                        { "embedding": [1.0], "index": 0 },
+                        { "embedding": [2.0], "index": 0 }
+                    ]
+                }));
+            })
+            .await;
+
+        let result = provider(server.base_url(), AzureAuthMode::Bearer)
+            .embed_batch("tok", "my-deployment", &["a".to_string(), "b".to_string()])
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a duplicate index leaves another slot unfilled -- that must be a hard error, never a silently empty embedding that gets cached as real"
+        );
     }
 
     #[test]
