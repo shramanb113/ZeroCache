@@ -3935,6 +3935,14 @@ version = "0.1.0"
 [[package]]
 name = "zerocache-adapters-bedrock"
 version = "0.1.0"
+dependencies = [
+ "httpmock",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zerocache-adapters-cloud",
+ "zerocache-ports",
+]
 
 [[package]]
 name = "zerocache-adapters-cloud"
