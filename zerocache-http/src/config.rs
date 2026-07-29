@@ -1,5 +1,9 @@
 use std::time::Duration;
 
+use zerocache_adapters_azure::{AzureAuthMode, DEFAULT_AZURE_FOUNDRY_API_VERSION};
+use zerocache_adapters_bedrock::{DEFAULT_BEDROCK_ENDPOINT_TEMPLATE, DEFAULT_BEDROCK_REGION};
+use zerocache_adapters_vertexai::{DEFAULT_VERTEX_ENDPOINT_TEMPLATE, DEFAULT_VERTEX_LOCATION};
+
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
 pub const DEFAULT_MISTRAL_BASE_URL: &str = "https://api.mistral.ai";
 pub const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
@@ -24,6 +28,20 @@ pub struct Config {
     pub mistral_base_url: String,
     pub gemini_base_url: String,
     pub huggingface_base_url: String,
+    /// Setting this is what registers the `azure` provider at all -- an Azure
+    /// resource name *is* its hostname, so unlike every other provider there
+    /// is no meaningful default to fall back to.
+    pub azure_openai_base_url: Option<String>,
+    pub azure_foundry_base_url: Option<String>,
+    pub azure_foundry_api_version: String,
+    pub azure_auth_mode: AzureAuthMode,
+    pub bedrock_region: String,
+    pub bedrock_endpoint_template: String,
+    /// `None` means every `vertexai` request's `model` must carry
+    /// `<location>/<project>/` itself.
+    pub vertex_project: Option<String>,
+    pub vertex_location: String,
+    pub vertex_endpoint_template: String,
 }
 
 /// Resolves an optional env-var override to a base URL, falling back to
@@ -38,6 +56,34 @@ fn base_url_or_default(raw: Option<&str>, default: &str) -> String {
     match raw {
         Some(v) if !v.is_empty() => v.to_string(),
         _ => default.to_string(),
+    }
+}
+
+/// Reads an env var that has no default. Empty is treated as unset, matching
+/// base_url_or_default and parse_ttl_seconds, rather than producing an empty
+/// string that would fail confusingly further down.
+fn optional_env(raw: Option<&str>) -> Option<String> {
+    match raw {
+        Some(v) if !v.is_empty() => Some(v.to_string()),
+        _ => None,
+    }
+}
+
+/// Parses ZEROCACHE_AZURE_AUTH_MODE. Unset defaults to `bearer` silently
+/// (that is the documented, recommended mode); an *unrecognized* value warns
+/// before falling back, because an operator who typed `apikey` instead of
+/// `api-key` would otherwise silently get a mode they did not ask for and see
+/// only a 401 from Azure. Same posture as parse_ttl_seconds.
+fn parse_azure_auth_mode(raw: Option<&str>) -> AzureAuthMode {
+    match raw {
+        None | Some("") | Some("bearer") => AzureAuthMode::Bearer,
+        Some("api-key") => AzureAuthMode::ApiKey,
+        Some(other) => {
+            eprintln!(
+                "warning: ZEROCACHE_AZURE_AUTH_MODE='{other}' is not recognized (expected 'bearer' or 'api-key') -- falling back to 'bearer'"
+            );
+            AzureAuthMode::Bearer
+        }
     }
 }
 
@@ -71,6 +117,36 @@ impl Config {
             huggingface_base_url: base_url_or_default(
                 std::env::var("ZEROCACHE_HUGGINGFACE_BASE_URL").ok().as_deref(),
                 DEFAULT_HUGGINGFACE_BASE_URL,
+            ),
+            azure_openai_base_url: optional_env(
+                std::env::var("ZEROCACHE_AZURE_OPENAI_BASE_URL").ok().as_deref(),
+            ),
+            azure_foundry_base_url: optional_env(
+                std::env::var("ZEROCACHE_AZURE_FOUNDRY_BASE_URL").ok().as_deref(),
+            ),
+            azure_foundry_api_version: base_url_or_default(
+                std::env::var("ZEROCACHE_AZURE_FOUNDRY_API_VERSION").ok().as_deref(),
+                DEFAULT_AZURE_FOUNDRY_API_VERSION,
+            ),
+            azure_auth_mode: parse_azure_auth_mode(
+                std::env::var("ZEROCACHE_AZURE_AUTH_MODE").ok().as_deref(),
+            ),
+            bedrock_region: base_url_or_default(
+                std::env::var("ZEROCACHE_BEDROCK_REGION").ok().as_deref(),
+                DEFAULT_BEDROCK_REGION,
+            ),
+            bedrock_endpoint_template: base_url_or_default(
+                std::env::var("ZEROCACHE_BEDROCK_ENDPOINT_TEMPLATE").ok().as_deref(),
+                DEFAULT_BEDROCK_ENDPOINT_TEMPLATE,
+            ),
+            vertex_project: optional_env(std::env::var("ZEROCACHE_VERTEX_PROJECT").ok().as_deref()),
+            vertex_location: base_url_or_default(
+                std::env::var("ZEROCACHE_VERTEX_LOCATION").ok().as_deref(),
+                DEFAULT_VERTEX_LOCATION,
+            ),
+            vertex_endpoint_template: base_url_or_default(
+                std::env::var("ZEROCACHE_VERTEX_ENDPOINT_TEMPLATE").ok().as_deref(),
+                DEFAULT_VERTEX_ENDPOINT_TEMPLATE,
             ),
         }
     }
@@ -199,5 +275,43 @@ mod tests {
     #[test]
     fn empty_base_url_override_is_treated_as_unset() {
         assert_eq!(base_url_or_default(Some(""), DEFAULT_OPENAI_BASE_URL), DEFAULT_OPENAI_BASE_URL);
+    }
+
+    #[test]
+    fn optional_env_treats_unset_and_empty_the_same() {
+        assert_eq!(optional_env(None), None);
+        assert_eq!(optional_env(Some("")), None);
+        assert_eq!(optional_env(Some("value")), Some("value".to_string()));
+    }
+
+    #[test]
+    fn azure_auth_mode_defaults_to_bearer() {
+        assert_eq!(parse_azure_auth_mode(None), AzureAuthMode::Bearer);
+        assert_eq!(parse_azure_auth_mode(Some("")), AzureAuthMode::Bearer);
+        assert_eq!(parse_azure_auth_mode(Some("bearer")), AzureAuthMode::Bearer);
+    }
+
+    #[test]
+    fn azure_auth_mode_api_key_is_recognized() {
+        assert_eq!(parse_azure_auth_mode(Some("api-key")), AzureAuthMode::ApiKey);
+    }
+
+    #[test]
+    fn azure_auth_mode_falls_back_to_bearer_on_an_unrecognized_value() {
+        // A typo must not silently select a mode the operator did not ask for
+        // and leave them staring at a 401 from Azure.
+        assert_eq!(parse_azure_auth_mode(Some("apikey")), AzureAuthMode::Bearer);
+    }
+
+    #[test]
+    fn bedrock_region_defaults_and_can_be_overridden() {
+        assert_eq!(base_url_or_default(None, DEFAULT_BEDROCK_REGION), DEFAULT_BEDROCK_REGION);
+        assert_eq!(base_url_or_default(Some("eu-west-1"), DEFAULT_BEDROCK_REGION), "eu-west-1");
+    }
+
+    #[test]
+    fn vertex_location_defaults_and_can_be_overridden() {
+        assert_eq!(base_url_or_default(None, DEFAULT_VERTEX_LOCATION), DEFAULT_VERTEX_LOCATION);
+        assert_eq!(base_url_or_default(Some("europe-west4"), DEFAULT_VERTEX_LOCATION), "europe-west4");
     }
 }

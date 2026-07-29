@@ -12,6 +12,10 @@ zerocache-adapters-openai = { path = "../zerocache-adapters-openai" }
 zerocache-adapters-mistral = { path = "../zerocache-adapters-mistral" }
 zerocache-adapters-gemini = { path = "../zerocache-adapters-gemini" }
 zerocache-adapters-huggingface = { path = "../zerocache-adapters-huggingface" }
+zerocache-adapters-cloud = { path = "../zerocache-adapters-cloud" }
+zerocache-adapters-azure = { path = "../zerocache-adapters-azure" }
+zerocache-adapters-bedrock = { path = "../zerocache-adapters-bedrock" }
+zerocache-adapters-vertexai = { path = "../zerocache-adapters-vertexai" }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 serde = { version = "1", features = ["derive"] }
