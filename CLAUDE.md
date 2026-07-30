@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-The Cargo workspace is scaffolded and builds/tests clean (13 crates — the original 9 plus a shared `zerocache-adapters-cloud` kit and three cloud-provider adapter crates, `-azure`/`-bedrock`/`-vertexai`, added 2026-07-28; see the Workspace structure table below for each one's current implementation status). Treat `PRD.md` as the spec of intent, but **do not assume the port trait signatures or scope in PRD §6.2/§4 are verbatim in the code** — see "Deviations from the PRD" below; check `zerocache-ports/src/lib.rs` directly when in doubt. No CI workflow or Dockerfile exist yet (deliberately deferred — see Phasing).
+The Cargo workspace is scaffolded and builds/tests clean (13 crates — the original 9 plus a shared `zerocache-adapters-cloud` kit and three cloud-provider adapter crates, `-azure`/`-bedrock`/`-vertexai`, added 2026-07-28 and fully wired into `zerocache-http` as of 2026-07-30; see the Workspace structure table below for what each crate does). Treat `PRD.md` as the spec of intent, but **do not assume the port trait signatures or scope in PRD §6.2/§4 are verbatim in the code** — see "Deviations from the PRD" below; check `zerocache-ports/src/lib.rs` directly when in doubt. No CI workflow or Dockerfile exist yet (deliberately deferred — see Phasing).
 
 ### Commands
 
