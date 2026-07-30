@@ -13,9 +13,54 @@ pub const DEFAULT_VERTEX_ENDPOINT_TEMPLATE: &str = "https://{location}-aiplatfor
 /// Google documents 250 instances per request for the text-embedding models.
 const STANDARD_MAX_BATCH: usize = 250;
 
-/// gemini-embedding-001 accepts exactly one input text per request -- it is
-/// also excluded from the batch-prediction API entirely. Verified 2026-07-28.
-const GEMINI_MAX_BATCH: usize = 1;
+/// gemini-embedding-001 previously accepted only one input per request, but
+/// Google's current docs (re-verified 2026-07-29/30) now apply the same
+/// 250-instance limit to all three Google embedding models, with no
+/// per-model carve-out, and gemini-embedding-001 is now explicitly listed as
+/// supported by the batch-prediction API too. The original "exactly one
+/// input, excluded from batch prediction" claim, dated 2026-07-28, is no
+/// longer true and was corrected the next day.
+const GEMINI_MAX_BATCH: usize = 250;
+
+// NOTE: Google also documents a 20,000-aggregate-input-token cap per
+// request (independent of the 250-instance count cap above), and truncates
+// any individual input over 2,048 tokens. Neither is enforced here -- doing
+// so would need a tokenizer or token-count estimator this codebase does not
+// currently have. A large real-world batch of long documents can hit this
+// even while under the 250-instance limit; this is a known, undocumented
+// (until now) gap, not a design decision.
+
+/// Derives the request host from `endpoint_template` and `location`.
+///
+/// Vertex's real hostnames do not follow one uniform pattern: a normal
+/// region like `us-central1` produces `https://us-central1-aiplatform.googleapis.com`
+/// (which is what naive `{location}` substitution already gets right), but
+/// `global` produces `https://aiplatform.googleapis.com` (no location prefix
+/// at all) and the multi-region pseudo-locations `us`/`eu` produce
+/// `https://aiplatform.{location}.rep.googleapis.com` (`aiplatform.` first,
+/// `.rep.` suffix) -- a structurally different shape naive substitution gets
+/// wrong. Confirmed live via unauthenticated probes on 2026-07-29/30:
+/// `global-aiplatform.googleapis.com` 404s (nonexistent host), while
+/// `aiplatform.googleapis.com` and `us-central1-aiplatform.googleapis.com`
+/// both correctly 401 (valid hosts, auth-gated).
+///
+/// The special-casing below applies ONLY when `endpoint_template` is exactly
+/// this crate's own `DEFAULT_VERTEX_ENDPOINT_TEMPLATE` -- an operator who has
+/// overridden it (e.g. for a Private Service Connect endpoint) is trusted to
+/// have gotten their own template right, and naive substitution (or a
+/// verbatim template with no placeholder at all) is preserved unchanged for
+/// that case, exactly as before this fix.
+fn resolve_host(endpoint_template: &str, location: &str) -> String {
+    if endpoint_template == DEFAULT_VERTEX_ENDPOINT_TEMPLATE {
+        match location {
+            "global" => "https://aiplatform.googleapis.com".to_string(),
+            "us" | "eu" => format!("https://aiplatform.{location}.rep.googleapis.com"),
+            _ => endpoint_template.replace("{location}", location),
+        }
+    } else {
+        endpoint_template.replace("{location}", location)
+    }
+}
 
 pub struct VertexRouter {
     /// `None` means the caller's `model` string must carry `location/project/`
@@ -136,7 +181,7 @@ impl CloudRouter for VertexRouter {
     fn resolve(&self, model: &str) -> Result<ResolvedModel, ProviderError> {
         let parts = split_model(model, self.default_project.as_deref(), &self.default_location)?;
 
-        let host = self.endpoint_template.replace("{location}", &parts.location);
+        let host = resolve_host(&self.endpoint_template, &parts.location);
         // The full resource path is folded into endpoint_base rather than
         // rebuilt in the strategy: project and location are part of *which
         // upstream*, so putting them here is what gets them into cache_scope.
@@ -165,7 +210,15 @@ impl CloudRouter for VertexRouter {
         // Same wire shape either way -- only Google's per-model input limit
         // differs, so these are two instances of one strategy type, not two
         // strategy types.
-        if resolved.model_id.starts_with("gemini-embedding") {
+        //
+        // Exact match, not a prefix match: a hypothetical future
+        // gemini-embedding-2 has documented behavior fundamentally different
+        // from gemini-embedding-001 (it aggregates multiple inputs into one
+        // output vector, rather than one embedding per input) and this crate
+        // does not support that shape -- a prefix match would silently route
+        // an unsupported model through this strategy instead of surfacing
+        // that it isn't handled.
+        if resolved.model_id == "gemini-embedding-001" {
             Ok(&self.gemini)
         } else {
             Ok(&self.standard)
@@ -257,13 +310,13 @@ mod tests {
     }
 
     #[test]
-    fn gemini_embedding_selects_the_single_instance_strategy() {
+    fn gemini_embedding_selects_the_gemini_strategy_with_the_current_shared_batch_limit() {
         let r = router_with_project();
         let gemini = r.resolve("gemini-embedding-001").unwrap();
         assert_eq!(
             r.strategy_for(&gemini).unwrap().max_batch(),
-            1,
-            "gemini-embedding-001 accepts exactly one input per request"
+            250,
+            "gemini-embedding-001's old 1-input limit is stale -- current docs apply the shared 250-instance limit"
         );
 
         let standard = r.resolve("text-embedding-005").unwrap();
@@ -309,6 +362,79 @@ mod tests {
         assert_eq!(
             r.resolve("text-embedding-005").unwrap().endpoint_base,
             "http://127.0.0.1:9999/v1/projects/p/locations/us-central1/publishers/google/models"
+        );
+    }
+
+    #[test]
+    fn global_location_uses_the_real_non_prefixed_host() {
+        let r = router_with_project().resolve("global/my-project/text-embedding-005").unwrap();
+        assert!(
+            r.endpoint_base.starts_with("https://aiplatform.googleapis.com/"),
+            "expected the real Vertex global host with no location prefix, got: {}",
+            r.endpoint_base
+        );
+    }
+
+    #[test]
+    fn us_multi_region_location_uses_the_dot_rep_host_shape() {
+        let r = router_with_project().resolve("us/my-project/text-embedding-005").unwrap();
+        assert!(
+            r.endpoint_base.starts_with("https://aiplatform.us.rep.googleapis.com/"),
+            "expected the real Vertex multi-region host shape, got: {}",
+            r.endpoint_base
+        );
+    }
+
+    #[test]
+    fn eu_multi_region_location_uses_the_dot_rep_host_shape() {
+        let r = router_with_project().resolve("eu/my-project/text-embedding-005").unwrap();
+        assert!(
+            r.endpoint_base.starts_with("https://aiplatform.eu.rep.googleapis.com/"),
+            "expected the real Vertex multi-region host shape, got: {}",
+            r.endpoint_base
+        );
+    }
+
+    #[test]
+    fn a_regular_region_still_uses_the_dash_prefixed_host_shape() {
+        // Regression guard: the special-casing for global/us/eu must not
+        // break the common case, which every pre-existing test already
+        // exercises via DEFAULT_VERTEX_LOCATION -- this test pins the exact
+        // string shape so a future refactor can't silently break it while
+        // those other tests happen to still pass for unrelated reasons.
+        let r = router_with_project().resolve("europe-west4/my-project/text-embedding-005").unwrap();
+        assert!(
+            r.endpoint_base.starts_with("https://europe-west4-aiplatform.googleapis.com/"),
+            "expected the normal dash-prefixed regional host shape, got: {}",
+            r.endpoint_base
+        );
+    }
+
+    #[test]
+    fn a_custom_operator_endpoint_template_is_still_honored_for_special_locations() {
+        // An operator who has overridden the endpoint template (e.g. for a
+        // Private Service Connect endpoint) must not have their template
+        // silently second-guessed for global/us/eu -- the special-casing
+        // below only applies to the crate's own DEFAULT_VERTEX_ENDPOINT_TEMPLATE.
+        let r = VertexRouter::new(Some("p".to_string()), "us-central1", "http://127.0.0.1:9999");
+        assert_eq!(
+            r.resolve("global/p/text-embedding-005").unwrap().endpoint_base,
+            "http://127.0.0.1:9999/v1/projects/p/locations/global/publishers/google/models",
+            "a fully custom template with no {{location}} placeholder must stay verbatim regardless of location value"
+        );
+    }
+
+    #[test]
+    fn a_hypothetical_future_gemini_model_does_not_get_the_gemini_001_strategy() {
+        // gemini-embedding-2 (documented separately by Google, with
+        // fundamentally different aggregation behavior) must not silently
+        // inherit gemini-embedding-001's strategy via prefix matching.
+        let r = router_with_project();
+        let resolved = r.resolve("gemini-embedding-2").unwrap();
+        assert_eq!(
+            r.strategy_for(&resolved).unwrap().max_batch(),
+            250,
+            "an unrecognized gemini-embedding-* model falls through to the standard strategy, not the exact-matched gemini one"
         );
     }
 }

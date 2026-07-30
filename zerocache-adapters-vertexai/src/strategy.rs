@@ -47,9 +47,11 @@ struct Statistics {
     token_count: u32,
 }
 
-/// The Vertex `:predict` wire shape. One type, instantiated at two batch
-/// sizes: Google allows 250 instances per request for the text-embedding
-/// models and exactly 1 for gemini-embedding-001.
+/// The Vertex `:predict` wire shape. One type, instantiated per model
+/// family in `router.rs` (`STANDARD_MAX_BATCH`/`GEMINI_MAX_BATCH`) -- as of
+/// 2026-07-29/30 both share Google's documented 250-instance-per-request
+/// limit; there is no per-model carve-out any more (see `router.rs` for the
+/// history of that constant).
 pub struct VertexPredictStrategy {
     max_batch: usize,
 }
@@ -238,7 +240,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gemini_embedding_issues_one_call_per_text() {
+    async fn gemini_embedding_batches_multiple_texts_in_one_call() {
+        // Superseded 2026-07-29/30: gemini-embedding-001 previously accepted
+        // only one instance per request (see router.rs's GEMINI_MAX_BATCH
+        // history), but current docs apply the same shared 250-instance
+        // limit as the other Google embedding models, so a small batch like
+        // this one now goes out as a single call, not one call per text.
         let server = MockServer::start_async().await;
         let mock = server
             .mock_async(|when, then| {
@@ -247,10 +254,14 @@ mod tests {
                     .matches(|req| {
                         let body: serde_json::Value =
                             serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
-                        body["instances"].as_array().map(|a| a.len()) == Some(1)
+                        body["instances"].as_array().map(|a| a.len()) == Some(3)
                     });
                 then.status(200).json_body(json!({
-                    "predictions": [{ "embeddings": { "values": [9.0], "statistics": { "token_count": 1 } } }]
+                    "predictions": [
+                        { "embeddings": { "values": [9.0], "statistics": { "token_count": 1 } } },
+                        { "embeddings": { "values": [9.1], "statistics": { "token_count": 1 } } },
+                        { "embeddings": { "values": [9.2], "statistics": { "token_count": 1 } } }
+                    ]
                 }));
             })
             .await;
@@ -261,7 +272,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(mock.hits_async().await, 3, "gemini-embedding-001 accepts one instance per request");
+        assert_eq!(mock.hits_async().await, 1, "gemini-embedding-001 now shares the 250-instance batch limit, so 3 texts fit in one call");
         assert_eq!(vectors.len(), 3);
         assert_eq!(usage.prompt_tokens, 3);
     }

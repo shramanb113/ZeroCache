@@ -20,6 +20,21 @@
 //! embeddings). That verification covers only the documentation, not this
 //! code: the adapter itself is mock-only, it has not yet had a live-key
 //! smoke test against a real GCP endpoint.
+//!
+//! Re-verified 2026-07-29/30 during a dedicated live-docs cross-check (no
+//! API keys are available for this project, so this kind of periodic
+//! doc-vs-code verification substitutes for a live smoke test). Google's
+//! docs site has since been rebranded from `vertex-ai/generative-ai/docs/...`
+//! to `gemini-enterprise-agent-platform/...` -- the underlying API is
+//! unchanged, only the docs URLs moved. Current citations:
+//! `docs.cloud.google.com/gemini-enterprise-agent-platform/models/embeddings/get-text-embeddings`,
+//! `.../reference/models/text-embeddings-api`, `.../resources/locations`,
+//! `.../models/model-versions`. This pass found and fixed two real defects:
+//! the `global`/`us`/`eu` location values previously produced a wrong,
+//! nonexistent endpoint host (empirically confirmed via unauthenticated
+//! probes), and `gemini-embedding-001`'s batch limit was stale at 1 when
+//! current docs apply the shared 250-instance limit. See `router.rs`'s
+//! `resolve_host` and `GEMINI_MAX_BATCH` for details.
 
 mod router;
 mod strategy;

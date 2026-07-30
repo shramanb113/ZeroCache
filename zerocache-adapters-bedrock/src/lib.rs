@@ -14,6 +14,18 @@
 //! `.../userguide/model-parameters-embed-v4.html`. That verification covers
 //! only the documentation, not this code: the adapter itself is mock-only,
 //! it has not yet had a live-key smoke test against a real AWS endpoint.
+//!
+//! Operational note (added after a live-docs cross-check, 2026-07-29/30):
+//! Bedrock's short-term API keys are region-scoped (a key minted for one
+//! region is not valid in another -- switching regions in the AWS console
+//! mints a different key) and expire in up to 12 hours. Since `owner_id` is
+//! derived from the caller's forwarded credential, a Bedrock caller's cache
+//! namespace rotates whenever their key rotates, the same open risk
+//! `zerocache-adapters-vertexai` already documents for its own OAuth2
+//! access-token credential (see that crate's own module doc comment). A
+//! caller whose `ZEROCACHE_BEDROCK_REGION` (or per-request region prefix)
+//! doesn't match the region their key was minted for will see an auth
+//! failure that looks like a Zerocache bug but originates entirely from AWS.
 
 mod router;
 mod strategy;
