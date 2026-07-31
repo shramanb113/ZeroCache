@@ -4086,7 +4086,6 @@ dependencies = [
  "tracing-subscriber",
  "zerocache-adapters-azure",
  "zerocache-adapters-bedrock",
- "zerocache-adapters-cloud",
  "zerocache-adapters-gemini",
  "zerocache-adapters-huggingface",
  "zerocache-adapters-mistral",

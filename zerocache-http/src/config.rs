@@ -44,15 +44,18 @@ pub struct Config {
     pub vertex_endpoint_template: String,
 }
 
-/// Resolves an optional env-var override to a base URL, falling back to
-/// `default` when the var is unset or empty. Pulled out as a pure function
+/// Resolves an optional env-var override to a string value, falling back to
+/// `default` when the var is unset or empty. Used for base URLs (the
+/// original motivating case) as well as non-URL values that share the same
+/// unset-or-empty-falls-back-to-default shape: `azure_foundry_api_version`,
+/// `bedrock_region`, `vertex_location`. Pulled out as a pure function
 /// (rather than inlined per call site) so it's unit-testable without
 /// mutating real process env vars -- same reasoning as parse_ttl_seconds
 /// below. An empty string is treated the same as unset, matching
 /// parse_ttl_seconds's treatment of an empty ZEROCACHE_TTL_SECONDS, rather
-/// than producing an empty base URL that would fail confusingly deep
-/// inside reqwest.
-fn base_url_or_default(raw: Option<&str>, default: &str) -> String {
+/// than producing an empty value that would fail confusingly deep inside
+/// reqwest (for the URL call sites) or the adapter it's passed to.
+fn env_or_default(raw: Option<&str>, default: &str) -> String {
     match raw {
         Some(v) if !v.is_empty() => v.to_string(),
         _ => default.to_string(),
@@ -60,7 +63,7 @@ fn base_url_or_default(raw: Option<&str>, default: &str) -> String {
 }
 
 /// Reads an env var that has no default. Empty is treated as unset, matching
-/// base_url_or_default and parse_ttl_seconds, rather than producing an empty
+/// env_or_default and parse_ttl_seconds, rather than producing an empty
 /// string that would fail confusingly further down.
 fn optional_env(raw: Option<&str>) -> Option<String> {
     match raw {
@@ -102,19 +105,19 @@ impl Config {
             redis_url: std::env::var("ZEROCACHE_REDIS_URL")
                 .unwrap_or_else(|_| "redis://127.0.0.1:6379".into()),
             ttl: parse_ttl_seconds(std::env::var("ZEROCACHE_TTL_SECONDS").ok().as_deref()),
-            openai_base_url: base_url_or_default(
+            openai_base_url: env_or_default(
                 std::env::var("ZEROCACHE_OPENAI_BASE_URL").ok().as_deref(),
                 DEFAULT_OPENAI_BASE_URL,
             ),
-            mistral_base_url: base_url_or_default(
+            mistral_base_url: env_or_default(
                 std::env::var("ZEROCACHE_MISTRAL_BASE_URL").ok().as_deref(),
                 DEFAULT_MISTRAL_BASE_URL,
             ),
-            gemini_base_url: base_url_or_default(
+            gemini_base_url: env_or_default(
                 std::env::var("ZEROCACHE_GEMINI_BASE_URL").ok().as_deref(),
                 DEFAULT_GEMINI_BASE_URL,
             ),
-            huggingface_base_url: base_url_or_default(
+            huggingface_base_url: env_or_default(
                 std::env::var("ZEROCACHE_HUGGINGFACE_BASE_URL").ok().as_deref(),
                 DEFAULT_HUGGINGFACE_BASE_URL,
             ),
@@ -124,27 +127,27 @@ impl Config {
             azure_foundry_base_url: optional_env(
                 std::env::var("ZEROCACHE_AZURE_FOUNDRY_BASE_URL").ok().as_deref(),
             ),
-            azure_foundry_api_version: base_url_or_default(
+            azure_foundry_api_version: env_or_default(
                 std::env::var("ZEROCACHE_AZURE_FOUNDRY_API_VERSION").ok().as_deref(),
                 DEFAULT_AZURE_FOUNDRY_API_VERSION,
             ),
             azure_auth_mode: parse_azure_auth_mode(
                 std::env::var("ZEROCACHE_AZURE_AUTH_MODE").ok().as_deref(),
             ),
-            bedrock_region: base_url_or_default(
+            bedrock_region: env_or_default(
                 std::env::var("ZEROCACHE_BEDROCK_REGION").ok().as_deref(),
                 DEFAULT_BEDROCK_REGION,
             ),
-            bedrock_endpoint_template: base_url_or_default(
+            bedrock_endpoint_template: env_or_default(
                 std::env::var("ZEROCACHE_BEDROCK_ENDPOINT_TEMPLATE").ok().as_deref(),
                 DEFAULT_BEDROCK_ENDPOINT_TEMPLATE,
             ),
             vertex_project: optional_env(std::env::var("ZEROCACHE_VERTEX_PROJECT").ok().as_deref()),
-            vertex_location: base_url_or_default(
+            vertex_location: env_or_default(
                 std::env::var("ZEROCACHE_VERTEX_LOCATION").ok().as_deref(),
                 DEFAULT_VERTEX_LOCATION,
             ),
-            vertex_endpoint_template: base_url_or_default(
+            vertex_endpoint_template: env_or_default(
                 std::env::var("ZEROCACHE_VERTEX_ENDPOINT_TEMPLATE").ok().as_deref(),
                 DEFAULT_VERTEX_ENDPOINT_TEMPLATE,
             ),
@@ -216,26 +219,26 @@ mod tests {
 
     #[test]
     fn openai_base_url_defaults_to_real_endpoint_when_unset() {
-        assert_eq!(base_url_or_default(None, DEFAULT_OPENAI_BASE_URL), DEFAULT_OPENAI_BASE_URL);
+        assert_eq!(env_or_default(None, DEFAULT_OPENAI_BASE_URL), DEFAULT_OPENAI_BASE_URL);
     }
 
     #[test]
     fn openai_base_url_can_be_overridden() {
         assert_eq!(
-            base_url_or_default(Some("http://localhost:11434"), DEFAULT_OPENAI_BASE_URL),
+            env_or_default(Some("http://localhost:11434"), DEFAULT_OPENAI_BASE_URL),
             "http://localhost:11434"
         );
     }
 
     #[test]
     fn mistral_base_url_defaults_to_real_endpoint_when_unset() {
-        assert_eq!(base_url_or_default(None, DEFAULT_MISTRAL_BASE_URL), DEFAULT_MISTRAL_BASE_URL);
+        assert_eq!(env_or_default(None, DEFAULT_MISTRAL_BASE_URL), DEFAULT_MISTRAL_BASE_URL);
     }
 
     #[test]
     fn mistral_base_url_can_be_overridden() {
         assert_eq!(
-            base_url_or_default(Some("http://localhost:11435"), DEFAULT_MISTRAL_BASE_URL),
+            env_or_default(Some("http://localhost:11435"), DEFAULT_MISTRAL_BASE_URL),
             "http://localhost:11435"
         );
     }
@@ -243,7 +246,7 @@ mod tests {
     #[test]
     fn gemini_base_url_defaults_to_real_endpoint_when_unset() {
         assert_eq!(
-            base_url_or_default(None, DEFAULT_GEMINI_BASE_URL),
+            env_or_default(None, DEFAULT_GEMINI_BASE_URL),
             DEFAULT_GEMINI_BASE_URL
         );
     }
@@ -251,7 +254,7 @@ mod tests {
     #[test]
     fn gemini_base_url_can_be_overridden() {
         assert_eq!(
-            base_url_or_default(Some("http://localhost:11436"), DEFAULT_GEMINI_BASE_URL),
+            env_or_default(Some("http://localhost:11436"), DEFAULT_GEMINI_BASE_URL),
             "http://localhost:11436"
         );
     }
@@ -259,7 +262,7 @@ mod tests {
     #[test]
     fn huggingface_base_url_defaults_to_real_endpoint_when_unset() {
         assert_eq!(
-            base_url_or_default(None, DEFAULT_HUGGINGFACE_BASE_URL),
+            env_or_default(None, DEFAULT_HUGGINGFACE_BASE_URL),
             DEFAULT_HUGGINGFACE_BASE_URL
         );
     }
@@ -267,14 +270,14 @@ mod tests {
     #[test]
     fn huggingface_base_url_can_be_overridden() {
         assert_eq!(
-            base_url_or_default(Some("http://localhost:11437"), DEFAULT_HUGGINGFACE_BASE_URL),
+            env_or_default(Some("http://localhost:11437"), DEFAULT_HUGGINGFACE_BASE_URL),
             "http://localhost:11437"
         );
     }
 
     #[test]
     fn empty_base_url_override_is_treated_as_unset() {
-        assert_eq!(base_url_or_default(Some(""), DEFAULT_OPENAI_BASE_URL), DEFAULT_OPENAI_BASE_URL);
+        assert_eq!(env_or_default(Some(""), DEFAULT_OPENAI_BASE_URL), DEFAULT_OPENAI_BASE_URL);
     }
 
     #[test]
@@ -305,13 +308,13 @@ mod tests {
 
     #[test]
     fn bedrock_region_defaults_and_can_be_overridden() {
-        assert_eq!(base_url_or_default(None, DEFAULT_BEDROCK_REGION), DEFAULT_BEDROCK_REGION);
-        assert_eq!(base_url_or_default(Some("eu-west-1"), DEFAULT_BEDROCK_REGION), "eu-west-1");
+        assert_eq!(env_or_default(None, DEFAULT_BEDROCK_REGION), DEFAULT_BEDROCK_REGION);
+        assert_eq!(env_or_default(Some("eu-west-1"), DEFAULT_BEDROCK_REGION), "eu-west-1");
     }
 
     #[test]
     fn vertex_location_defaults_and_can_be_overridden() {
-        assert_eq!(base_url_or_default(None, DEFAULT_VERTEX_LOCATION), DEFAULT_VERTEX_LOCATION);
-        assert_eq!(base_url_or_default(Some("europe-west4"), DEFAULT_VERTEX_LOCATION), "europe-west4");
+        assert_eq!(env_or_default(None, DEFAULT_VERTEX_LOCATION), DEFAULT_VERTEX_LOCATION);
+        assert_eq!(env_or_default(Some("europe-west4"), DEFAULT_VERTEX_LOCATION), "europe-west4");
     }
 }

@@ -35,7 +35,9 @@ impl AzureAuthMode {
 }
 
 pub struct AzureRouter {
-    openai_base_url: String,
+    /// `None` means no Azure OpenAI endpoint was configured, so a non-Foundry
+    /// model string is a resolution error naming the env var that fixes it.
+    openai_base_url: Option<String>,
     /// `None` means no Foundry endpoint was configured, so a `foundry:` model
     /// string is a resolution error naming the env var that fixes it.
     foundry_base_url: Option<String>,
@@ -46,13 +48,13 @@ pub struct AzureRouter {
 
 impl AzureRouter {
     pub fn new(
-        openai_base_url: impl Into<String>,
+        openai_base_url: Option<String>,
         foundry_base_url: Option<String>,
         foundry_api_version: impl Into<String>,
         auth_mode: AzureAuthMode,
     ) -> Self {
         Self {
-            openai_base_url: openai_base_url.into(),
+            openai_base_url,
             foundry_base_url,
             foundry_api_version: foundry_api_version.into(),
             openai: AzureOpenAiV1Strategy::new(auth_mode),
@@ -130,10 +132,16 @@ impl CloudRouter for AzureRouter {
             )));
         }
 
+        let base = self.openai_base_url.as_ref().ok_or_else(|| {
+            ProviderError(format!(
+                "azure model '{model}' targets the Azure OpenAI surface but ZEROCACHE_AZURE_OPENAI_BASE_URL is unset"
+            ))
+        })?;
+
         Ok(ResolvedModel {
             canonical: format!("openai:{}", parts.deployment),
             model_id: parts.deployment,
-            endpoint_base: format!("{}/openai/v1/embeddings", self.openai_base_url),
+            endpoint_base: format!("{base}/openai/v1/embeddings"),
             qualifier: None,
         })
     }
@@ -153,7 +161,7 @@ mod tests {
 
     fn router() -> AzureRouter {
         AzureRouter::new(
-            "https://my-res.openai.azure.com",
+            Some("https://my-res.openai.azure.com".to_string()),
             Some("https://my-res.services.ai.azure.com".to_string()),
             DEFAULT_AZURE_FOUNDRY_API_VERSION,
             AzureAuthMode::Bearer,
@@ -162,8 +170,17 @@ mod tests {
 
     fn router_without_foundry() -> AzureRouter {
         AzureRouter::new(
-            "https://my-res.openai.azure.com",
+            Some("https://my-res.openai.azure.com".to_string()),
             None,
+            DEFAULT_AZURE_FOUNDRY_API_VERSION,
+            AzureAuthMode::Bearer,
+        )
+    }
+
+    fn router_foundry_only() -> AzureRouter {
+        AzureRouter::new(
+            None,
+            Some("https://my-res.services.ai.azure.com".to_string()),
             DEFAULT_AZURE_FOUNDRY_API_VERSION,
             AzureAuthMode::Bearer,
         )
@@ -203,13 +220,13 @@ mod tests {
     #[test]
     fn the_foundry_api_version_is_part_of_the_cache_identity() {
         let old = AzureRouter::new(
-            "https://my-res.openai.azure.com",
+            Some("https://my-res.openai.azure.com".to_string()),
             Some("https://my-res.services.ai.azure.com".to_string()),
             "2024-05-01-preview",
             AzureAuthMode::Bearer,
         );
         let new = AzureRouter::new(
-            "https://my-res.openai.azure.com",
+            Some("https://my-res.openai.azure.com".to_string()),
             Some("https://my-res.services.ai.azure.com".to_string()),
             "2025-01-01-preview",
             AzureAuthMode::Bearer,
@@ -240,6 +257,24 @@ mod tests {
     fn a_foundry_model_with_no_foundry_endpoint_configured_names_the_env_var() {
         let err = router_without_foundry().resolve("foundry:cohere-embed-v3-english").unwrap_err();
         assert!(err.0.contains("ZEROCACHE_AZURE_FOUNDRY_BASE_URL"), "{}", err.0);
+    }
+
+    #[test]
+    fn a_foundry_only_router_resolves_a_foundry_model_successfully() {
+        // A deployment with no Azure OpenAI resource at all (Foundry-only)
+        // must still work: ZEROCACHE_AZURE_OPENAI_BASE_URL is optional.
+        let r = router_foundry_only().resolve("foundry:cohere-embed-v3-english").unwrap();
+        assert_eq!(r.model_id, "cohere-embed-v3-english");
+        assert_eq!(
+            r.endpoint_base,
+            "https://my-res.services.ai.azure.com/models/embeddings?api-version=2024-05-01-preview"
+        );
+    }
+
+    #[test]
+    fn a_non_foundry_model_with_no_openai_base_url_configured_names_the_env_var() {
+        let err = router_foundry_only().resolve("text-embedding-3-small").unwrap_err();
+        assert!(err.0.contains("ZEROCACHE_AZURE_OPENAI_BASE_URL"), "{}", err.0);
     }
 
     #[test]

@@ -83,28 +83,29 @@ async fn main() {
     );
 
     // Azure is the exception: an Azure resource name *is* its hostname, so
-    // there is no default endpoint to fall back to. With the env var unset,
-    // POST /azure/v1/embeddings returns the existing 404 "unknown provider"
-    // straight out of the missing map key -- the same structural mechanism
-    // that already makes /openai/v1/images/embeddings 404, with no extra
-    // enforcement code.
-    match &config.azure_openai_base_url {
-        Some(base_url) => {
-            providers.insert(
-                "azure".to_string(),
-                Arc::new(new_azure_provider(
-                    base_url.clone(),
-                    config.azure_foundry_base_url.clone(),
-                    config.azure_foundry_api_version.clone(),
-                    config.azure_auth_mode,
-                )),
-            );
-        }
-        None => {
-            tracing::info!(
-                "ZEROCACHE_AZURE_OPENAI_BASE_URL is unset -- the 'azure' provider is not registered and /azure/v1/embeddings will return 404"
-            );
-        }
+    // there is no default endpoint to fall back to. Either surface alone is
+    // enough to register the provider -- a Foundry-only deployment (no Azure
+    // OpenAI resource at all) is a real, supported configuration, and
+    // AzureRouter::resolve returns a clean ProviderError naming the missing
+    // env var if a caller's model then targets the unconfigured surface.
+    // With both env vars unset, POST /azure/v1/embeddings returns the
+    // existing 404 "unknown provider" straight out of the missing map key --
+    // the same structural mechanism that already makes
+    // /openai/v1/images/embeddings 404, with no extra enforcement code.
+    if config.azure_openai_base_url.is_some() || config.azure_foundry_base_url.is_some() {
+        providers.insert(
+            "azure".to_string(),
+            Arc::new(new_azure_provider(
+                config.azure_openai_base_url.clone(),
+                config.azure_foundry_base_url.clone(),
+                config.azure_foundry_api_version.clone(),
+                config.azure_auth_mode,
+            )),
+        );
+    } else {
+        tracing::info!(
+            "neither ZEROCACHE_AZURE_OPENAI_BASE_URL nor ZEROCACHE_AZURE_FOUNDRY_BASE_URL is set -- the 'azure' provider is not registered and /azure/v1/embeddings will return 404"
+        );
     }
 
     let port = config.port;

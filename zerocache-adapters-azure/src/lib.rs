@@ -36,7 +36,7 @@ pub type AzureProvider = CloudProvider<AzureRouter>;
 /// segment. `version` is this crate's own `CARGO_PKG_VERSION`, keeping
 /// cache-key versioning tied to this Cargo.toml rather than the kit's.
 pub fn new_provider(
-    openai_base_url: impl Into<String>,
+    openai_base_url: Option<String>,
     foundry_base_url: Option<String>,
     foundry_api_version: impl Into<String>,
     auth_mode: AzureAuthMode,

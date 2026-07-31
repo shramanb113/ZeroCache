@@ -189,7 +189,7 @@ mod tests {
     use crate::{new_provider, AzureAuthMode, AzureProvider};
 
     fn provider(base: String, auth_mode: AzureAuthMode) -> AzureProvider {
-        new_provider(base.clone(), Some(base), "2024-05-01-preview", auth_mode)
+        new_provider(Some(base.clone()), Some(base), "2024-05-01-preview", auth_mode)
     }
 
     #[tokio::test]
@@ -470,13 +470,13 @@ mod tests {
     #[test]
     fn cache_scope_separates_resources_surfaces_and_input_types() {
         let a = new_provider(
-            "https://res-a.openai.azure.com",
+            Some("https://res-a.openai.azure.com".to_string()),
             Some("https://res-a.services.ai.azure.com".to_string()),
             "2024-05-01-preview",
             AzureAuthMode::Bearer,
         );
         let b = new_provider(
-            "https://res-b.openai.azure.com",
+            Some("https://res-b.openai.azure.com".to_string()),
             Some("https://res-b.services.ai.azure.com".to_string()),
             "2024-05-01-preview",
             AzureAuthMode::Bearer,
@@ -499,7 +499,12 @@ mod tests {
 
     #[test]
     fn cache_scope_rejects_a_malformed_model_rather_than_inventing_a_scope() {
-        let p = new_provider("https://res.openai.azure.com", None, "2024-05-01-preview", AzureAuthMode::Bearer);
+        let p = new_provider(
+            Some("https://res.openai.azure.com".to_string()),
+            None,
+            "2024-05-01-preview",
+            AzureAuthMode::Bearer,
+        );
         assert!(p.cache_scope("foundry:cohere-embed-v3-english").is_err());
         assert!(p.cache_scope("").is_err());
     }
