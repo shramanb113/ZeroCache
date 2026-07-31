@@ -1,0 +1,9 @@
+target/
+data/
+demo/
+docs/
+.git/
+.github/
+*.md
+.claude/
+.superpowers/
