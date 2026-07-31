@@ -7,3 +7,8 @@ docs/
 *.md
 .claude/
 .superpowers/
+.env
+.env.*
+*.pem
+*.key
+credentials*.json
