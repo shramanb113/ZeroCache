@@ -87,5 +87,8 @@ pub trait TextWireStrategy: Send + Sync {
 /// caller's `model` string to a concrete endpoint and wire strategy.
 pub trait CloudRouter: Send + Sync {
     fn resolve(&self, model: &str) -> Result<ResolvedModel, ProviderError>;
-    fn strategy_for(&self, resolved: &ResolvedModel) -> Result<&dyn TextWireStrategy, ProviderError>;
+    fn strategy_for(
+        &self,
+        resolved: &ResolvedModel,
+    ) -> Result<&dyn TextWireStrategy, ProviderError>;
 }

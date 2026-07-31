@@ -13,7 +13,10 @@ fn bedrock_headers(api_key: &str) -> Vec<(&'static str, String)> {
 }
 
 fn invoke_url(resolved: &ResolvedModel) -> String {
-    format!("{}/model/{}/invoke", resolved.endpoint_base, resolved.model_id)
+    format!(
+        "{}/model/{}/invoke",
+        resolved.endpoint_base, resolved.model_id
+    )
 }
 
 // ---------------------------------------------------------------- Titan ----
@@ -64,7 +67,11 @@ impl TextWireStrategy for TitanEmbedStrategy {
         let body = serde_json::to_vec(&TitanRequest { input_text: text })
             .map_err(|e| ProviderError(e.to_string()))?;
 
-        Ok(EmbedCall { url: invoke_url(resolved), headers: bedrock_headers(api_key), body })
+        Ok(EmbedCall {
+            url: invoke_url(resolved),
+            headers: bedrock_headers(api_key),
+            body,
+        })
     }
 
     fn parse_response(&self, _expected: usize, body: &[u8]) -> Result<EmbedOutcome, ProviderError> {
@@ -134,7 +141,11 @@ impl TextWireStrategy for CohereEmbedStrategy {
         let body = serde_json::to_vec(&CohereRequest { texts, input_type })
             .map_err(|e| ProviderError(e.to_string()))?;
 
-        Ok(EmbedCall { url: invoke_url(resolved), headers: bedrock_headers(api_key), body })
+        Ok(EmbedCall {
+            url: invoke_url(resolved),
+            headers: bedrock_headers(api_key),
+            body,
+        })
     }
 
     fn parse_response(&self, _expected: usize, body: &[u8]) -> Result<EmbedOutcome, ProviderError> {
@@ -146,7 +157,10 @@ impl TextWireStrategy for CohereEmbedStrategy {
         };
         // Cohere on Bedrock reports no token usage at all -- report zero
         // rather than fabricate, the same posture as Gemini and HuggingFace.
-        Ok(EmbedOutcome { vectors, usage: ProviderUsage::default() })
+        Ok(EmbedOutcome {
+            vectors,
+            usage: ProviderUsage::default(),
+        })
     }
 }
 
@@ -177,13 +191,20 @@ mod tests {
             .await;
 
         let (vectors, usage) = provider(server.base_url())
-            .embed_batch("test-key", "amazon.titan-embed-text-v2:0", &["hello".to_string()])
+            .embed_batch(
+                "test-key",
+                "amazon.titan-embed-text-v2:0",
+                &["hello".to_string()],
+            )
             .await
             .unwrap();
 
         mock.assert_async().await;
         assert_eq!(vectors, vec![vec![1.0, 2.0]]);
-        assert_eq!(usage.prompt_tokens, 3, "Titan does report token usage -- it must not be dropped");
+        assert_eq!(
+            usage.prompt_tokens, 3,
+            "Titan does report token usage -- it must not be dropped"
+        );
         assert_eq!(usage.total_tokens, 3);
     }
 
@@ -193,7 +214,8 @@ mod tests {
         let server = MockServer::start_async().await;
         let mock = server
             .mock_async(|when, then| {
-                when.method(POST).path("/model/amazon.titan-embed-text-v2:0/invoke");
+                when.method(POST)
+                    .path("/model/amazon.titan-embed-text-v2:0/invoke");
                 then.status(200)
                     .json_body(json!({ "embedding": [7.0], "inputTextTokenCount": 4 }));
             })
@@ -229,7 +251,11 @@ mod tests {
             .await;
 
         let (vectors, usage) = provider(server.base_url())
-            .embed_batch("test-key", "cohere.embed-english-v3", &["a".to_string(), "b".to_string()])
+            .embed_batch(
+                "test-key",
+                "cohere.embed-english-v3",
+                &["a".to_string(), "b".to_string()],
+            )
             .await
             .unwrap();
 
@@ -249,13 +275,18 @@ mod tests {
                 when.method(POST)
                     .path("/model/cohere.embed-english-v3/invoke")
                     .json_body(json!({ "texts": ["q"], "input_type": "search_query" }));
-                then.status(200)
-                    .json_body(json!({ "response_type": "embeddings_floats", "embeddings": [[5.0]] }));
+                then.status(200).json_body(
+                    json!({ "response_type": "embeddings_floats", "embeddings": [[5.0]] }),
+                );
             })
             .await;
 
         provider(server.base_url())
-            .embed_batch("test-key", "cohere.embed-english-v3#search_query", &["q".to_string()])
+            .embed_batch(
+                "test-key",
+                "cohere.embed-english-v3#search_query",
+                &["q".to_string()],
+            )
             .await
             .unwrap();
 
@@ -279,7 +310,11 @@ mod tests {
             .await;
 
         let (vectors, _usage) = provider(server.base_url())
-            .embed_batch("test-key", "cohere.embed-v4:0", &["a".to_string(), "b".to_string()])
+            .embed_batch(
+                "test-key",
+                "cohere.embed-v4:0",
+                &["a".to_string(), "b".to_string()],
+            )
             .await
             .unwrap();
 
@@ -291,11 +326,14 @@ mod tests {
         let server = MockServer::start_async().await;
         let first = server
             .mock_async(|when, then| {
-                when.method(POST).path("/model/cohere.embed-english-v3/invoke").matches(|req| {
-                    let body: serde_json::Value =
-                        serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
-                    body["texts"].as_array().map(|a| a.len()) == Some(96)
-                });
+                when.method(POST)
+                    .path("/model/cohere.embed-english-v3/invoke")
+                    .matches(|req| {
+                        let body: serde_json::Value =
+                            serde_json::from_slice(req.body.as_deref().unwrap_or_default())
+                                .unwrap();
+                        body["texts"].as_array().map(|a| a.len()) == Some(96)
+                    });
                 then.status(200).json_body_obj(&json!({
                     "embeddings": (0..96).map(|i| json!([i as f64])).collect::<Vec<_>>()
                 }));
@@ -303,11 +341,14 @@ mod tests {
             .await;
         let second = server
             .mock_async(|when, then| {
-                when.method(POST).path("/model/cohere.embed-english-v3/invoke").matches(|req| {
-                    let body: serde_json::Value =
-                        serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
-                    body["texts"].as_array().map(|a| a.len()) == Some(4)
-                });
+                when.method(POST)
+                    .path("/model/cohere.embed-english-v3/invoke")
+                    .matches(|req| {
+                        let body: serde_json::Value =
+                            serde_json::from_slice(req.body.as_deref().unwrap_or_default())
+                                .unwrap();
+                        body["texts"].as_array().map(|a| a.len()) == Some(4)
+                    });
                 then.status(200).json_body_obj(&json!({
                     "embeddings": (0..4).map(|i| json!([1000.0 + i as f64])).collect::<Vec<_>>()
                 }));
@@ -334,8 +375,10 @@ mod tests {
         let server = MockServer::start_async().await;
         server
             .mock_async(|when, then| {
-                when.method(POST).path("/model/cohere.embed-english-v3/invoke");
-                then.status(403).json_body(json!({ "message": "not authorized" }));
+                when.method(POST)
+                    .path("/model/cohere.embed-english-v3/invoke");
+                then.status(403)
+                    .json_body(json!({ "message": "not authorized" }));
             })
             .await;
 
@@ -351,16 +394,24 @@ mod tests {
         let server = MockServer::start_async().await;
         server
             .mock_async(|when, then| {
-                when.method(POST).path("/model/cohere.embed-english-v3/invoke");
+                when.method(POST)
+                    .path("/model/cohere.embed-english-v3/invoke");
                 then.status(200).json_body(json!({ "embeddings": [[1.0]] }));
             })
             .await;
 
         let result = provider(server.base_url())
-            .embed_batch("test-key", "cohere.embed-english-v3", &["a".to_string(), "b".to_string()])
+            .embed_batch(
+                "test-key",
+                "cohere.embed-english-v3",
+                &["a".to_string(), "b".to_string()],
+            )
             .await;
 
-        assert!(result.is_err(), "a count mismatch must be a hard error, not a silent misalignment");
+        assert!(
+            result.is_err(),
+            "a count mismatch must be a hard error, not a silent misalignment"
+        );
     }
 
     #[test]
@@ -368,8 +419,12 @@ mod tests {
         let p = provider("https://bedrock-runtime.{region}.amazonaws.com".to_string());
         let east = p.cache_scope("us-east-1/cohere.embed-english-v3").unwrap();
         let west = p.cache_scope("eu-west-1/cohere.embed-english-v3").unwrap();
-        let query = p.cache_scope("us-east-1/cohere.embed-english-v3#search_query").unwrap();
-        let titan = p.cache_scope("us-east-1/amazon.titan-embed-text-v2:0").unwrap();
+        let query = p
+            .cache_scope("us-east-1/cohere.embed-english-v3#search_query")
+            .unwrap();
+        let titan = p
+            .cache_scope("us-east-1/amazon.titan-embed-text-v2:0")
+            .unwrap();
 
         assert_ne!(east, west, "region must not be cached across");
         assert_ne!(east, query, "input_type must not be cached across");

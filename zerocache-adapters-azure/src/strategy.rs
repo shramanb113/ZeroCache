@@ -72,10 +72,16 @@ fn parse_openai_shaped(expected: usize, body: &[u8]) -> Result<EmbedOutcome, Pro
 
     let usage = parsed
         .usage
-        .map(|u| ProviderUsage { prompt_tokens: u.prompt_tokens, total_tokens: u.total_tokens })
+        .map(|u| ProviderUsage {
+            prompt_tokens: u.prompt_tokens,
+            total_tokens: u.total_tokens,
+        })
         .unwrap_or_default();
 
-    Ok(EmbedOutcome { vectors: ordered, usage })
+    Ok(EmbedOutcome {
+        vectors: ordered,
+        usage,
+    })
 }
 
 // ------------------------------------------------------- Azure OpenAI v1 ----
@@ -110,8 +116,11 @@ impl TextWireStrategy for AzureOpenAiV1Strategy {
         resolved: &ResolvedModel,
         texts: &[String],
     ) -> Result<EmbedCall, ProviderError> {
-        let body = serde_json::to_vec(&OpenAiV1Request { model: &resolved.model_id, input: texts })
-            .map_err(|e| ProviderError(e.to_string()))?;
+        let body = serde_json::to_vec(&OpenAiV1Request {
+            model: &resolved.model_id,
+            input: texts,
+        })
+        .map_err(|e| ProviderError(e.to_string()))?;
 
         Ok(EmbedCall {
             url: resolved.endpoint_base.clone(),
@@ -189,7 +198,12 @@ mod tests {
     use crate::{new_provider, AzureAuthMode, AzureProvider};
 
     fn provider(base: String, auth_mode: AzureAuthMode) -> AzureProvider {
-        new_provider(Some(base.clone()), Some(base), "2024-05-01-preview", auth_mode)
+        new_provider(
+            Some(base.clone()),
+            Some(base),
+            "2024-05-01-preview",
+            auth_mode,
+        )
     }
 
     #[tokio::test]
@@ -214,12 +228,20 @@ mod tests {
             .await;
 
         let (vectors, usage) = provider(server.base_url(), AzureAuthMode::Bearer)
-            .embed_batch("entra-token", "my-deployment", &["a".to_string(), "b".to_string()])
+            .embed_batch(
+                "entra-token",
+                "my-deployment",
+                &["a".to_string(), "b".to_string()],
+            )
             .await
             .unwrap();
 
         mock.assert_async().await;
-        assert_eq!(vectors, vec![vec![1.0], vec![2.0]], "an out-of-order response must be reordered by index");
+        assert_eq!(
+            vectors,
+            vec![vec![1.0], vec![2.0]],
+            "an out-of-order response must be reordered by index"
+        );
         assert_eq!(usage.prompt_tokens, 5);
         assert_eq!(usage.total_tokens, 5);
     }
@@ -229,12 +251,14 @@ mod tests {
         let server = MockServer::start_async().await;
         let mock = server
             .mock_async(|when, then| {
-                when.method(POST).path("/openai/v1/embeddings").matches(|req| {
-                    req.query_params
-                        .as_ref()
-                        .map(|params| params.iter().all(|(k, _)| k != "api-version"))
-                        .unwrap_or(true)
-                });
+                when.method(POST)
+                    .path("/openai/v1/embeddings")
+                    .matches(|req| {
+                        req.query_params
+                            .as_ref()
+                            .map(|params| params.iter().all(|(k, _)| k != "api-version"))
+                            .unwrap_or(true)
+                    });
                 then.status(200).json_body(json!({
                     "data": [{ "embedding": [1.0], "index": 0 }],
                     "usage": { "prompt_tokens": 1, "total_tokens": 1 }
@@ -255,7 +279,9 @@ mod tests {
         let server = MockServer::start_async().await;
         let mock = server
             .mock_async(|when, then| {
-                when.method(POST).path("/openai/v1/embeddings").header("api-key", "resource-key");
+                when.method(POST)
+                    .path("/openai/v1/embeddings")
+                    .header("api-key", "resource-key");
                 then.status(200).json_body(json!({
                     "data": [{ "embedding": [1.0], "index": 0 }],
                     "usage": { "prompt_tokens": 1, "total_tokens": 1 }
@@ -292,7 +318,11 @@ mod tests {
             .await;
 
         provider(server.base_url(), AzureAuthMode::Bearer)
-            .embed_batch("tok", "foundry:cohere-embed-v3-english#query", &["a".to_string()])
+            .embed_batch(
+                "tok",
+                "foundry:cohere-embed-v3-english#query",
+                &["a".to_string()],
+            )
             .await
             .unwrap();
         with_type.assert_async().await;
@@ -324,7 +354,8 @@ mod tests {
         server
             .mock_async(|when, then| {
                 when.method(POST).path("/openai/v1/embeddings");
-                then.status(200).json_body(json!({ "data": [{ "embedding": [1.0], "index": 0 }] }));
+                then.status(200)
+                    .json_body(json!({ "data": [{ "embedding": [1.0], "index": 0 }] }));
             })
             .await;
 
@@ -334,7 +365,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(vectors, vec![vec![1.0]]);
-        assert_eq!(usage.prompt_tokens, 0, "absent usage must be zero, not fabricated");
+        assert_eq!(
+            usage.prompt_tokens, 0,
+            "absent usage must be zero, not fabricated"
+        );
     }
 
     #[tokio::test]
@@ -342,11 +376,14 @@ mod tests {
         let server = MockServer::start_async().await;
         let first = server
             .mock_async(|when, then| {
-                when.method(POST).path("/openai/v1/embeddings").matches(|req| {
-                    let body: serde_json::Value =
-                        serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
-                    body["input"].as_array().map(|a| a.len()) == Some(100)
-                });
+                when.method(POST)
+                    .path("/openai/v1/embeddings")
+                    .matches(|req| {
+                        let body: serde_json::Value =
+                            serde_json::from_slice(req.body.as_deref().unwrap_or_default())
+                                .unwrap();
+                        body["input"].as_array().map(|a| a.len()) == Some(100)
+                    });
                 then.status(200).json_body_obj(&json!({
                     "data": (0..100)
                         .map(|i| json!({ "embedding": [i as f64], "index": i }))
@@ -357,11 +394,14 @@ mod tests {
             .await;
         let second = server
             .mock_async(|when, then| {
-                when.method(POST).path("/openai/v1/embeddings").matches(|req| {
-                    let body: serde_json::Value =
-                        serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
-                    body["input"].as_array().map(|a| a.len()) == Some(20)
-                });
+                when.method(POST)
+                    .path("/openai/v1/embeddings")
+                    .matches(|req| {
+                        let body: serde_json::Value =
+                            serde_json::from_slice(req.body.as_deref().unwrap_or_default())
+                                .unwrap();
+                        body["input"].as_array().map(|a| a.len()) == Some(20)
+                    });
                 then.status(200).json_body_obj(&json!({
                     "data": (0..20)
                         .map(|i| json!({ "embedding": [1000.0 + i as f64], "index": i }))
@@ -383,7 +423,10 @@ mod tests {
         assert_eq!(vectors[0], vec![0.0]);
         assert_eq!(vectors[99], vec![99.0]);
         assert_eq!(vectors[100], vec![1000.0]);
-        assert_eq!(usage.prompt_tokens, 120, "usage must accumulate across chunks");
+        assert_eq!(
+            usage.prompt_tokens, 120,
+            "usage must accumulate across chunks"
+        );
     }
 
     #[tokio::test]
@@ -392,7 +435,8 @@ mod tests {
         server
             .mock_async(|when, then| {
                 when.method(POST).path("/openai/v1/embeddings");
-                then.status(401).json_body(json!({ "error": { "message": "invalid token" } }));
+                then.status(401)
+                    .json_body(json!({ "error": { "message": "invalid token" } }));
             })
             .await;
 
@@ -409,7 +453,8 @@ mod tests {
         server
             .mock_async(|when, then| {
                 when.method(POST).path("/openai/v1/embeddings");
-                then.status(200).json_body(json!({ "data": [{ "embedding": [1.0], "index": 0 }] }));
+                then.status(200)
+                    .json_body(json!({ "data": [{ "embedding": [1.0], "index": 0 }] }));
             })
             .await;
 
@@ -417,7 +462,10 @@ mod tests {
             .embed_batch("tok", "my-deployment", &["a".to_string(), "b".to_string()])
             .await;
 
-        assert!(result.is_err(), "a count mismatch must be a hard error, not a silent misalignment");
+        assert!(
+            result.is_err(),
+            "a count mismatch must be a hard error, not a silent misalignment"
+        );
     }
 
     #[tokio::test]
@@ -439,7 +487,10 @@ mod tests {
             .embed_batch("tok", "my-deployment", &["a".to_string(), "b".to_string()])
             .await;
 
-        assert!(result.is_err(), "a bogus index must be reported, never used to index out of bounds");
+        assert!(
+            result.is_err(),
+            "a bogus index must be reported, never used to index out of bounds"
+        );
     }
 
     #[tokio::test]

@@ -156,13 +156,19 @@ fn split_model(
     // arms above have resolved their values, so neither the bare-model-id
     // form (with a malicious default) nor the explicit-location/project form
     // can bypass it.
-    if !location.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+    if !location
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
         return Err(ProviderError(format!(
             "vertexai model '{model}' has an invalid location -- expected a GCP location like 'us-central1'"
         )));
     }
 
-    if !project.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+    if !project
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
         return Err(ProviderError(format!(
             "vertexai model '{model}' has an invalid project -- expected a GCP project id like 'my-project'"
         )));
@@ -174,12 +180,21 @@ fn split_model(
         )));
     }
 
-    Ok(VertexModelParts { location, project, model_id, task_type })
+    Ok(VertexModelParts {
+        location,
+        project,
+        model_id,
+        task_type,
+    })
 }
 
 impl CloudRouter for VertexRouter {
     fn resolve(&self, model: &str) -> Result<ResolvedModel, ProviderError> {
-        let parts = split_model(model, self.default_project.as_deref(), &self.default_location)?;
+        let parts = split_model(
+            model,
+            self.default_project.as_deref(),
+            &self.default_location,
+        )?;
 
         let host = resolve_host(&self.endpoint_template, &parts.location);
         // The full resource path is folded into endpoint_base rather than
@@ -206,7 +221,10 @@ impl CloudRouter for VertexRouter {
         })
     }
 
-    fn strategy_for(&self, resolved: &ResolvedModel) -> Result<&dyn TextWireStrategy, ProviderError> {
+    fn strategy_for(
+        &self,
+        resolved: &ResolvedModel,
+    ) -> Result<&dyn TextWireStrategy, ProviderError> {
         // Same wire shape either way -- only Google's per-model input limit
         // differs, so these are two instances of one strategy type, not two
         // strategy types.
@@ -239,7 +257,11 @@ mod tests {
     }
 
     fn router_without_project() -> VertexRouter {
-        VertexRouter::new(None, DEFAULT_VERTEX_LOCATION, DEFAULT_VERTEX_ENDPOINT_TEMPLATE)
+        VertexRouter::new(
+            None,
+            DEFAULT_VERTEX_LOCATION,
+            DEFAULT_VERTEX_ENDPOINT_TEMPLATE,
+        )
     }
 
     #[test]
@@ -276,8 +298,12 @@ mod tests {
 
     #[test]
     fn two_projects_never_collapse_to_one_cache_entry() {
-        let a = router_with_project().resolve("us-central1/proj-a/text-embedding-005").unwrap();
-        let b = router_with_project().resolve("us-central1/proj-b/text-embedding-005").unwrap();
+        let a = router_with_project()
+            .resolve("us-central1/proj-a/text-embedding-005")
+            .unwrap();
+        let b = router_with_project()
+            .resolve("us-central1/proj-b/text-embedding-005")
+            .unwrap();
         assert_ne!(
             a.canonical, b.canonical,
             "two projects are two billing and deployment boundaries and must not share cached vectors"
@@ -286,7 +312,9 @@ mod tests {
 
     #[test]
     fn a_missing_project_with_no_default_is_an_error_naming_both_fixes() {
-        let err = router_without_project().resolve("text-embedding-005").unwrap_err();
+        let err = router_without_project()
+            .resolve("text-embedding-005")
+            .unwrap_err();
         assert!(err.0.contains("ZEROCACHE_VERTEX_PROJECT"), "{}", err.0);
         assert!(err.0.contains("<location>/<project>/"), "{}", err.0);
     }
@@ -306,7 +334,10 @@ mod tests {
     #[test]
     fn an_omitted_task_type_stays_omitted_rather_than_being_defaulted_here() {
         let r = router_with_project().resolve("text-embedding-005").unwrap();
-        assert_eq!(r.qualifier, None, "Google's own default must apply, not one invented by this adapter");
+        assert_eq!(
+            r.qualifier, None,
+            "Google's own default must apply, not one invented by this adapter"
+        );
     }
 
     #[test]
@@ -330,7 +361,10 @@ mod tests {
     fn a_malformed_model_string_is_rejected() {
         let r = router_with_project();
         assert!(r.resolve("").is_err());
-        assert!(r.resolve("my-project/text-embedding-005").is_err(), "two segments is ambiguous");
+        assert!(
+            r.resolve("my-project/text-embedding-005").is_err(),
+            "two segments is ambiguous"
+        );
         assert!(r.resolve("a/b/c/d").is_err());
         assert!(r.resolve("us-central1//text-embedding-005").is_err());
         assert!(r.resolve("text-embedding-005#").is_err());
@@ -338,7 +372,9 @@ mod tests {
 
     #[test]
     fn a_location_containing_url_structural_characters_is_rejected() {
-        let err = router_with_project().resolve("evil.com/p/text-embedding-005").unwrap_err();
+        let err = router_with_project()
+            .resolve("evil.com/p/text-embedding-005")
+            .unwrap_err();
         assert!(err.0.contains("invalid location"), "{}", err.0);
     }
 
@@ -352,13 +388,19 @@ mod tests {
 
     #[test]
     fn a_model_id_containing_url_structural_characters_is_rejected() {
-        let err = router_with_project().resolve("us-central1/p/model?x=1").unwrap_err();
+        let err = router_with_project()
+            .resolve("us-central1/p/model?x=1")
+            .unwrap_err();
         assert!(err.0.contains("invalid model id"), "{}", err.0);
     }
 
     #[test]
     fn an_endpoint_template_without_a_location_placeholder_is_used_verbatim() {
-        let r = VertexRouter::new(Some("p".to_string()), "us-central1", "http://127.0.0.1:9999");
+        let r = VertexRouter::new(
+            Some("p".to_string()),
+            "us-central1",
+            "http://127.0.0.1:9999",
+        );
         assert_eq!(
             r.resolve("text-embedding-005").unwrap().endpoint_base,
             "http://127.0.0.1:9999/v1/projects/p/locations/us-central1/publishers/google/models"
@@ -367,9 +409,12 @@ mod tests {
 
     #[test]
     fn global_location_uses_the_real_non_prefixed_host() {
-        let r = router_with_project().resolve("global/my-project/text-embedding-005").unwrap();
+        let r = router_with_project()
+            .resolve("global/my-project/text-embedding-005")
+            .unwrap();
         assert!(
-            r.endpoint_base.starts_with("https://aiplatform.googleapis.com/"),
+            r.endpoint_base
+                .starts_with("https://aiplatform.googleapis.com/"),
             "expected the real Vertex global host with no location prefix, got: {}",
             r.endpoint_base
         );
@@ -377,9 +422,12 @@ mod tests {
 
     #[test]
     fn us_multi_region_location_uses_the_dot_rep_host_shape() {
-        let r = router_with_project().resolve("us/my-project/text-embedding-005").unwrap();
+        let r = router_with_project()
+            .resolve("us/my-project/text-embedding-005")
+            .unwrap();
         assert!(
-            r.endpoint_base.starts_with("https://aiplatform.us.rep.googleapis.com/"),
+            r.endpoint_base
+                .starts_with("https://aiplatform.us.rep.googleapis.com/"),
             "expected the real Vertex multi-region host shape, got: {}",
             r.endpoint_base
         );
@@ -387,9 +435,12 @@ mod tests {
 
     #[test]
     fn eu_multi_region_location_uses_the_dot_rep_host_shape() {
-        let r = router_with_project().resolve("eu/my-project/text-embedding-005").unwrap();
+        let r = router_with_project()
+            .resolve("eu/my-project/text-embedding-005")
+            .unwrap();
         assert!(
-            r.endpoint_base.starts_with("https://aiplatform.eu.rep.googleapis.com/"),
+            r.endpoint_base
+                .starts_with("https://aiplatform.eu.rep.googleapis.com/"),
             "expected the real Vertex multi-region host shape, got: {}",
             r.endpoint_base
         );
@@ -402,9 +453,12 @@ mod tests {
         // exercises via DEFAULT_VERTEX_LOCATION -- this test pins the exact
         // string shape so a future refactor can't silently break it while
         // those other tests happen to still pass for unrelated reasons.
-        let r = router_with_project().resolve("europe-west4/my-project/text-embedding-005").unwrap();
+        let r = router_with_project()
+            .resolve("europe-west4/my-project/text-embedding-005")
+            .unwrap();
         assert!(
-            r.endpoint_base.starts_with("https://europe-west4-aiplatform.googleapis.com/"),
+            r.endpoint_base
+                .starts_with("https://europe-west4-aiplatform.googleapis.com/"),
             "expected the normal dash-prefixed regional host shape, got: {}",
             r.endpoint_base
         );
@@ -416,7 +470,11 @@ mod tests {
         // Private Service Connect endpoint) must not have their template
         // silently second-guessed for global/us/eu -- the special-casing
         // below only applies to the crate's own DEFAULT_VERTEX_ENDPOINT_TEMPLATE.
-        let r = VertexRouter::new(Some("p".to_string()), "us-central1", "http://127.0.0.1:9999");
+        let r = VertexRouter::new(
+            Some("p".to_string()),
+            "us-central1",
+            "http://127.0.0.1:9999",
+        );
         assert_eq!(
             r.resolve("global/p/text-embedding-005").unwrap().endpoint_base,
             "http://127.0.0.1:9999/v1/projects/p/locations/global/publishers/google/models",

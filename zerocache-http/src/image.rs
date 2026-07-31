@@ -16,7 +16,10 @@ pub fn parse_data_uri(uri: &str) -> Result<ImageInput, String> {
     if mime_type.is_empty() {
         return Err("data URI is missing a mime type".to_string());
     }
-    Ok(ImageInput { mime_type: mime_type.to_string(), data: data.to_string() })
+    Ok(ImageInput {
+        mime_type: mime_type.to_string(),
+        data: data.to_string(),
+    })
 }
 
 #[cfg(test)]

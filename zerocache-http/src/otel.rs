@@ -39,16 +39,18 @@ pub fn init() -> Option<SdkTracerProvider> {
                      (e.g. http://localhost:4317)"
                 )
             });
-        let resource = Resource::builder().with_service_name("zerocache-http").build();
+        let resource = Resource::builder()
+            .with_service_name("zerocache-http")
+            .build();
         SdkTracerProvider::builder()
             .with_batch_exporter(exporter)
             .with_resource(resource)
             .build()
     });
 
-    let otel_layer = tracer_provider
-        .as_ref()
-        .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer("zerocache-http")));
+    let otel_layer = tracer_provider.as_ref().map(|provider| {
+        tracing_opentelemetry::layer().with_tracer(provider.tracer("zerocache-http"))
+    });
 
     // Without an explicit filter, tracing_subscriber's default is "enable
     // everything" -- every TRACE-level event from every dependency (sled's

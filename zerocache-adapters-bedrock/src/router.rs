@@ -8,7 +8,8 @@ pub const DEFAULT_BEDROCK_REGION: &str = "us-east-1";
 /// `{region}` is substituted per request. A template with no placeholder is
 /// used verbatim, which is what makes httpmock testing possible and also
 /// covers a VPC/PrivateLink endpoint that is not region-templated.
-pub const DEFAULT_BEDROCK_ENDPOINT_TEMPLATE: &str = "https://bedrock-runtime.{region}.amazonaws.com";
+pub const DEFAULT_BEDROCK_ENDPOINT_TEMPLATE: &str =
+    "https://bedrock-runtime.{region}.amazonaws.com";
 
 /// Cohere requires `input_type` and it changes the vector. `search_document`
 /// is the corpus-indexing value, which is what an ingestion cache is
@@ -85,7 +86,10 @@ fn split_model(model: &str, default_region: &str) -> Result<BedrockModelParts, P
     // caller-supplied `model` string smuggle a different host/path/query
     // through, which is a real SSRF vector against e.g. link-local metadata
     // endpoints, not a hypothetical one.
-    if !region.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+    if !region
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
         return Err(ProviderError(format!(
             "bedrock model '{model}' has an invalid region -- expected an AWS region like 'us-east-1'"
         )));
@@ -97,7 +101,11 @@ fn split_model(model: &str, default_region: &str) -> Result<BedrockModelParts, P
         )));
     }
 
-    Ok(BedrockModelParts { region, model_id, input_type })
+    Ok(BedrockModelParts {
+        region,
+        model_id,
+        input_type,
+    })
 }
 
 impl CloudRouter for BedrockRouter {
@@ -129,7 +137,12 @@ impl CloudRouter for BedrockRouter {
         }
 
         let qualifier = if is_cohere {
-            Some(parts.input_type.clone().unwrap_or_else(|| DEFAULT_COHERE_INPUT_TYPE.to_string()))
+            Some(
+                parts
+                    .input_type
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_COHERE_INPUT_TYPE.to_string()),
+            )
         } else {
             None
         };
@@ -139,10 +152,18 @@ impl CloudRouter for BedrockRouter {
             None => format!("{}/{}", parts.region, parts.model_id),
         };
 
-        Ok(ResolvedModel { canonical, model_id: parts.model_id, endpoint_base, qualifier })
+        Ok(ResolvedModel {
+            canonical,
+            model_id: parts.model_id,
+            endpoint_base,
+            qualifier,
+        })
     }
 
-    fn strategy_for(&self, resolved: &ResolvedModel) -> Result<&dyn TextWireStrategy, ProviderError> {
+    fn strategy_for(
+        &self,
+        resolved: &ResolvedModel,
+    ) -> Result<&dyn TextWireStrategy, ProviderError> {
         if resolved.model_id.starts_with("amazon.titan-embed") {
             Ok(&self.titan)
         } else if resolved.model_id.starts_with("cohere.embed") {
@@ -168,14 +189,22 @@ mod tests {
     fn bare_model_id_uses_the_default_region() {
         let r = router().resolve("amazon.titan-embed-text-v2:0").unwrap();
         assert_eq!(r.model_id, "amazon.titan-embed-text-v2:0");
-        assert_eq!(r.endpoint_base, "https://bedrock-runtime.us-east-1.amazonaws.com");
+        assert_eq!(
+            r.endpoint_base,
+            "https://bedrock-runtime.us-east-1.amazonaws.com"
+        );
         assert_eq!(r.canonical, "us-east-1/amazon.titan-embed-text-v2:0");
     }
 
     #[test]
     fn explicit_region_overrides_the_default_and_reaches_a_different_host() {
-        let r = router().resolve("eu-west-1/amazon.titan-embed-text-v2:0").unwrap();
-        assert_eq!(r.endpoint_base, "https://bedrock-runtime.eu-west-1.amazonaws.com");
+        let r = router()
+            .resolve("eu-west-1/amazon.titan-embed-text-v2:0")
+            .unwrap();
+        assert_eq!(
+            r.endpoint_base,
+            "https://bedrock-runtime.eu-west-1.amazonaws.com"
+        );
         assert_eq!(r.canonical, "eu-west-1/amazon.titan-embed-text-v2:0");
     }
 
@@ -184,14 +213,20 @@ mod tests {
         // Same target, two spellings -- must produce identical canonical form,
         // or the cache splits in two for no reason.
         let bare = router().resolve("cohere.embed-english-v3").unwrap();
-        let qualified = router().resolve("us-east-1/cohere.embed-english-v3").unwrap();
+        let qualified = router()
+            .resolve("us-east-1/cohere.embed-english-v3")
+            .unwrap();
         assert_eq!(bare.canonical, qualified.canonical);
     }
 
     #[test]
     fn the_same_model_in_two_regions_never_collapses_to_one_cache_entry() {
-        let east = router().resolve("us-east-1/cohere.embed-english-v3").unwrap();
-        let west = router().resolve("eu-west-1/cohere.embed-english-v3").unwrap();
+        let east = router()
+            .resolve("us-east-1/cohere.embed-english-v3")
+            .unwrap();
+        let west = router()
+            .resolve("eu-west-1/cohere.embed-english-v3")
+            .unwrap();
         assert_ne!(
             east.canonical, west.canonical,
             "two regional deployments are two upstreams and must not share cached vectors"
@@ -202,13 +237,20 @@ mod tests {
     fn cohere_defaults_to_search_document_and_records_it_in_the_canonical_form() {
         let r = router().resolve("cohere.embed-english-v3").unwrap();
         assert_eq!(r.qualifier.as_deref(), Some("search_document"));
-        assert_eq!(r.canonical, "us-east-1/cohere.embed-english-v3#search_document");
+        assert_eq!(
+            r.canonical,
+            "us-east-1/cohere.embed-english-v3#search_document"
+        );
     }
 
     #[test]
     fn cohere_input_type_changes_the_canonical_form_so_query_and_document_vectors_never_collide() {
-        let doc = router().resolve("cohere.embed-english-v3#search_document").unwrap();
-        let query = router().resolve("cohere.embed-english-v3#search_query").unwrap();
+        let doc = router()
+            .resolve("cohere.embed-english-v3#search_document")
+            .unwrap();
+        let query = router()
+            .resolve("cohere.embed-english-v3#search_query")
+            .unwrap();
         assert_ne!(
             doc.canonical, query.canonical,
             "input_type changes the vector, so it has to change the cache identity"
@@ -221,7 +263,9 @@ mod tests {
         let r = router().resolve("amazon.titan-embed-text-v2:0").unwrap();
         assert_eq!(r.qualifier, None);
 
-        let err = router().resolve("amazon.titan-embed-text-v2:0#search_query").unwrap_err();
+        let err = router()
+            .resolve("amazon.titan-embed-text-v2:0#search_query")
+            .unwrap_err();
         assert!(
             err.0.contains("no input_type parameter"),
             "silently ignoring a qualifier would let a caller believe it took effect: {}",
@@ -259,7 +303,9 @@ mod tests {
 
     #[test]
     fn a_region_containing_url_structural_characters_is_rejected() {
-        let err = router().resolve("@169.254.169.254?/cohere.embed-english-v3").unwrap_err();
+        let err = router()
+            .resolve("@169.254.169.254?/cohere.embed-english-v3")
+            .unwrap_err();
         assert!(err.0.contains("invalid region"), "{}", err.0);
     }
 
@@ -268,7 +314,9 @@ mod tests {
         // Region splits at the first '/', so everything after it -- including
         // this embedded '/' -- lands in model_id, which must reject it rather
         // than let it escape the intended URL path segment.
-        let err = router().resolve("us-east-1/cohere.embed-x/evil").unwrap_err();
+        let err = router()
+            .resolve("us-east-1/cohere.embed-x/evil")
+            .unwrap_err();
         assert!(err.0.contains("invalid model id"), "{}", err.0);
     }
 

@@ -91,7 +91,11 @@ fn split_model(model: &str) -> Result<AzureModelParts, ProviderError> {
         )));
     }
 
-    Ok(AzureModelParts { foundry, deployment, input_type })
+    Ok(AzureModelParts {
+        foundry,
+        deployment,
+        input_type,
+    })
 }
 
 impl CloudRouter for AzureRouter {
@@ -108,7 +112,10 @@ impl CloudRouter for AzureRouter {
             // The api-version is part of the endpoint identity: two versions
             // of the same surface can return different vectors, and an
             // operator bumping it must get a cold cache, not stale hits.
-            let endpoint_base = format!("{base}/models/embeddings?api-version={}", self.foundry_api_version);
+            let endpoint_base = format!(
+                "{base}/models/embeddings?api-version={}",
+                self.foundry_api_version
+            );
 
             let canonical = match &parts.input_type {
                 Some(input_type) => format!(
@@ -146,7 +153,10 @@ impl CloudRouter for AzureRouter {
         })
     }
 
-    fn strategy_for(&self, resolved: &ResolvedModel) -> Result<&dyn TextWireStrategy, ProviderError> {
+    fn strategy_for(
+        &self,
+        resolved: &ResolvedModel,
+    ) -> Result<&dyn TextWireStrategy, ProviderError> {
         if resolved.canonical.starts_with("foundry:") {
             Ok(&self.foundry)
         } else {
@@ -190,7 +200,10 @@ mod tests {
     fn a_bare_deployment_name_targets_the_openai_v1_surface_with_no_api_version() {
         let r = router().resolve("text-embedding-3-small").unwrap();
         assert_eq!(r.model_id, "text-embedding-3-small");
-        assert_eq!(r.endpoint_base, "https://my-res.openai.azure.com/openai/v1/embeddings");
+        assert_eq!(
+            r.endpoint_base,
+            "https://my-res.openai.azure.com/openai/v1/embeddings"
+        );
         assert!(
             !r.endpoint_base.contains("api-version"),
             "the GA v1 path takes no api-version; adding one only opts into preview behavior"
@@ -206,7 +219,10 @@ mod tests {
             r.endpoint_base,
             "https://my-res.services.ai.azure.com/models/embeddings?api-version=2024-05-01-preview"
         );
-        assert_eq!(r.canonical, "foundry:cohere-embed-v3-english@2024-05-01-preview");
+        assert_eq!(
+            r.canonical,
+            "foundry:cohere-embed-v3-english@2024-05-01-preview"
+        );
     }
 
     #[test]
@@ -240,30 +256,48 @@ mod tests {
 
     #[test]
     fn foundry_input_type_changes_the_canonical_form() {
-        let doc = router().resolve("foundry:cohere-embed-v3-english#document").unwrap();
-        let query = router().resolve("foundry:cohere-embed-v3-english#query").unwrap();
+        let doc = router()
+            .resolve("foundry:cohere-embed-v3-english#document")
+            .unwrap();
+        let query = router()
+            .resolve("foundry:cohere-embed-v3-english#query")
+            .unwrap();
         assert_ne!(doc.canonical, query.canonical);
         assert_eq!(query.qualifier.as_deref(), Some("query"));
     }
 
     #[test]
     fn an_input_type_on_the_openai_surface_is_rejected_rather_than_ignored() {
-        let err = router().resolve("text-embedding-3-small#document").unwrap_err();
+        let err = router()
+            .resolve("text-embedding-3-small#document")
+            .unwrap_err();
         assert!(err.0.contains("do not accept an input_type"), "{}", err.0);
-        assert!(err.0.contains(FOUNDRY_MODEL_PREFIX), "the message should name the fix: {}", err.0);
+        assert!(
+            err.0.contains(FOUNDRY_MODEL_PREFIX),
+            "the message should name the fix: {}",
+            err.0
+        );
     }
 
     #[test]
     fn a_foundry_model_with_no_foundry_endpoint_configured_names_the_env_var() {
-        let err = router_without_foundry().resolve("foundry:cohere-embed-v3-english").unwrap_err();
-        assert!(err.0.contains("ZEROCACHE_AZURE_FOUNDRY_BASE_URL"), "{}", err.0);
+        let err = router_without_foundry()
+            .resolve("foundry:cohere-embed-v3-english")
+            .unwrap_err();
+        assert!(
+            err.0.contains("ZEROCACHE_AZURE_FOUNDRY_BASE_URL"),
+            "{}",
+            err.0
+        );
     }
 
     #[test]
     fn a_foundry_only_router_resolves_a_foundry_model_successfully() {
         // A deployment with no Azure OpenAI resource at all (Foundry-only)
         // must still work: ZEROCACHE_AZURE_OPENAI_BASE_URL is optional.
-        let r = router_foundry_only().resolve("foundry:cohere-embed-v3-english").unwrap();
+        let r = router_foundry_only()
+            .resolve("foundry:cohere-embed-v3-english")
+            .unwrap();
         assert_eq!(r.model_id, "cohere-embed-v3-english");
         assert_eq!(
             r.endpoint_base,
@@ -273,8 +307,14 @@ mod tests {
 
     #[test]
     fn a_non_foundry_model_with_no_openai_base_url_configured_names_the_env_var() {
-        let err = router_foundry_only().resolve("text-embedding-3-small").unwrap_err();
-        assert!(err.0.contains("ZEROCACHE_AZURE_OPENAI_BASE_URL"), "{}", err.0);
+        let err = router_foundry_only()
+            .resolve("text-embedding-3-small")
+            .unwrap_err();
+        assert!(
+            err.0.contains("ZEROCACHE_AZURE_OPENAI_BASE_URL"),
+            "{}",
+            err.0
+        );
     }
 
     #[test]
@@ -301,7 +341,10 @@ mod tests {
             AzureAuthMode::Bearer.header("tok"),
             ("Authorization", "Bearer tok".to_string())
         );
-        assert_eq!(AzureAuthMode::ApiKey.header("k"), ("api-key", "k".to_string()));
+        assert_eq!(
+            AzureAuthMode::ApiKey.header("k"),
+            ("api-key", "k".to_string())
+        );
     }
 
     #[test]
@@ -328,7 +371,8 @@ mod tests {
             );
         }
 
-        let expected_foundry = "https://my-res.services.ai.azure.com/models/embeddings?api-version=2024-05-01-preview";
+        let expected_foundry =
+            "https://my-res.services.ai.azure.com/models/embeddings?api-version=2024-05-01-preview";
         for hostile in ["foundry:@evil.example/x", "foundry:m#a&api-version=hacked"] {
             assert_eq!(
                 r.resolve(hostile).unwrap().endpoint_base,

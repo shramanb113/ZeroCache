@@ -41,7 +41,11 @@ mod tests {
         let keys = [miss_key, hit_key, miss_key];
 
         let result = reconcile(&keys, |k| {
-            Ok::<_, std::convert::Infallible>(if *k == hit_key { Some(vec![1.0, 2.0]) } else { None })
+            Ok::<_, std::convert::Infallible>(if *k == hit_key {
+                Some(vec![1.0, 2.0])
+            } else {
+                None
+            })
         })
         .unwrap();
 

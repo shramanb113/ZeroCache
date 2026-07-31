@@ -52,7 +52,10 @@ impl EmbeddingProvider for HuggingFaceProvider {
 
             let response: Vec<Vec<f32>> = self
                 .client
-                .post(format!("{}/models/{model}/pipeline/feature-extraction", self.base_url))
+                .post(format!(
+                    "{}/models/{model}/pipeline/feature-extraction",
+                    self.base_url
+                ))
                 .header("Authorization", format!("Bearer {api_key}"))
                 .json(&body)
                 .send()
@@ -113,7 +116,11 @@ mod tests {
 
         let provider = HuggingFaceProvider::new(server.base_url());
         let (vectors, usage) = provider
-            .embed_batch("test-key", "sentence-transformers/all-MiniLM-L6-v2", &["a".to_string(), "b".to_string()])
+            .embed_batch(
+                "test-key",
+                "sentence-transformers/all-MiniLM-L6-v2",
+                &["a".to_string(), "b".to_string()],
+            )
             .await
             .unwrap();
 
@@ -127,13 +134,17 @@ mod tests {
         let server = MockServer::start_async().await;
         server
             .mock_async(|when, then| {
-                when.method(POST).path("/models/some-model/pipeline/feature-extraction");
-                then.status(401).json_body(json!({ "error": "Invalid token" }));
+                when.method(POST)
+                    .path("/models/some-model/pipeline/feature-extraction");
+                then.status(401)
+                    .json_body(json!({ "error": "Invalid token" }));
             })
             .await;
 
         let provider = HuggingFaceProvider::new(server.base_url());
-        let result = provider.embed_batch("bad-key", "some-model", &["x".to_string()]).await;
+        let result = provider
+            .embed_batch("bad-key", "some-model", &["x".to_string()])
+            .await;
 
         assert!(result.is_err());
     }
@@ -143,13 +154,16 @@ mod tests {
         let server = MockServer::start_async().await;
         server
             .mock_async(|when, then| {
-                when.method(POST).path("/models/some-model/pipeline/feature-extraction");
+                when.method(POST)
+                    .path("/models/some-model/pipeline/feature-extraction");
                 then.status(200).body("not json");
             })
             .await;
 
         let provider = HuggingFaceProvider::new(server.base_url());
-        let result = provider.embed_batch("test-key", "some-model", &["x".to_string()]).await;
+        let result = provider
+            .embed_batch("test-key", "some-model", &["x".to_string()])
+            .await;
 
         assert!(result.is_err());
     }
@@ -159,15 +173,25 @@ mod tests {
         let server = MockServer::start_async().await;
         server
             .mock_async(|when, then| {
-                when.method(POST).path("/models/some-model/pipeline/feature-extraction");
+                when.method(POST)
+                    .path("/models/some-model/pipeline/feature-extraction");
                 then.status(200).json_body(json!([[1.0]]));
             })
             .await;
 
         let provider = HuggingFaceProvider::new(server.base_url());
-        let result = provider.embed_batch("test-key", "some-model", &["a".to_string(), "b".to_string()]).await;
+        let result = provider
+            .embed_batch(
+                "test-key",
+                "some-model",
+                &["a".to_string(), "b".to_string()],
+            )
+            .await;
 
-        assert!(result.is_err(), "a count mismatch must be a hard error, same discipline as the other three adapters");
+        assert!(
+            result.is_err(),
+            "a count mismatch must be a hard error, same discipline as the other three adapters"
+        );
     }
 
     #[tokio::test]
@@ -180,10 +204,12 @@ mod tests {
                     .path("/models/some-model/pipeline/feature-extraction")
                     .matches(|req| {
                         let body: serde_json::Value =
-                            serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
+                            serde_json::from_slice(req.body.as_deref().unwrap_or_default())
+                                .unwrap();
                         body["inputs"].as_array().map(|a| a.len()) == Some(100)
                     });
-                then.status(200).json_body_obj(&json!((0..100).map(|i| vec![i as f64]).collect::<Vec<_>>()));
+                then.status(200)
+                    .json_body_obj(&json!((0..100).map(|i| vec![i as f64]).collect::<Vec<_>>()));
             })
             .await;
         let second_chunk = server
@@ -192,17 +218,22 @@ mod tests {
                     .path("/models/some-model/pipeline/feature-extraction")
                     .matches(|req| {
                         let body: serde_json::Value =
-                            serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
+                            serde_json::from_slice(req.body.as_deref().unwrap_or_default())
+                                .unwrap();
                         body["inputs"].as_array().map(|a| a.len()) == Some(50)
                     });
-                then.status(200)
-                    .json_body_obj(&json!((0..50).map(|i| vec![1000.0 + i as f64]).collect::<Vec<_>>()));
+                then.status(200).json_body_obj(&json!((0..50)
+                    .map(|i| vec![1000.0 + i as f64])
+                    .collect::<Vec<_>>()));
             })
             .await;
 
         let texts: Vec<String> = (0..150).map(|i| format!("text-{i}")).collect();
         let provider = HuggingFaceProvider::new(server.base_url());
-        let (vectors, _usage) = provider.embed_batch("test-key", "some-model", &texts).await.unwrap();
+        let (vectors, _usage) = provider
+            .embed_batch("test-key", "some-model", &texts)
+            .await
+            .unwrap();
 
         first_chunk.assert_async().await;
         second_chunk.assert_async().await;
@@ -218,15 +249,22 @@ mod tests {
         let server = MockServer::start_async().await;
         let mock = server
             .mock_async(|when, then| {
-                when.method(POST).path("/models/some-model/pipeline/feature-extraction");
-                then.status(503).json_body(json!({ "error": "Model is overloaded" }));
+                when.method(POST)
+                    .path("/models/some-model/pipeline/feature-extraction");
+                then.status(503)
+                    .json_body(json!({ "error": "Model is overloaded" }));
             })
             .await;
 
         let provider = HuggingFaceProvider::new(server.base_url());
-        let result = provider.embed_batch("test-key", "some-model", &["x".to_string()]).await;
+        let result = provider
+            .embed_batch("test-key", "some-model", &["x".to_string()])
+            .await;
 
-        assert!(result.is_err(), "must still fail once retries are exhausted, not hang or silently succeed");
+        assert!(
+            result.is_err(),
+            "must still fail once retries are exhausted, not hang or silently succeed"
+        );
         assert_eq!(mock.hits_async().await, (MAX_RETRIES + 1) as usize);
     }
 
@@ -235,15 +273,23 @@ mod tests {
         let server = MockServer::start_async().await;
         let mock = server
             .mock_async(|when, then| {
-                when.method(POST).path("/models/some-model/pipeline/feature-extraction");
-                then.status(401).json_body(json!({ "error": "Invalid token" }));
+                when.method(POST)
+                    .path("/models/some-model/pipeline/feature-extraction");
+                then.status(401)
+                    .json_body(json!({ "error": "Invalid token" }));
             })
             .await;
 
         let provider = HuggingFaceProvider::new(server.base_url());
-        let result = provider.embed_batch("bad-key", "some-model", &["x".to_string()]).await;
+        let result = provider
+            .embed_batch("bad-key", "some-model", &["x".to_string()])
+            .await;
 
         assert!(result.is_err());
-        assert_eq!(mock.hits_async().await, 1, "a 401 will never succeed on retry");
+        assert_eq!(
+            mock.hits_async().await,
+            1,
+            "a 401 will never succeed on retry"
+        );
     }
 }

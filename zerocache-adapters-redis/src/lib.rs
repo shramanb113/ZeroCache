@@ -41,8 +41,10 @@ impl RedisStore {
 // are reused across many calls, and re-applying the same value each time is
 // a cheap setsockopt, not a real cost.
 fn apply_socket_timeouts(conn: &r2d2::PooledConnection<redis::Client>) -> Result<(), StoreError> {
-    conn.set_read_timeout(Some(STORE_TIMEOUT)).map_err(|e| StoreError(e.to_string()))?;
-    conn.set_write_timeout(Some(STORE_TIMEOUT)).map_err(|e| StoreError(e.to_string()))?;
+    conn.set_read_timeout(Some(STORE_TIMEOUT))
+        .map_err(|e| StoreError(e.to_string()))?;
+    conn.set_write_timeout(Some(STORE_TIMEOUT))
+        .map_err(|e| StoreError(e.to_string()))?;
     Ok(())
 }
 
@@ -77,7 +79,8 @@ impl EmbeddingStore for RedisStore {
     fn delete(&self, key: &CacheKey) -> Result<(), StoreError> {
         let mut conn = self.pool.get().map_err(|e| StoreError(e.to_string()))?;
         apply_socket_timeouts(&conn)?;
-        conn.del::<_, ()>(redis_key(key)).map_err(|e| StoreError(e.to_string()))?;
+        conn.del::<_, ()>(redis_key(key))
+            .map_err(|e| StoreError(e.to_string()))?;
         Ok(())
     }
 }
@@ -118,9 +121,15 @@ mod live_redis_tests {
     use super::*;
 
     fn start_redis() -> (Container<Redis>, String) {
-        let container = Redis::default().start().expect("failed to start Redis testcontainer -- is Docker running?");
-        let host = container.get_host().expect("failed to get testcontainer host");
-        let port = container.get_host_port_ipv4(REDIS_PORT).expect("failed to get testcontainer port");
+        let container = Redis::default()
+            .start()
+            .expect("failed to start Redis testcontainer -- is Docker running?");
+        let host = container
+            .get_host()
+            .expect("failed to get testcontainer host");
+        let port = container
+            .get_host_port_ipv4(REDIS_PORT)
+            .expect("failed to get testcontainer port");
         (container, format!("redis://{host}:{port}"))
     }
 
@@ -141,7 +150,14 @@ mod live_redis_tests {
     fn delete_removes_an_entry_from_a_real_redis() {
         let (_container, url) = start_redis();
         let store = RedisStore::connect(&url, None).unwrap();
-        let key = CacheKey::derive([1u8; 32], "openai", "test-scope", "m", "v1", "to be deleted");
+        let key = CacheKey::derive(
+            [1u8; 32],
+            "openai",
+            "test-scope",
+            "m",
+            "v1",
+            "to be deleted",
+        );
 
         store.put(key, vec![1.0]).unwrap();
         assert_eq!(store.get(&key).unwrap(), Some(vec![1.0]));
@@ -155,7 +171,14 @@ mod live_redis_tests {
     fn delete_on_a_missing_key_is_not_an_error_on_a_real_redis() {
         let (_container, url) = start_redis();
         let store = RedisStore::connect(&url, None).unwrap();
-        let key = CacheKey::derive([1u8; 32], "openai", "test-scope", "m", "v1", "never existed");
+        let key = CacheKey::derive(
+            [1u8; 32],
+            "openai",
+            "test-scope",
+            "m",
+            "v1",
+            "never existed",
+        );
 
         assert!(store.delete(&key).is_ok());
     }
@@ -170,11 +193,22 @@ mod live_redis_tests {
         // handling). Use the smallest real TTL Redis accepts and sleep past
         // it, rather than exercising that unrelated edge case here.
         let store = RedisStore::connect(&url, Some(Duration::from_secs(1))).unwrap();
-        let key = CacheKey::derive([1u8; 32], "openai", "test-scope", "m", "v1", "expires almost immediately");
+        let key = CacheKey::derive(
+            [1u8; 32],
+            "openai",
+            "test-scope",
+            "m",
+            "v1",
+            "expires almost immediately",
+        );
 
         store.put(key, vec![1.0]).unwrap();
         std::thread::sleep(Duration::from_millis(1500));
-        assert_eq!(store.get(&key).unwrap(), None, "an entry past its Redis-native TTL must read as a miss");
+        assert_eq!(
+            store.get(&key).unwrap(),
+            None,
+            "an entry past its Redis-native TTL must read as a miss"
+        );
     }
 
     #[test]
@@ -182,10 +216,21 @@ mod live_redis_tests {
     fn entry_within_its_ttl_still_reads_as_a_hit_on_a_real_redis() {
         let (_container, url) = start_redis();
         let store = RedisStore::connect(&url, Some(Duration::from_secs(3600))).unwrap();
-        let key = CacheKey::derive([1u8; 32], "openai", "test-scope", "m", "v1", "expires in an hour");
+        let key = CacheKey::derive(
+            [1u8; 32],
+            "openai",
+            "test-scope",
+            "m",
+            "v1",
+            "expires in an hour",
+        );
 
         store.put(key, vec![1.0]).unwrap();
-        assert_eq!(store.get(&key).unwrap(), Some(vec![1.0]), "an entry well within its TTL must still hit");
+        assert_eq!(
+            store.get(&key).unwrap(),
+            Some(vec![1.0]),
+            "an entry well within its TTL must still hit"
+        );
     }
 
     #[test]
@@ -193,11 +238,22 @@ mod live_redis_tests {
     fn no_ttl_configured_means_entries_never_expire_on_a_real_redis() {
         let (_container, url) = start_redis();
         let store = RedisStore::connect(&url, None).unwrap();
-        let key = CacheKey::derive([1u8; 32], "openai", "test-scope", "m", "v1", "lives forever");
+        let key = CacheKey::derive(
+            [1u8; 32],
+            "openai",
+            "test-scope",
+            "m",
+            "v1",
+            "lives forever",
+        );
 
         store.put(key, vec![1.0]).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(store.get(&key).unwrap(), Some(vec![1.0]), "with no TTL configured, an entry must never expire");
+        assert_eq!(
+            store.get(&key).unwrap(),
+            Some(vec![1.0]),
+            "with no TTL configured, an entry must never expire"
+        );
     }
 
     #[test]
@@ -211,7 +267,14 @@ mod live_redis_tests {
         let store = RedisStore::connect(&url, None).unwrap();
 
         for i in 0..20 {
-            let key = CacheKey::derive([1u8; 32], "openai", "test-scope", "m", "v1", &format!("fast op {i}"));
+            let key = CacheKey::derive(
+                [1u8; 32],
+                "openai",
+                "test-scope",
+                "m",
+                "v1",
+                &format!("fast op {i}"),
+            );
             store.put(key, vec![i as f32]).unwrap();
             assert_eq!(store.get(&key).unwrap(), Some(vec![i as f32]));
         }

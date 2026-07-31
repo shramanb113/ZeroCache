@@ -77,7 +77,8 @@ mod tests {
 
     #[test]
     fn input_accepts_a_json_array_of_strings() {
-        let req: EmbeddingsRequest = serde_json::from_str(r#"{"model":"m","input":["a","b"]}"#).unwrap();
+        let req: EmbeddingsRequest =
+            serde_json::from_str(r#"{"model":"m","input":["a","b"]}"#).unwrap();
         assert_eq!(req.input, vec!["a".to_string(), "b".to_string()]);
     }
 
@@ -85,13 +86,18 @@ mod tests {
     fn input_accepts_a_bare_json_string_as_a_single_element_vec() {
         // What embedQuery() (a single-text call) actually sends -- confirmed
         // against @langchain/openai's embeddings.js during battle-testing.
-        let req: EmbeddingsRequest = serde_json::from_str(r#"{"model":"m","input":"just one string"}"#).unwrap();
+        let req: EmbeddingsRequest =
+            serde_json::from_str(r#"{"model":"m","input":"just one string"}"#).unwrap();
         assert_eq!(req.input, vec!["just one string".to_string()]);
     }
 
     #[test]
     fn input_rejects_a_non_string_array_element() {
-        let result: Result<EmbeddingsRequest, _> = serde_json::from_str(r#"{"model":"m","input":[1,2,3]}"#);
-        assert!(result.is_err(), "an array of numbers must still be rejected, not silently coerced");
+        let result: Result<EmbeddingsRequest, _> =
+            serde_json::from_str(r#"{"model":"m","input":[1,2,3]}"#);
+        assert!(
+            result.is_err(),
+            "an array of numbers must still be rejected, not silently coerced"
+        );
     }
 }

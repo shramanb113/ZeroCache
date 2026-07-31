@@ -89,7 +89,10 @@ impl EmbeddingProvider for OpenAiProvider {
 
         for (chunk_index, chunk) in texts.chunks(MAX_BATCH_SIZE).enumerate() {
             let base_index = chunk_index * MAX_BATCH_SIZE;
-            let body = EmbeddingsRequest { model, input: chunk };
+            let body = EmbeddingsRequest {
+                model,
+                input: chunk,
+            };
 
             let response = self
                 .client
@@ -112,7 +115,10 @@ impl EmbeddingProvider for OpenAiProvider {
             total_tokens += response.usage.total_tokens;
         }
 
-        let usage = ProviderUsage { prompt_tokens, total_tokens };
+        let usage = ProviderUsage {
+            prompt_tokens,
+            total_tokens,
+        };
         Ok((ordered, usage))
     }
 
@@ -157,7 +163,11 @@ mod tests {
 
         let provider = OpenAiProvider::new(server.base_url());
         let (vectors, usage) = provider
-            .embed_batch("test-key", "text-embedding-3-small", &["a".to_string(), "b".to_string()])
+            .embed_batch(
+                "test-key",
+                "text-embedding-3-small",
+                &["a".to_string(), "b".to_string()],
+            )
             .await
             .unwrap();
 
@@ -173,12 +183,15 @@ mod tests {
         server
             .mock_async(|when, then| {
                 when.method(POST).path("/v1/embeddings");
-                then.status(401).json_body(json!({ "error": "invalid api key" }));
+                then.status(401)
+                    .json_body(json!({ "error": "invalid api key" }));
             })
             .await;
 
         let provider = OpenAiProvider::new(server.base_url());
-        let result = provider.embed_batch("bad-key", "m", &["x".to_string()]).await;
+        let result = provider
+            .embed_batch("bad-key", "m", &["x".to_string()])
+            .await;
 
         assert!(result.is_err());
     }
@@ -194,7 +207,9 @@ mod tests {
             .await;
 
         let provider = OpenAiProvider::new(server.base_url());
-        let result = provider.embed_batch("test-key", "m", &["x".to_string()]).await;
+        let result = provider
+            .embed_batch("test-key", "m", &["x".to_string()])
+            .await;
 
         assert!(result.is_err());
     }
@@ -269,9 +284,14 @@ mod tests {
             .await;
 
         let provider = OpenAiProvider::new(server.base_url());
-        let result = provider.embed_batch("test-key", "m", &["x".to_string()]).await;
+        let result = provider
+            .embed_batch("test-key", "m", &["x".to_string()])
+            .await;
 
-        assert!(result.is_err(), "must still fail once retries are exhausted, not hang or silently succeed");
+        assert!(
+            result.is_err(),
+            "must still fail once retries are exhausted, not hang or silently succeed"
+        );
         assert_eq!(
             mock.hits_async().await,
             (MAX_RETRIES + 1) as usize,
@@ -285,12 +305,15 @@ mod tests {
         let mock = server
             .mock_async(|when, then| {
                 when.method(POST).path("/v1/embeddings");
-                then.status(401).json_body(json!({ "error": "invalid api key" }));
+                then.status(401)
+                    .json_body(json!({ "error": "invalid api key" }));
             })
             .await;
 
         let provider = OpenAiProvider::new(server.base_url());
-        let result = provider.embed_batch("bad-key", "m", &["x".to_string()]).await;
+        let result = provider
+            .embed_batch("bad-key", "m", &["x".to_string()])
+            .await;
 
         assert!(result.is_err());
         assert_eq!(
@@ -304,7 +327,10 @@ mod tests {
     fn cache_scope_is_the_configured_base_url_so_repointing_invalidates_the_cache() {
         let a = OpenAiProvider::new("https://api.openai.com");
         let b = OpenAiProvider::new("http://localhost:8000");
-        assert_eq!(a.cache_scope("text-embedding-3-small").unwrap(), "https://api.openai.com");
+        assert_eq!(
+            a.cache_scope("text-embedding-3-small").unwrap(),
+            "https://api.openai.com"
+        );
         assert_ne!(
             a.cache_scope("text-embedding-3-small").unwrap(),
             b.cache_scope("text-embedding-3-small").unwrap(),

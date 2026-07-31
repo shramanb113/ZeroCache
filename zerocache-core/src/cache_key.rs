@@ -79,15 +79,43 @@ mod tests {
 
     #[test]
     fn same_inputs_produce_same_key() {
-        let a = CacheKey::derive(OWNER_A, "openai", SCOPE_A, "gpt-4-embed", "v1", "hello world");
-        let b = CacheKey::derive(OWNER_A, "openai", SCOPE_A, "gpt-4-embed", "v1", "hello world");
+        let a = CacheKey::derive(
+            OWNER_A,
+            "openai",
+            SCOPE_A,
+            "gpt-4-embed",
+            "v1",
+            "hello world",
+        );
+        let b = CacheKey::derive(
+            OWNER_A,
+            "openai",
+            SCOPE_A,
+            "gpt-4-embed",
+            "v1",
+            "hello world",
+        );
         assert_eq!(a, b);
     }
 
     #[test]
     fn different_model_version_produces_different_key() {
-        let a = CacheKey::derive(OWNER_A, "openai", SCOPE_A, "gpt-4-embed", "v1", "hello world");
-        let b = CacheKey::derive(OWNER_A, "openai", SCOPE_A, "gpt-4-embed", "v2", "hello world");
+        let a = CacheKey::derive(
+            OWNER_A,
+            "openai",
+            SCOPE_A,
+            "gpt-4-embed",
+            "v1",
+            "hello world",
+        );
+        let b = CacheKey::derive(
+            OWNER_A,
+            "openai",
+            SCOPE_A,
+            "gpt-4-embed",
+            "v2",
+            "hello world",
+        );
         assert_ne!(a, b);
     }
 
@@ -109,7 +137,10 @@ mod tests {
     fn different_provider_produces_different_key() {
         let a = CacheKey::derive(OWNER_A, "openai", SCOPE_A, "embed-v1", "v1", "same text");
         let b = CacheKey::derive(OWNER_A, "mistral", SCOPE_A, "embed-v1", "v1", "same text");
-        assert_ne!(a, b, "two providers with an identically-named model must never collide");
+        assert_ne!(
+            a, b,
+            "two providers with an identically-named model must never collide"
+        );
     }
 
     #[test]
@@ -118,22 +149,58 @@ mod tests {
         // a self-hosted endpoint, or a caller naming a different region /
         // project / deployment, must get a cold miss rather than a vector
         // computed by some other set of weights.
-        let a = CacheKey::derive(OWNER_A, "openai", SCOPE_A, "text-embedding-3-small", "v1", "same text");
-        let b = CacheKey::derive(OWNER_A, "openai", SCOPE_B, "text-embedding-3-small", "v1", "same text");
-        assert_ne!(a, b, "two different upstream endpoints must never share a cache entry");
+        let a = CacheKey::derive(
+            OWNER_A,
+            "openai",
+            SCOPE_A,
+            "text-embedding-3-small",
+            "v1",
+            "same text",
+        );
+        let b = CacheKey::derive(
+            OWNER_A,
+            "openai",
+            SCOPE_B,
+            "text-embedding-3-small",
+            "v1",
+            "same text",
+        );
+        assert_ne!(
+            a, b,
+            "two different upstream endpoints must never share a cache entry"
+        );
     }
 
     #[test]
     fn cache_scope_field_boundary_is_not_ambiguous() {
         let a = CacheKey::derive(OWNER_A, "openai", "a", "bc", "v1", "x");
         let b = CacheKey::derive(OWNER_A, "openai", "ab", "c", "v1", "x");
-        assert_ne!(a, b, "the scope/model boundary must be unambiguous, like every other field pair");
+        assert_ne!(
+            a, b,
+            "the scope/model boundary must be unambiguous, like every other field pair"
+        );
     }
 
     #[test]
     fn derive_image_same_inputs_produce_same_key() {
-        let a = CacheKey::derive_image(OWNER_A, "gemini", SCOPE_A, "gemini-embedding-2", "v1", "image/png", "YmFzZTY0");
-        let b = CacheKey::derive_image(OWNER_A, "gemini", SCOPE_A, "gemini-embedding-2", "v1", "image/png", "YmFzZTY0");
+        let a = CacheKey::derive_image(
+            OWNER_A,
+            "gemini",
+            SCOPE_A,
+            "gemini-embedding-2",
+            "v1",
+            "image/png",
+            "YmFzZTY0",
+        );
+        let b = CacheKey::derive_image(
+            OWNER_A,
+            "gemini",
+            SCOPE_A,
+            "gemini-embedding-2",
+            "v1",
+            "image/png",
+            "YmFzZTY0",
+        );
         assert_eq!(a, b);
     }
 
@@ -143,22 +210,75 @@ mod tests {
         // the literal text of an unrelated cache entry -- the "image\0"
         // domain-separation byte inside derive_image must make this
         // impossible even if every other field lines up exactly.
-        let text_key = CacheKey::derive(OWNER_A, "gemini", SCOPE_A, "gemini-embedding-2", "v1", "YmFzZTY0");
-        let image_key = CacheKey::derive_image(OWNER_A, "gemini", SCOPE_A, "gemini-embedding-2", "v1", "image/png", "YmFzZTY0");
+        let text_key = CacheKey::derive(
+            OWNER_A,
+            "gemini",
+            SCOPE_A,
+            "gemini-embedding-2",
+            "v1",
+            "YmFzZTY0",
+        );
+        let image_key = CacheKey::derive_image(
+            OWNER_A,
+            "gemini",
+            SCOPE_A,
+            "gemini-embedding-2",
+            "v1",
+            "image/png",
+            "YmFzZTY0",
+        );
         assert_ne!(text_key, image_key);
     }
 
     #[test]
     fn derive_image_different_mime_type_produces_different_key() {
-        let a = CacheKey::derive_image(OWNER_A, "gemini", SCOPE_A, "gemini-embedding-2", "v1", "image/png", "YmFzZTY0");
-        let b = CacheKey::derive_image(OWNER_A, "gemini", SCOPE_A, "gemini-embedding-2", "v1", "image/jpeg", "YmFzZTY0");
-        assert_ne!(a, b, "the same bytes decoded under a different mime type are a different image");
+        let a = CacheKey::derive_image(
+            OWNER_A,
+            "gemini",
+            SCOPE_A,
+            "gemini-embedding-2",
+            "v1",
+            "image/png",
+            "YmFzZTY0",
+        );
+        let b = CacheKey::derive_image(
+            OWNER_A,
+            "gemini",
+            SCOPE_A,
+            "gemini-embedding-2",
+            "v1",
+            "image/jpeg",
+            "YmFzZTY0",
+        );
+        assert_ne!(
+            a, b,
+            "the same bytes decoded under a different mime type are a different image"
+        );
     }
 
     #[test]
     fn derive_image_different_cache_scope_produces_different_key() {
-        let a = CacheKey::derive_image(OWNER_A, "gemini", SCOPE_A, "gemini-embedding-2", "v1", "image/png", "YmFzZTY0");
-        let b = CacheKey::derive_image(OWNER_A, "gemini", SCOPE_B, "gemini-embedding-2", "v1", "image/png", "YmFzZTY0");
-        assert_ne!(a, b, "the image path needs the same endpoint isolation the text path gets");
+        let a = CacheKey::derive_image(
+            OWNER_A,
+            "gemini",
+            SCOPE_A,
+            "gemini-embedding-2",
+            "v1",
+            "image/png",
+            "YmFzZTY0",
+        );
+        let b = CacheKey::derive_image(
+            OWNER_A,
+            "gemini",
+            SCOPE_B,
+            "gemini-embedding-2",
+            "v1",
+            "image/png",
+            "YmFzZTY0",
+        );
+        assert_ne!(
+            a, b,
+            "the image path needs the same endpoint isolation the text path gets"
+        );
     }
 }

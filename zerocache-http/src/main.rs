@@ -16,12 +16,17 @@ use axum::{
 };
 use tower_http::trace::TraceLayer;
 
-use app::{check_store_readiness, delete_batch, embed_batch, AppError, AppState, DeleteRequest, EmbedRequest, Metrics};
-use config::{
-    Config, StorageBackend, DEFAULT_GEMINI_BASE_URL, DEFAULT_HUGGINGFACE_BASE_URL, DEFAULT_MISTRAL_BASE_URL,
-    DEFAULT_OPENAI_BASE_URL,
+use app::{
+    check_store_readiness, delete_batch, embed_batch, AppError, AppState, DeleteRequest,
+    EmbedRequest, Metrics,
 };
-use wire::{DeleteResponse, EmbeddingObject, EmbeddingsRequest, EmbeddingsResponse, ErrorResponse, Usage};
+use config::{
+    Config, StorageBackend, DEFAULT_GEMINI_BASE_URL, DEFAULT_HUGGINGFACE_BASE_URL,
+    DEFAULT_MISTRAL_BASE_URL, DEFAULT_OPENAI_BASE_URL,
+};
+use wire::{
+    DeleteResponse, EmbeddingObject, EmbeddingsRequest, EmbeddingsResponse, ErrorResponse, Usage,
+};
 use zerocache_adapters_azure::new_provider as new_azure_provider;
 use zerocache_adapters_bedrock::new_provider as new_bedrock_provider;
 use zerocache_adapters_gemini::GeminiProvider;
@@ -41,27 +46,41 @@ async fn main() {
     log_overridden_base_urls(&config);
 
     let store: Arc<dyn EmbeddingStore> = match config.storage_backend {
-        StorageBackend::Sled => {
-            Arc::new(SledStore::open(&config.storage_path, config.ttl).expect("failed to open sled store"))
-        }
-        StorageBackend::Redis => {
-            Arc::new(RedisStore::connect(&config.redis_url, config.ttl).expect("failed to connect to redis"))
-        }
+        StorageBackend::Sled => Arc::new(
+            SledStore::open(&config.storage_path, config.ttl).expect("failed to open sled store"),
+        ),
+        StorageBackend::Redis => Arc::new(
+            RedisStore::connect(&config.redis_url, config.ttl).expect("failed to connect to redis"),
+        ),
     };
 
     let gemini_provider = Arc::new(GeminiProvider::new(config.gemini_base_url.clone()));
 
     let mut providers: HashMap<String, Arc<dyn EmbeddingProvider>> = HashMap::new();
-    providers.insert("openai".to_string(), Arc::new(OpenAiProvider::new(config.openai_base_url.clone())));
-    providers.insert("mistral".to_string(), Arc::new(MistralProvider::new(config.mistral_base_url.clone())));
-    providers.insert("gemini".to_string(), Arc::clone(&gemini_provider) as Arc<dyn EmbeddingProvider>);
+    providers.insert(
+        "openai".to_string(),
+        Arc::new(OpenAiProvider::new(config.openai_base_url.clone())),
+    );
+    providers.insert(
+        "mistral".to_string(),
+        Arc::new(MistralProvider::new(config.mistral_base_url.clone())),
+    );
+    providers.insert(
+        "gemini".to_string(),
+        Arc::clone(&gemini_provider) as Arc<dyn EmbeddingProvider>,
+    );
     providers.insert(
         "huggingface".to_string(),
-        Arc::new(HuggingFaceProvider::new(config.huggingface_base_url.clone())),
+        Arc::new(HuggingFaceProvider::new(
+            config.huggingface_base_url.clone(),
+        )),
     );
 
     let mut image_providers: HashMap<String, Arc<dyn ImageEmbeddingProvider>> = HashMap::new();
-    image_providers.insert("gemini".to_string(), gemini_provider as Arc<dyn ImageEmbeddingProvider>);
+    image_providers.insert(
+        "gemini".to_string(),
+        gemini_provider as Arc<dyn ImageEmbeddingProvider>,
+    );
 
     // Registered unconditionally: both are constructible from pure defaults,
     // and a missing per-request coordinate (Vertex project, Bedrock region)
@@ -165,10 +184,26 @@ async fn main() {
 /// correctness warning anymore.
 fn log_overridden_base_urls(config: &Config) {
     let overrides = [
-        ("ZEROCACHE_OPENAI_BASE_URL", &config.openai_base_url, DEFAULT_OPENAI_BASE_URL),
-        ("ZEROCACHE_MISTRAL_BASE_URL", &config.mistral_base_url, DEFAULT_MISTRAL_BASE_URL),
-        ("ZEROCACHE_GEMINI_BASE_URL", &config.gemini_base_url, DEFAULT_GEMINI_BASE_URL),
-        ("ZEROCACHE_HUGGINGFACE_BASE_URL", &config.huggingface_base_url, DEFAULT_HUGGINGFACE_BASE_URL),
+        (
+            "ZEROCACHE_OPENAI_BASE_URL",
+            &config.openai_base_url,
+            DEFAULT_OPENAI_BASE_URL,
+        ),
+        (
+            "ZEROCACHE_MISTRAL_BASE_URL",
+            &config.mistral_base_url,
+            DEFAULT_MISTRAL_BASE_URL,
+        ),
+        (
+            "ZEROCACHE_GEMINI_BASE_URL",
+            &config.gemini_base_url,
+            DEFAULT_GEMINI_BASE_URL,
+        ),
+        (
+            "ZEROCACHE_HUGGINGFACE_BASE_URL",
+            &config.huggingface_base_url,
+            DEFAULT_HUGGINGFACE_BASE_URL,
+        ),
     ];
 
     for (env_var_name, actual, default) in overrides {
@@ -211,7 +246,10 @@ async fn shutdown_signal() {
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
-    let value = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
     value.strip_prefix("Bearer ").map(|s| s.to_string())
 }
 
@@ -225,7 +263,12 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
 /// target shape, etc.) and message axum already computed correctly --
 /// only the response envelope changes.
 fn json_rejection_to_error_response(rejection: JsonRejection) -> (StatusCode, Json<ErrorResponse>) {
-    (rejection.status(), Json(ErrorResponse { error: rejection.body_text() }))
+    (
+        rejection.status(),
+        Json(ErrorResponse {
+            error: rejection.body_text(),
+        }),
+    )
 }
 
 #[tracing::instrument(skip_all, fields(provider = %provider_name))]
@@ -241,17 +284,24 @@ async fn embeddings_handler(
         (
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
-                error: "missing or malformed Authorization header (expected 'Bearer <key>')".to_string(),
+                error: "missing or malformed Authorization header (expected 'Bearer <key>')"
+                    .to_string(),
             }),
         )
     })?;
 
-    let provider = state.providers.get(&provider_name).cloned().ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse { error: format!("unknown provider '{provider_name}'") }),
-        )
-    })?;
+    let provider = state
+        .providers
+        .get(&provider_name)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("unknown provider '{provider_name}'"),
+                }),
+            )
+        })?;
 
     let owner_id = derive_owner_id(&api_key);
     let model = request.model;
@@ -273,13 +323,22 @@ async fn embeddings_handler(
             AppError::Provider(_) => StatusCode::BAD_GATEWAY,
             AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (status, Json(ErrorResponse { error: err.to_string() }))
+        (
+            status,
+            Json(ErrorResponse {
+                error: err.to_string(),
+            }),
+        )
     })?;
 
     let data = vectors
         .into_iter()
         .enumerate()
-        .map(|(index, embedding)| EmbeddingObject { object: "embedding", embedding, index })
+        .map(|(index, embedding)| EmbeddingObject {
+            object: "embedding",
+            embedding,
+            index,
+        })
         .collect();
 
     let mut response = Json(EmbeddingsResponse {
@@ -296,11 +355,19 @@ async fn embeddings_handler(
     let headers = response.headers_mut();
     headers.insert(
         "x-zerocache-hits",
-        stats.hits.to_string().parse().expect("digit string is a valid header value"),
+        stats
+            .hits
+            .to_string()
+            .parse()
+            .expect("digit string is a valid header value"),
     );
     headers.insert(
         "x-zerocache-misses",
-        stats.misses.to_string().parse().expect("digit string is a valid header value"),
+        stats
+            .misses
+            .to_string()
+            .parse()
+            .expect("digit string is a valid header value"),
     );
 
     Ok(response)
@@ -319,17 +386,24 @@ async fn delete_handler(
         (
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
-                error: "missing or malformed Authorization header (expected 'Bearer <key>')".to_string(),
+                error: "missing or malformed Authorization header (expected 'Bearer <key>')"
+                    .to_string(),
             }),
         )
     })?;
 
-    let provider = state.providers.get(&provider_name).cloned().ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse { error: format!("unknown provider '{provider_name}'") }),
-        )
-    })?;
+    let provider = state
+        .providers
+        .get(&provider_name)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("unknown provider '{provider_name}'"),
+                }),
+            )
+        })?;
 
     let owner_id = derive_owner_id(&api_key);
     let model = request.model;
@@ -348,7 +422,12 @@ async fn delete_handler(
             AppError::Provider(_) => StatusCode::BAD_GATEWAY,
             AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (status, Json(ErrorResponse { error: err.to_string() }))
+        (
+            status,
+            Json(ErrorResponse {
+                error: err.to_string(),
+            }),
+        )
     })?;
 
     Ok(Json(DeleteResponse { deleted }))
@@ -367,19 +446,24 @@ async fn image_embeddings_handler(
         (
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
-                error: "missing or malformed Authorization header (expected 'Bearer <key>')".to_string(),
+                error: "missing or malformed Authorization header (expected 'Bearer <key>')"
+                    .to_string(),
             }),
         )
     })?;
 
-    let provider = state.image_providers.get(&provider_name).cloned().ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("provider '{provider_name}' does not support image embeddings"),
-            }),
-        )
-    })?;
+    let provider = state
+        .image_providers
+        .get(&provider_name)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("provider '{provider_name}' does not support image embeddings"),
+                }),
+            )
+        })?;
 
     let owner_id = derive_owner_id(&api_key);
     let model = request.model;
@@ -407,13 +491,22 @@ async fn image_embeddings_handler(
             AppError::Provider(_) => StatusCode::BAD_GATEWAY,
             AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (status, Json(ErrorResponse { error: err.to_string() }))
+        (
+            status,
+            Json(ErrorResponse {
+                error: err.to_string(),
+            }),
+        )
     })?;
 
     let data = vectors
         .into_iter()
         .enumerate()
-        .map(|(index, embedding)| EmbeddingObject { object: "embedding", embedding, index })
+        .map(|(index, embedding)| EmbeddingObject {
+            object: "embedding",
+            embedding,
+            index,
+        })
         .collect();
 
     let mut response = Json(EmbeddingsResponse {
@@ -430,11 +523,19 @@ async fn image_embeddings_handler(
     let headers = response.headers_mut();
     headers.insert(
         "x-zerocache-hits",
-        stats.hits.to_string().parse().expect("digit string is a valid header value"),
+        stats
+            .hits
+            .to_string()
+            .parse()
+            .expect("digit string is a valid header value"),
     );
     headers.insert(
         "x-zerocache-misses",
-        stats.misses.to_string().parse().expect("digit string is a valid header value"),
+        stats
+            .misses
+            .to_string()
+            .parse()
+            .expect("digit string is a valid header value"),
     );
 
     Ok(response)
@@ -453,19 +554,24 @@ async fn delete_image_handler(
         (
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
-                error: "missing or malformed Authorization header (expected 'Bearer <key>')".to_string(),
+                error: "missing or malformed Authorization header (expected 'Bearer <key>')"
+                    .to_string(),
             }),
         )
     })?;
 
-    let provider = state.image_providers.get(&provider_name).cloned().ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("provider '{provider_name}' does not support image embeddings"),
-            }),
-        )
-    })?;
+    let provider = state
+        .image_providers
+        .get(&provider_name)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("provider '{provider_name}' does not support image embeddings"),
+                }),
+            )
+        })?;
 
     let owner_id = derive_owner_id(&api_key);
     let model = request.model;
@@ -485,20 +591,30 @@ async fn delete_image_handler(
         images: &images,
     };
 
-    let deleted = app::delete_image_batch(&state, delete_request).await.map_err(|err| {
-        let status = match &err {
-            AppError::Provider(_) => StatusCode::BAD_GATEWAY,
-            AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        (status, Json(ErrorResponse { error: err.to_string() }))
-    })?;
+    let deleted = app::delete_image_batch(&state, delete_request)
+        .await
+        .map_err(|err| {
+            let status = match &err {
+                AppError::Provider(_) => StatusCode::BAD_GATEWAY,
+                AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (
+                status,
+                Json(ErrorResponse {
+                    error: err.to_string(),
+                }),
+            )
+        })?;
 
     Ok(Json(DeleteResponse { deleted }))
 }
 
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
         state.metrics.encode(),
     )
 }

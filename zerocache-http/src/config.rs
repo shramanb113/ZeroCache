@@ -101,7 +101,8 @@ impl Config {
                 Ok("redis") => StorageBackend::Redis,
                 _ => StorageBackend::Sled,
             },
-            storage_path: std::env::var("ZEROCACHE_STORAGE_PATH").unwrap_or_else(|_| "./data".into()),
+            storage_path: std::env::var("ZEROCACHE_STORAGE_PATH")
+                .unwrap_or_else(|_| "./data".into()),
             redis_url: std::env::var("ZEROCACHE_REDIS_URL")
                 .unwrap_or_else(|_| "redis://127.0.0.1:6379".into()),
             ttl: parse_ttl_seconds(std::env::var("ZEROCACHE_TTL_SECONDS").ok().as_deref()),
@@ -118,17 +119,25 @@ impl Config {
                 DEFAULT_GEMINI_BASE_URL,
             ),
             huggingface_base_url: env_or_default(
-                std::env::var("ZEROCACHE_HUGGINGFACE_BASE_URL").ok().as_deref(),
+                std::env::var("ZEROCACHE_HUGGINGFACE_BASE_URL")
+                    .ok()
+                    .as_deref(),
                 DEFAULT_HUGGINGFACE_BASE_URL,
             ),
             azure_openai_base_url: optional_env(
-                std::env::var("ZEROCACHE_AZURE_OPENAI_BASE_URL").ok().as_deref(),
+                std::env::var("ZEROCACHE_AZURE_OPENAI_BASE_URL")
+                    .ok()
+                    .as_deref(),
             ),
             azure_foundry_base_url: optional_env(
-                std::env::var("ZEROCACHE_AZURE_FOUNDRY_BASE_URL").ok().as_deref(),
+                std::env::var("ZEROCACHE_AZURE_FOUNDRY_BASE_URL")
+                    .ok()
+                    .as_deref(),
             ),
             azure_foundry_api_version: env_or_default(
-                std::env::var("ZEROCACHE_AZURE_FOUNDRY_API_VERSION").ok().as_deref(),
+                std::env::var("ZEROCACHE_AZURE_FOUNDRY_API_VERSION")
+                    .ok()
+                    .as_deref(),
                 DEFAULT_AZURE_FOUNDRY_API_VERSION,
             ),
             azure_auth_mode: parse_azure_auth_mode(
@@ -139,7 +148,9 @@ impl Config {
                 DEFAULT_BEDROCK_REGION,
             ),
             bedrock_endpoint_template: env_or_default(
-                std::env::var("ZEROCACHE_BEDROCK_ENDPOINT_TEMPLATE").ok().as_deref(),
+                std::env::var("ZEROCACHE_BEDROCK_ENDPOINT_TEMPLATE")
+                    .ok()
+                    .as_deref(),
                 DEFAULT_BEDROCK_ENDPOINT_TEMPLATE,
             ),
             vertex_project: optional_env(std::env::var("ZEROCACHE_VERTEX_PROJECT").ok().as_deref()),
@@ -148,7 +159,9 @@ impl Config {
                 DEFAULT_VERTEX_LOCATION,
             ),
             vertex_endpoint_template: env_or_default(
-                std::env::var("ZEROCACHE_VERTEX_ENDPOINT_TEMPLATE").ok().as_deref(),
+                std::env::var("ZEROCACHE_VERTEX_ENDPOINT_TEMPLATE")
+                    .ok()
+                    .as_deref(),
                 DEFAULT_VERTEX_ENDPOINT_TEMPLATE,
             ),
         }
@@ -219,7 +232,10 @@ mod tests {
 
     #[test]
     fn openai_base_url_defaults_to_real_endpoint_when_unset() {
-        assert_eq!(env_or_default(None, DEFAULT_OPENAI_BASE_URL), DEFAULT_OPENAI_BASE_URL);
+        assert_eq!(
+            env_or_default(None, DEFAULT_OPENAI_BASE_URL),
+            DEFAULT_OPENAI_BASE_URL
+        );
     }
 
     #[test]
@@ -232,7 +248,10 @@ mod tests {
 
     #[test]
     fn mistral_base_url_defaults_to_real_endpoint_when_unset() {
-        assert_eq!(env_or_default(None, DEFAULT_MISTRAL_BASE_URL), DEFAULT_MISTRAL_BASE_URL);
+        assert_eq!(
+            env_or_default(None, DEFAULT_MISTRAL_BASE_URL),
+            DEFAULT_MISTRAL_BASE_URL
+        );
     }
 
     #[test]
@@ -277,7 +296,10 @@ mod tests {
 
     #[test]
     fn empty_base_url_override_is_treated_as_unset() {
-        assert_eq!(env_or_default(Some(""), DEFAULT_OPENAI_BASE_URL), DEFAULT_OPENAI_BASE_URL);
+        assert_eq!(
+            env_or_default(Some(""), DEFAULT_OPENAI_BASE_URL),
+            DEFAULT_OPENAI_BASE_URL
+        );
     }
 
     #[test]
@@ -296,7 +318,10 @@ mod tests {
 
     #[test]
     fn azure_auth_mode_api_key_is_recognized() {
-        assert_eq!(parse_azure_auth_mode(Some("api-key")), AzureAuthMode::ApiKey);
+        assert_eq!(
+            parse_azure_auth_mode(Some("api-key")),
+            AzureAuthMode::ApiKey
+        );
     }
 
     #[test]
@@ -308,13 +333,25 @@ mod tests {
 
     #[test]
     fn bedrock_region_defaults_and_can_be_overridden() {
-        assert_eq!(env_or_default(None, DEFAULT_BEDROCK_REGION), DEFAULT_BEDROCK_REGION);
-        assert_eq!(env_or_default(Some("eu-west-1"), DEFAULT_BEDROCK_REGION), "eu-west-1");
+        assert_eq!(
+            env_or_default(None, DEFAULT_BEDROCK_REGION),
+            DEFAULT_BEDROCK_REGION
+        );
+        assert_eq!(
+            env_or_default(Some("eu-west-1"), DEFAULT_BEDROCK_REGION),
+            "eu-west-1"
+        );
     }
 
     #[test]
     fn vertex_location_defaults_and_can_be_overridden() {
-        assert_eq!(env_or_default(None, DEFAULT_VERTEX_LOCATION), DEFAULT_VERTEX_LOCATION);
-        assert_eq!(env_or_default(Some("europe-west4"), DEFAULT_VERTEX_LOCATION), "europe-west4");
+        assert_eq!(
+            env_or_default(None, DEFAULT_VERTEX_LOCATION),
+            DEFAULT_VERTEX_LOCATION
+        );
+        assert_eq!(
+            env_or_default(Some("europe-west4"), DEFAULT_VERTEX_LOCATION),
+            "europe-west4"
+        );
     }
 }

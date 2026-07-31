@@ -113,7 +113,10 @@ impl TextWireStrategy for VertexPredictStrategy {
             // Vertex reports one token_count per prediction rather than a
             // request-level usage object; summing them is the closest honest
             // equivalent, and it is a real number, not a fabricated one.
-            usage: ProviderUsage { prompt_tokens: tokens, total_tokens: tokens },
+            usage: ProviderUsage {
+                prompt_tokens: tokens,
+                total_tokens: tokens,
+            },
         })
     }
 }
@@ -152,13 +155,20 @@ mod tests {
             .await;
 
         let (vectors, usage) = provider(server.base_url())
-            .embed_batch("test-token", "text-embedding-005", &["a".to_string(), "b".to_string()])
+            .embed_batch(
+                "test-token",
+                "text-embedding-005",
+                &["a".to_string(), "b".to_string()],
+            )
             .await
             .unwrap();
 
         mock.assert_async().await;
         assert_eq!(vectors, vec![vec![1.0], vec![2.0]]);
-        assert_eq!(usage.prompt_tokens, 7, "Vertex reports per-prediction token_count; it must be summed, not dropped");
+        assert_eq!(
+            usage.prompt_tokens, 7,
+            "Vertex reports per-prediction token_count; it must be summed, not dropped"
+        );
         assert_eq!(usage.total_tokens, 7);
     }
 
@@ -225,8 +235,9 @@ mod tests {
         server
             .mock_async(|when, then| {
                 when.method(POST).path(PREDICT_PATH);
-                then.status(200)
-                    .json_body(json!({ "predictions": [{ "embeddings": { "values": [1.0, 2.0] } }] }));
+                then.status(200).json_body(
+                    json!({ "predictions": [{ "embeddings": { "values": [1.0, 2.0] } }] }),
+                );
             })
             .await;
 
@@ -330,7 +341,8 @@ mod tests {
         server
             .mock_async(|when, then| {
                 when.method(POST).path(PREDICT_PATH);
-                then.status(401).json_body(json!({ "error": { "message": "invalid credentials" } }));
+                then.status(401)
+                    .json_body(json!({ "error": { "message": "invalid credentials" } }));
             })
             .await;
 
@@ -353,18 +365,29 @@ mod tests {
             .await;
 
         let result = provider(server.base_url())
-            .embed_batch("test-token", "text-embedding-005", &["a".to_string(), "b".to_string()])
+            .embed_batch(
+                "test-token",
+                "text-embedding-005",
+                &["a".to_string(), "b".to_string()],
+            )
             .await;
 
-        assert!(result.is_err(), "a count mismatch must be a hard error, not a silent misalignment");
+        assert!(
+            result.is_err(),
+            "a count mismatch must be a hard error, not a silent misalignment"
+        );
     }
 
     #[test]
     fn cache_scope_separates_projects_locations_models_and_task_types() {
         let p = provider("https://{location}-aiplatform.googleapis.com".to_string());
         let base = p.cache_scope("text-embedding-005").unwrap();
-        let other_project = p.cache_scope("us-central1/other-project/text-embedding-005").unwrap();
-        let other_location = p.cache_scope("europe-west4/my-project/text-embedding-005").unwrap();
+        let other_project = p
+            .cache_scope("us-central1/other-project/text-embedding-005")
+            .unwrap();
+        let other_location = p
+            .cache_scope("europe-west4/my-project/text-embedding-005")
+            .unwrap();
         let other_task = p.cache_scope("text-embedding-005#RETRIEVAL_QUERY").unwrap();
         let other_model = p.cache_scope("gemini-embedding-001").unwrap();
 

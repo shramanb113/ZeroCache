@@ -42,7 +42,12 @@ pub fn new_provider(
     auth_mode: AzureAuthMode,
 ) -> AzureProvider {
     CloudProvider::new(
-        AzureRouter::new(openai_base_url, foundry_base_url, foundry_api_version, auth_mode),
+        AzureRouter::new(
+            openai_base_url,
+            foundry_base_url,
+            foundry_api_version,
+            auth_mode,
+        ),
         env!("CARGO_PKG_VERSION"),
     )
 }

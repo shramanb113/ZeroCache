@@ -33,7 +33,8 @@ mod strategy;
 use zerocache_adapters_cloud::CloudProvider;
 
 pub use router::{
-    BedrockRouter, DEFAULT_BEDROCK_ENDPOINT_TEMPLATE, DEFAULT_BEDROCK_REGION, DEFAULT_COHERE_INPUT_TYPE,
+    BedrockRouter, DEFAULT_BEDROCK_ENDPOINT_TEMPLATE, DEFAULT_BEDROCK_REGION,
+    DEFAULT_COHERE_INPUT_TYPE,
 };
 
 pub type BedrockProvider = CloudProvider<BedrockRouter>;
@@ -41,7 +42,10 @@ pub type BedrockProvider = CloudProvider<BedrockRouter>;
 /// Builds the adapter zerocache-http registers under the `bedrock` path
 /// segment. `version` is this crate's own `CARGO_PKG_VERSION`, keeping
 /// cache-key versioning tied to this Cargo.toml rather than the kit's.
-pub fn new_provider(default_region: impl Into<String>, endpoint_template: impl Into<String>) -> BedrockProvider {
+pub fn new_provider(
+    default_region: impl Into<String>,
+    endpoint_template: impl Into<String>,
+) -> BedrockProvider {
     CloudProvider::new(
         BedrockRouter::new(default_region, endpoint_template),
         env!("CARGO_PKG_VERSION"),

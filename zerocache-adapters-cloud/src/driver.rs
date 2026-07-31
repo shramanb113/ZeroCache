@@ -20,7 +20,11 @@ impl<R: CloudRouter> CloudProvider<R> {
     /// versioning tracks each adapter crate's own Cargo.toml. The kit's
     /// version is folded into `cache_scope` separately.
     pub fn new(router: R, version: &'static str) -> Self {
-        Self { client: build_client(), router, version }
+        Self {
+            client: build_client(),
+            router,
+            version,
+        }
     }
 
     pub fn router(&self) -> &R {
@@ -41,7 +45,9 @@ impl<R: CloudRouter + 'static> EmbeddingProvider for CloudProvider<R> {
 
         let max_batch = strategy.max_batch();
         if max_batch == 0 {
-            return Err(ProviderError("strategy reported a max batch size of 0".to_string()));
+            return Err(ProviderError(
+                "strategy reported a max batch size of 0".to_string(),
+            ));
         }
 
         let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
@@ -88,7 +94,13 @@ impl<R: CloudRouter + 'static> EmbeddingProvider for CloudProvider<R> {
             total_tokens = total_tokens.saturating_add(outcome.usage.total_tokens);
         }
 
-        Ok((vectors, ProviderUsage { prompt_tokens, total_tokens }))
+        Ok((
+            vectors,
+            ProviderUsage {
+                prompt_tokens,
+                total_tokens,
+            },
+        ))
     }
 
     fn version(&self) -> &'static str {
@@ -97,7 +109,10 @@ impl<R: CloudRouter + 'static> EmbeddingProvider for CloudProvider<R> {
 
     fn cache_scope(&self, model: &str) -> Result<String, ProviderError> {
         let resolved = self.router.resolve(model)?;
-        Ok(format!("{}\0{}\0kit{}", resolved.endpoint_base, resolved.canonical, KIT_VERSION))
+        Ok(format!(
+            "{}\0{}\0kit{}",
+            resolved.endpoint_base, resolved.canonical, KIT_VERSION
+        ))
     }
 }
 
@@ -137,16 +152,24 @@ mod tests {
             })
         }
 
-        fn parse_response(&self, _expected: usize, body: &[u8]) -> Result<EmbedOutcome, ProviderError> {
+        fn parse_response(
+            &self,
+            _expected: usize,
+            body: &[u8],
+        ) -> Result<EmbedOutcome, ProviderError> {
             #[derive(serde::Deserialize)]
             struct Body {
                 vectors: Vec<Vec<f32>>,
                 tokens: u32,
             }
-            let parsed: Body = serde_json::from_slice(body).map_err(|e| ProviderError(e.to_string()))?;
+            let parsed: Body =
+                serde_json::from_slice(body).map_err(|e| ProviderError(e.to_string()))?;
             Ok(EmbedOutcome {
                 vectors: parsed.vectors,
-                usage: ProviderUsage { prompt_tokens: parsed.tokens, total_tokens: parsed.tokens },
+                usage: ProviderUsage {
+                    prompt_tokens: parsed.tokens,
+                    total_tokens: parsed.tokens,
+                },
             })
         }
     }
@@ -169,14 +192,20 @@ mod tests {
             })
         }
 
-        fn strategy_for(&self, _resolved: &ResolvedModel) -> Result<&dyn TextWireStrategy, ProviderError> {
+        fn strategy_for(
+            &self,
+            _resolved: &ResolvedModel,
+        ) -> Result<&dyn TextWireStrategy, ProviderError> {
             Ok(&self.strategy)
         }
     }
 
     fn provider(base: String, max_batch: usize) -> CloudProvider<FakeRouter> {
         CloudProvider::new(
-            FakeRouter { endpoint_base: base, strategy: FakeStrategy { max_batch } },
+            FakeRouter {
+                endpoint_base: base,
+                strategy: FakeStrategy { max_batch },
+            },
             "test-v1",
         )
     }
@@ -186,15 +215,21 @@ mod tests {
         let server = MockServer::start_async().await;
         let first = server
             .mock_async(|when, then| {
-                when.method(POST).path("/fake/m").json_body(serde_json::json!({ "n": 3 }));
-                then.status(200)
-                    .json_body(serde_json::json!({ "vectors": [[1.0], [2.0], [3.0]], "tokens": 10 }));
+                when.method(POST)
+                    .path("/fake/m")
+                    .json_body(serde_json::json!({ "n": 3 }));
+                then.status(200).json_body(
+                    serde_json::json!({ "vectors": [[1.0], [2.0], [3.0]], "tokens": 10 }),
+                );
             })
             .await;
         let second = server
             .mock_async(|when, then| {
-                when.method(POST).path("/fake/m").json_body(serde_json::json!({ "n": 2 }));
-                then.status(200).json_body(serde_json::json!({ "vectors": [[4.0], [5.0]], "tokens": 7 }));
+                when.method(POST)
+                    .path("/fake/m")
+                    .json_body(serde_json::json!({ "n": 2 }));
+                then.status(200)
+                    .json_body(serde_json::json!({ "vectors": [[4.0], [5.0]], "tokens": 7 }));
             })
             .await;
 
@@ -206,8 +241,14 @@ mod tests {
 
         first.assert_async().await;
         second.assert_async().await;
-        assert_eq!(vectors, vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0], vec![5.0]]);
-        assert_eq!(usage.prompt_tokens, 17, "usage must accumulate across chunks, not report only the last");
+        assert_eq!(
+            vectors,
+            vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0], vec![5.0]]
+        );
+        assert_eq!(
+            usage.prompt_tokens, 17,
+            "usage must accumulate across chunks, not report only the last"
+        );
         assert_eq!(usage.total_tokens, 17);
     }
 
@@ -219,8 +260,11 @@ mod tests {
         let server = MockServer::start_async().await;
         let mock = server
             .mock_async(|when, then| {
-                when.method(POST).path("/fake/m").json_body(serde_json::json!({ "n": 1 }));
-                then.status(200).json_body(serde_json::json!({ "vectors": [[9.0]], "tokens": 2 }));
+                when.method(POST)
+                    .path("/fake/m")
+                    .json_body(serde_json::json!({ "n": 1 }));
+                then.status(200)
+                    .json_body(serde_json::json!({ "vectors": [[9.0]], "tokens": 2 }));
             })
             .await;
 
@@ -241,14 +285,20 @@ mod tests {
         server
             .mock_async(|when, then| {
                 when.method(POST).path("/fake/m");
-                then.status(200).json_body(serde_json::json!({ "vectors": [[1.0]], "tokens": 1 }));
+                then.status(200)
+                    .json_body(serde_json::json!({ "vectors": [[1.0]], "tokens": 1 }));
             })
             .await;
 
         let texts = vec!["a".to_string(), "b".to_string()];
-        let result = provider(server.base_url(), 10).embed_batch("key", "m", &texts).await;
+        let result = provider(server.base_url(), 10)
+            .embed_batch("key", "m", &texts)
+            .await;
 
-        assert!(result.is_err(), "a short response must fail loudly, never silently misalign vectors with inputs");
+        assert!(
+            result.is_err(),
+            "a short response must fail loudly, never silently misalign vectors with inputs"
+        );
     }
 
     #[tokio::test]
@@ -260,7 +310,8 @@ mod tests {
                     .path("/fake/m")
                     .header("Authorization", "Bearer secret")
                     .header("Content-Type", "application/json");
-                then.status(200).json_body(serde_json::json!({ "vectors": [[1.0]], "tokens": 1 }));
+                then.status(200)
+                    .json_body(serde_json::json!({ "vectors": [[1.0]], "tokens": 1 }));
             })
             .await;
 
@@ -286,7 +337,10 @@ mod tests {
             .embed_batch("key", "m", &["a".to_string()])
             .await;
 
-        assert!(result.is_err(), "must still fail once retries are exhausted, not hang or silently succeed");
+        assert!(
+            result.is_err(),
+            "must still fail once retries are exhausted, not hang or silently succeed"
+        );
         assert_eq!(
             mock.hits_async().await,
             (MAX_RETRIES + 1) as usize,
@@ -326,10 +380,16 @@ mod tests {
             })
             .await;
 
-        let result = provider(server.base_url(), 10).embed_batch("key", "", &["a".to_string()]).await;
+        let result = provider(server.base_url(), 10)
+            .embed_batch("key", "", &["a".to_string()])
+            .await;
 
         assert!(result.is_err());
-        assert_eq!(mock.hits_async().await, 0, "an unresolvable model must not reach the network");
+        assert_eq!(
+            mock.hits_async().await,
+            0,
+            "an unresolvable model must not reach the network"
+        );
     }
 
     #[test]
@@ -338,7 +398,10 @@ mod tests {
         let a = p.cache_scope("model-a").unwrap();
         let b = p.cache_scope("model-b").unwrap();
         assert_ne!(a, b);
-        assert!(a.contains(KIT_VERSION), "a kit behavior change must invalidate cloud cache entries");
+        assert!(
+            a.contains(KIT_VERSION),
+            "a kit behavior change must invalidate cloud cache entries"
+        );
         assert!(a.contains("https://example.invalid"));
     }
 

@@ -10,8 +10,11 @@ use prometheus::{Encoder, IntCounterVec, Opts, Registry, TextEncoder};
 use tracing::Instrument;
 
 use zerocache_core::{normalize_text, reconcile, CacheKey};
-use zerocache_ports::{EmbeddingProvider, EmbeddingStore, ImageEmbeddingProvider, ProviderError, ProviderUsage, StoreError};
 use zerocache_ports::ImageInput;
+use zerocache_ports::{
+    EmbeddingProvider, EmbeddingStore, ImageEmbeddingProvider, ProviderError, ProviderUsage,
+    StoreError,
+};
 
 /// What a coalesced fetch resolves to: every claimed key's vector plus the
 /// usage from the one real provider call that produced them. `Arc`-wrapped
@@ -142,12 +145,21 @@ impl Metrics {
             .register(Box::new(prompt_tokens_billed.clone()))
             .expect("registering a metric once on a fresh registry cannot fail");
 
-        Self { registry, hits, misses, prompt_tokens_billed }
+        Self {
+            registry,
+            hits,
+            misses,
+            prompt_tokens_billed,
+        }
     }
 
     fn record(&self, provider: &str, content_type: &str, stats: &BatchStats) {
-        self.hits.with_label_values(&[provider, content_type]).inc_by(stats.hits as u64);
-        self.misses.with_label_values(&[provider, content_type]).inc_by(stats.misses as u64);
+        self.hits
+            .with_label_values(&[provider, content_type])
+            .inc_by(stats.hits as u64);
+        self.misses
+            .with_label_values(&[provider, content_type])
+            .inc_by(stats.misses as u64);
         self.prompt_tokens_billed
             .with_label_values(&[provider, content_type])
             .inc_by(stats.provider_prompt_tokens as u64);
@@ -228,13 +240,23 @@ pub struct EmbedRequest<'a> {
 /// silently into an extra miss or a dropped write — the caller is expected
 /// to surface it as an error response.
 #[tracing::instrument(skip_all, fields(provider = %request.provider_name, texts = request.texts.len(), hits, misses))]
-pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<(Vec<Vec<f32>>, BatchStats), AppError> {
+pub async fn embed_batch(
+    state: &AppState,
+    request: EmbedRequest<'_>,
+) -> Result<(Vec<Vec<f32>>, BatchStats), AppError> {
     let provider_version = request.provider.version();
     // Resolved once per batch, not once per text: for a cloud adapter this
     // parses the caller's model string, which is pure but not free, and the
     // answer is identical for every text in the batch.
-    let cache_scope = request.provider.cache_scope(request.model).map_err(AppError::Provider)?;
-    let normalized_texts: Vec<String> = request.texts.iter().map(|text| normalize_text(text)).collect();
+    let cache_scope = request
+        .provider
+        .cache_scope(request.model)
+        .map_err(AppError::Provider)?;
+    let normalized_texts: Vec<String> = request
+        .texts
+        .iter()
+        .map(|text| normalize_text(text))
+        .collect();
     let keys: Vec<CacheKey> = normalized_texts
         .iter()
         .map(|text| {
@@ -252,14 +274,20 @@ pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<
     let reconciled = {
         let store = Arc::clone(&state.store);
         let keys_for_lookup = keys.clone();
-        run_store_task(move || reconcile(&keys_for_lookup, |key| store.get(key).map_err(AppError::Store)))
-            .instrument(tracing::info_span!("store_lookup"))
-            .await?
+        run_store_task(move || {
+            reconcile(&keys_for_lookup, |key| {
+                store.get(key).map_err(AppError::Store)
+            })
+        })
+        .instrument(tracing::info_span!("store_lookup"))
+        .await?
     };
 
     let hits = reconciled.hits.len();
     let misses = reconciled.misses.len();
-    tracing::Span::current().record("hits", hits).record("misses", misses);
+    tracing::Span::current()
+        .record("hits", hits)
+        .record("misses", misses);
 
     let mut results: Vec<Option<Vec<f32>>> = vec![None; request.texts.len()];
     for (index, vector) in reconciled.hits {
@@ -278,7 +306,8 @@ pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<
         let mut unique_miss_texts: Vec<String> = Vec::new();
         let mut unique_keys: Vec<CacheKey> = Vec::new();
         let mut key_to_unique_index: HashMap<CacheKey, usize> = HashMap::new();
-        let mut index_to_unique_index: Vec<(usize, usize)> = Vec::with_capacity(reconciled.misses.len());
+        let mut index_to_unique_index: Vec<(usize, usize)> =
+            Vec::with_capacity(reconciled.misses.len());
 
         for (index, key) in &reconciled.misses {
             let unique_index = *key_to_unique_index.entry(*key).or_insert_with(|| {
@@ -331,7 +360,12 @@ pub async fn embed_batch(state: &AppState, request: EmbedRequest<'_>) -> Result<
         .map(|v| v.expect("every index must be filled by a hit or a miss"))
         .collect();
 
-    let stats = BatchStats { hits, misses, provider_prompt_tokens, provider_total_tokens };
+    let stats = BatchStats {
+        hits,
+        misses,
+        provider_prompt_tokens,
+        provider_total_tokens,
+    };
     state.metrics.record(request.provider_name, "text", &stats);
 
     Ok((vectors, stats))
@@ -365,7 +399,10 @@ pub async fn embed_image_batch(
     request: EmbedImageRequest<'_>,
 ) -> Result<(Vec<Vec<f32>>, BatchStats), AppError> {
     let provider_version = request.provider.version();
-    let cache_scope = request.provider.cache_scope(request.model).map_err(AppError::Provider)?;
+    let cache_scope = request
+        .provider
+        .cache_scope(request.model)
+        .map_err(AppError::Provider)?;
     let keys: Vec<CacheKey> = request
         .images
         .iter()
@@ -385,14 +422,20 @@ pub async fn embed_image_batch(
     let reconciled = {
         let store = Arc::clone(&state.store);
         let keys_for_lookup = keys.clone();
-        run_store_task(move || reconcile(&keys_for_lookup, |key| store.get(key).map_err(AppError::Store)))
-            .instrument(tracing::info_span!("store_lookup"))
-            .await?
+        run_store_task(move || {
+            reconcile(&keys_for_lookup, |key| {
+                store.get(key).map_err(AppError::Store)
+            })
+        })
+        .instrument(tracing::info_span!("store_lookup"))
+        .await?
     };
 
     let hits = reconciled.hits.len();
     let misses = reconciled.misses.len();
-    tracing::Span::current().record("hits", hits).record("misses", misses);
+    tracing::Span::current()
+        .record("hits", hits)
+        .record("misses", misses);
 
     let mut results: Vec<Option<Vec<f32>>> = vec![None; request.images.len()];
     for (index, vector) in reconciled.hits {
@@ -412,7 +455,8 @@ pub async fn embed_image_batch(
         let mut unique_miss_images: Vec<ImageInput> = Vec::new();
         let mut unique_keys: Vec<CacheKey> = Vec::new();
         let mut key_to_unique_index: HashMap<CacheKey, usize> = HashMap::new();
-        let mut index_to_unique_index: Vec<(usize, usize)> = Vec::with_capacity(reconciled.misses.len());
+        let mut index_to_unique_index: Vec<(usize, usize)> =
+            Vec::with_capacity(reconciled.misses.len());
 
         for (index, key) in &reconciled.misses {
             let unique_index = *key_to_unique_index.entry(*key).or_insert_with(|| {
@@ -429,7 +473,10 @@ pub async fn embed_image_batch(
         let (vectors, usage) = request
             .provider
             .embed_image_batch(request.api_key, request.model, &unique_miss_images)
-            .instrument(tracing::info_span!("provider_call", images = unique_miss_images.len()))
+            .instrument(tracing::info_span!(
+                "provider_call",
+                images = unique_miss_images.len()
+            ))
             .await
             .map_err(AppError::Provider)?;
         provider_prompt_tokens = usage.prompt_tokens;
@@ -456,7 +503,12 @@ pub async fn embed_image_batch(
         .map(|v| v.expect("every index must be filled by a hit or a miss"))
         .collect();
 
-    let stats = BatchStats { hits, misses, provider_prompt_tokens, provider_total_tokens };
+    let stats = BatchStats {
+        hits,
+        misses,
+        provider_prompt_tokens,
+        provider_total_tokens,
+    };
     state.metrics.record(request.provider_name, "image", &stats);
 
     Ok((vectors, stats))
@@ -472,9 +524,15 @@ pub struct DeleteImageRequest<'a> {
 }
 
 #[tracing::instrument(skip_all, fields(provider = %request.provider_name, images = request.images.len()))]
-pub async fn delete_image_batch(state: &AppState, request: DeleteImageRequest<'_>) -> Result<usize, AppError> {
+pub async fn delete_image_batch(
+    state: &AppState,
+    request: DeleteImageRequest<'_>,
+) -> Result<usize, AppError> {
     let provider_version = request.provider.version();
-    let cache_scope = request.provider.cache_scope(request.model).map_err(AppError::Provider)?;
+    let cache_scope = request
+        .provider
+        .cache_scope(request.model)
+        .map_err(AppError::Provider)?;
     let keys: Vec<CacheKey> = request
         .images
         .iter()
@@ -567,7 +625,9 @@ async fn fetch_coalesced(
             let claim_count = claim_keys.len();
             let fut: Pin<Box<dyn Future<Output = SharedFetchOutput> + Send>> = Box::pin(
                 async move {
-                    let (vectors, usage) = provider.embed_batch(&api_key, &model, &claim_texts_for_future).await?;
+                    let (vectors, usage) = provider
+                        .embed_batch(&api_key, &model, &claim_texts_for_future)
+                        .await?;
                     let by_key = claim_keys_for_future.into_iter().zip(vectors).collect();
                     Ok((Arc::new(by_key), usage))
                 }
@@ -632,7 +692,10 @@ pub struct DeleteRequest<'a> {
 #[tracing::instrument(skip_all, fields(provider = %request.provider_name, texts = request.texts.len()))]
 pub async fn delete_batch(state: &AppState, request: DeleteRequest<'_>) -> Result<usize, AppError> {
     let provider_version = request.provider.version();
-    let cache_scope = request.provider.cache_scope(request.model).map_err(AppError::Provider)?;
+    let cache_scope = request
+        .provider
+        .cache_scope(request.model)
+        .map_err(AppError::Provider)?;
     let keys: Vec<CacheKey> = request
         .texts
         .iter()
@@ -703,11 +766,15 @@ mod tests {
 
     impl MockStore {
         fn empty() -> Self {
-            Self { data: Mutex::new(StdHashMap::new()) }
+            Self {
+                data: Mutex::new(StdHashMap::new()),
+            }
         }
 
         fn with(entries: Vec<(CacheKey, Vec<f32>)>) -> Self {
-            Self { data: Mutex::new(entries.into_iter().collect()) }
+            Self {
+                data: Mutex::new(entries.into_iter().collect()),
+            }
         }
     }
 
@@ -755,8 +822,18 @@ mod tests {
             _model: &str,
             texts: &[String],
         ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
-            assert_eq!(texts.len(), self.response.len(), "mock provider called with unexpected batch size");
-            Ok((self.response.clone(), ProviderUsage { prompt_tokens: 10, total_tokens: 10 }))
+            assert_eq!(
+                texts.len(),
+                self.response.len(),
+                "mock provider called with unexpected batch size"
+            );
+            Ok((
+                self.response.clone(),
+                ProviderUsage {
+                    prompt_tokens: 10,
+                    total_tokens: 10,
+                },
+            ))
         }
 
         fn version(&self) -> &'static str {
@@ -819,7 +896,10 @@ mod tests {
 
     impl MockImageProvider {
         fn returning(response: Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError>) -> Self {
-            Self { response, call_count: std::sync::atomic::AtomicUsize::new(0) }
+            Self {
+                response,
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+            }
         }
     }
 
@@ -831,7 +911,8 @@ mod tests {
             _model: &str,
             images: &[ImageInput],
         ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
-            self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match &self.response {
                 Ok((vectors, usage)) => Ok((vectors[..images.len()].to_vec(), *usage)),
                 Err(e) => Err(e.clone()),
@@ -862,7 +943,14 @@ mod tests {
 
     #[tokio::test]
     async fn all_hits_skips_provider_entirely() {
-        let key = CacheKey::derive(OWNER_A, "openai", "mock-scope", "m", "mock-v1", "cached text");
+        let key = CacheKey::derive(
+            OWNER_A,
+            "openai",
+            "mock-scope",
+            "m",
+            "mock-v1",
+            "cached text",
+        );
         let state = state_with(MockStore::with(vec![(key, vec![1.0, 2.0])]));
         let provider = PanicProvider;
         let texts = vec!["cached text".to_string()];
@@ -890,7 +978,9 @@ mod tests {
     #[tokio::test]
     async fn all_misses_calls_provider_and_writes_back_to_store() {
         let state = state_with(MockStore::empty());
-        let provider = MockProvider { response: vec![vec![9.0, 9.0]] };
+        let provider = MockProvider {
+            response: vec![vec![9.0, 9.0]],
+        };
         let texts = vec!["fresh text".to_string()];
 
         let (vectors, stats) = embed_batch(
@@ -912,7 +1002,14 @@ mod tests {
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.provider_prompt_tokens, 10);
 
-        let key = CacheKey::derive(OWNER_A, "openai", "mock-scope", "m", "mock-v1", "fresh text");
+        let key = CacheKey::derive(
+            OWNER_A,
+            "openai",
+            "mock-scope",
+            "m",
+            "mock-v1",
+            "fresh text",
+        );
         assert_eq!(state.store.get(&key).unwrap(), Some(vec![9.0, 9.0]));
     }
 
@@ -920,7 +1017,9 @@ mod tests {
     async fn mixed_batch_preserves_original_order() {
         let hit_key = CacheKey::derive(OWNER_A, "openai", "mock-scope", "m", "mock-v1", "old");
         let state = state_with(MockStore::with(vec![(hit_key, vec![1.0])]));
-        let provider = MockProvider { response: vec![vec![2.0]] };
+        let provider = MockProvider {
+            response: vec![vec![2.0]],
+        };
         let texts = vec!["new".to_string(), "old".to_string()];
 
         let (vectors, stats) = embed_batch(
@@ -945,7 +1044,9 @@ mod tests {
     #[tokio::test]
     async fn different_owners_never_share_a_cache_entry() {
         let state = state_with(MockStore::empty());
-        let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockProvider { response: vec![vec![7.0]] });
+        let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockProvider {
+            response: vec![vec![7.0]],
+        });
         let texts = vec!["identical text".to_string()];
 
         let (_, stats_a) = embed_batch(
@@ -976,7 +1077,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(stats_b.misses, 1, "owner B must not hit owner A's cache entry");
+        assert_eq!(
+            stats_b.misses, 1,
+            "owner B must not hit owner A's cache entry"
+        );
     }
 
     #[tokio::test]
@@ -1026,7 +1130,9 @@ mod tests {
     #[tokio::test]
     async fn metrics_are_labeled_by_provider_and_only_recorded_on_success() {
         let state = state_with(MockStore::empty());
-        let openai_provider = MockProvider { response: vec![vec![1.0]] };
+        let openai_provider = MockProvider {
+            response: vec![vec![1.0]],
+        };
         let texts = vec!["text".to_string()];
 
         embed_batch(
@@ -1059,9 +1165,12 @@ mod tests {
         .await;
 
         let metrics_text = state.metrics.encode();
-        assert!(metrics_text.contains("zerocache_cache_misses_total{content_type=\"text\",provider=\"openai\"} 1"));
+        assert!(metrics_text
+            .contains("zerocache_cache_misses_total{content_type=\"text\",provider=\"openai\"} 1"));
         assert!(
-            !metrics_text.contains("zerocache_cache_misses_total{content_type=\"text\",provider=\"mistral\"}"),
+            !metrics_text.contains(
+                "zerocache_cache_misses_total{content_type=\"text\",provider=\"mistral\"}"
+            ),
             "a failed request must not record any metric for that provider"
         );
     }
@@ -1097,7 +1206,10 @@ mod tests {
         let state = state_with(MockStore::empty());
         let texts = vec!["same text".to_string()];
 
-        let v1 = VersionedProvider { version: "1.0.0", response: vec![vec![1.0]] };
+        let v1 = VersionedProvider {
+            version: "1.0.0",
+            response: vec![vec![1.0]],
+        };
         let (_, stats_v1) = embed_batch(
             &state,
             EmbedRequest {
@@ -1113,7 +1225,10 @@ mod tests {
         .unwrap();
         assert_eq!(stats_v1.misses, 1);
 
-        let v2 = VersionedProvider { version: "2.0.0", response: vec![vec![2.0]] };
+        let v2 = VersionedProvider {
+            version: "2.0.0",
+            response: vec![vec![2.0]],
+        };
         let (_, stats_v2) = embed_batch(
             &state,
             EmbedRequest {
@@ -1127,7 +1242,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(stats_v2.misses, 1, "a different adapter version must not hit the old version's cache entry");
+        assert_eq!(
+            stats_v2.misses, 1,
+            "a different adapter version must not hit the old version's cache entry"
+        );
     }
 
     #[tokio::test]
@@ -1144,8 +1262,13 @@ mod tests {
                 _model: &str,
                 texts: &[String],
             ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
-                self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                assert_eq!(texts.len(), 1, "duplicate texts in the batch must be deduplicated before calling the provider");
+                self.call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(
+                    texts.len(),
+                    1,
+                    "duplicate texts in the batch must be deduplicated before calling the provider"
+                );
                 Ok((vec![vec![42.0]], ProviderUsage::default()))
             }
 
@@ -1162,9 +1285,15 @@ mod tests {
         // Kept as a concrete Arc<CountingProvider>, not Arc<dyn
         // EmbeddingProvider>, so call_count is still inspectable after the
         // request -- EmbedRequest.provider gets its own coerced clone.
-        let provider = Arc::new(CountingProvider { call_count: std::sync::atomic::AtomicUsize::new(0) });
+        let provider = Arc::new(CountingProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
         // Same text three times in one batch.
-        let texts = vec!["same text".to_string(), "same text".to_string(), "same text".to_string()];
+        let texts = vec![
+            "same text".to_string(),
+            "same text".to_string(),
+            "same text".to_string(),
+        ];
 
         let (vectors, stats) = embed_batch(
             &state,
@@ -1180,13 +1309,26 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(provider.call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(vectors, vec![vec![42.0], vec![42.0], vec![42.0]], "the same vector must be broadcast to every duplicate position");
-        assert_eq!(stats.misses, 3, "hit/miss accounting still reflects all three original positions");
+        assert_eq!(
+            provider
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            vectors,
+            vec![vec![42.0], vec![42.0], vec![42.0]],
+            "the same vector must be broadcast to every duplicate position"
+        );
+        assert_eq!(
+            stats.misses, 3,
+            "hit/miss accounting still reflects all three original positions"
+        );
     }
 
     #[tokio::test]
-    async fn concurrent_identical_misses_across_separate_requests_are_coalesced_into_one_provider_call() {
+    async fn concurrent_identical_misses_across_separate_requests_are_coalesced_into_one_provider_call(
+    ) {
         // Distinct from duplicate_texts_in_one_batch_call_provider_only_once
         // above: that test dedupes duplicates *within* one batch. This one
         // proves the harder case -- request coalescing *across* separate,
@@ -1207,13 +1349,20 @@ mod tests {
                 _model: &str,
                 texts: &[String],
             ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
-                self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 // Long enough that all 5 concurrent callers below genuinely
                 // overlap in time rather than happening to run one after
                 // another -- without this, the test could pass even if
                 // coalescing were broken, just by getting lucky on timing.
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                Ok((vec![vec![99.0]; texts.len()], ProviderUsage { prompt_tokens: 7, total_tokens: 7 }))
+                Ok((
+                    vec![vec![99.0]; texts.len()],
+                    ProviderUsage {
+                        prompt_tokens: 7,
+                        total_tokens: 7,
+                    },
+                ))
             }
 
             fn version(&self) -> &'static str {
@@ -1229,7 +1378,9 @@ mod tests {
         // Concrete Arc<SlowCountingProvider>, same reasoning as
         // CountingProvider above: call_count needs to stay inspectable
         // after the requests complete.
-        let provider = Arc::new(SlowCountingProvider { call_count: std::sync::atomic::AtomicUsize::new(0) });
+        let provider = Arc::new(SlowCountingProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
         let texts = vec!["never before seen concurrent text".to_string()];
 
         let requests = (0..5).map(|_| {
@@ -1250,7 +1401,9 @@ mod tests {
 
         let mut total_prompt_tokens = 0;
         for result in &results {
-            let (vectors, stats) = result.as_ref().expect("every concurrent request must still succeed");
+            let (vectors, stats) = result
+                .as_ref()
+                .expect("every concurrent request must still succeed");
             assert_eq!(vectors, &vec![vec![99.0]], "every request must resolve to the correct vector, whether it claimed the fetch or piggybacked");
             total_prompt_tokens += stats.provider_prompt_tokens;
         }
@@ -1271,7 +1424,9 @@ mod tests {
     #[tokio::test]
     async fn whitespace_variants_of_the_same_text_share_a_cache_entry() {
         let state = state_with(MockStore::empty());
-        let provider = MockProvider { response: vec![vec![1.0]] };
+        let provider = MockProvider {
+            response: vec![vec![1.0]],
+        };
         let texts = vec!["  hello   world  ".to_string()];
 
         embed_batch(
@@ -1313,9 +1468,18 @@ mod tests {
 
     #[tokio::test]
     async fn delete_batch_removes_entries_so_a_later_request_misses_again() {
-        let key = CacheKey::derive(OWNER_A, "openai", "mock-scope", "m", "mock-v1", "to be forgotten");
-        let state = state_with(MockStore::with(vec![(key, vec![9.0]) ]));
-        let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockProvider { response: vec![vec![1.0]] });
+        let key = CacheKey::derive(
+            OWNER_A,
+            "openai",
+            "mock-scope",
+            "m",
+            "mock-v1",
+            "to be forgotten",
+        );
+        let state = state_with(MockStore::with(vec![(key, vec![9.0])]));
+        let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockProvider {
+            response: vec![vec![1.0]],
+        });
         let texts = vec!["to be forgotten".to_string()];
 
         let deleted = delete_batch(
@@ -1345,7 +1509,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(stats.hits, 0, "a deleted entry must be a miss again, not still cached");
+        assert_eq!(
+            stats.hits, 0,
+            "a deleted entry must be a miss again, not still cached"
+        );
         assert_eq!(stats.misses, 1);
     }
 
@@ -1379,18 +1546,25 @@ mod tests {
     #[tokio::test]
     async fn readiness_check_fails_when_the_store_is_unreachable() {
         let state = state_with(FailingStore);
-        assert!(matches!(check_store_readiness(&state).await, Err(AppError::Store(_))));
+        assert!(matches!(
+            check_store_readiness(&state).await,
+            Err(AppError::Store(_))
+        ));
     }
 
     #[tokio::test]
     async fn run_store_task_times_out_on_a_hung_closure() {
-        let result: Result<(), AppError> = run_store_task_with_timeout(Duration::from_millis(20), || {
-            std::thread::sleep(Duration::from_secs(5));
-            Ok(())
-        })
-        .await;
+        let result: Result<(), AppError> =
+            run_store_task_with_timeout(Duration::from_millis(20), || {
+                std::thread::sleep(Duration::from_secs(5));
+                Ok(())
+            })
+            .await;
 
-        assert!(matches!(result, Err(AppError::Store(_))), "a closure that outlives the timeout must surface as a store timeout error");
+        assert!(
+            matches!(result, Err(AppError::Store(_))),
+            "a closure that outlives the timeout must surface as a store timeout error"
+        );
     }
 
     #[tokio::test]
@@ -1409,10 +1583,19 @@ mod tests {
     #[tokio::test]
     async fn image_all_misses_calls_provider_and_writes_back_to_store() {
         let state = state_with(MockStore::empty());
-        let provider = Arc::new(MockImageProvider::returning(Ok((vec![vec![1.0], vec![2.0]], ProviderUsage::default()))));
+        let provider = Arc::new(MockImageProvider::returning(Ok((
+            vec![vec![1.0], vec![2.0]],
+            ProviderUsage::default(),
+        ))));
         let images = vec![
-            ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() },
-            ImageInput { mime_type: "image/png".to_string(), data: "d29ybGQ=".to_string() },
+            ImageInput {
+                mime_type: "image/png".to_string(),
+                data: "aGVsbG8=".to_string(),
+            },
+            ImageInput {
+                mime_type: "image/png".to_string(),
+                data: "d29ybGQ=".to_string(),
+            },
         ];
 
         let request = EmbedImageRequest {
@@ -1428,7 +1611,12 @@ mod tests {
         assert_eq!(vectors, vec![vec![1.0], vec![2.0]]);
         assert_eq!(stats.hits, 0);
         assert_eq!(stats.misses, 2);
-        assert_eq!(provider.call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            provider
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1445,7 +1633,8 @@ mod tests {
                 _model: &str,
                 images: &[ImageInput],
             ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
-                self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 assert_eq!(images.len(), 1, "duplicate images in the batch must be deduplicated before calling the provider");
                 Ok((vec![vec![42.0]], ProviderUsage::default()))
             }
@@ -1460,12 +1649,23 @@ mod tests {
         }
 
         let state = state_with(MockStore::empty());
-        let provider = Arc::new(CountingImageProvider { call_count: std::sync::atomic::AtomicUsize::new(0) });
+        let provider = Arc::new(CountingImageProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
         // Same image (identical bytes + mime type) three times in one batch.
         let images = vec![
-            ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() },
-            ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() },
-            ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() },
+            ImageInput {
+                mime_type: "image/png".to_string(),
+                data: "aGVsbG8=".to_string(),
+            },
+            ImageInput {
+                mime_type: "image/png".to_string(),
+                data: "aGVsbG8=".to_string(),
+            },
+            ImageInput {
+                mime_type: "image/png".to_string(),
+                data: "aGVsbG8=".to_string(),
+            },
         ];
 
         let request = EmbedImageRequest {
@@ -1479,18 +1679,44 @@ mod tests {
 
         let (vectors, stats) = embed_image_batch(&state, request).await.unwrap();
 
-        assert_eq!(provider.call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(vectors, vec![vec![42.0], vec![42.0], vec![42.0]], "the same vector must be broadcast to every duplicate position");
-        assert_eq!(stats.misses, 3, "hit/miss accounting still reflects all three original positions");
+        assert_eq!(
+            provider
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            vectors,
+            vec![vec![42.0], vec![42.0], vec![42.0]],
+            "the same vector must be broadcast to every duplicate position"
+        );
+        assert_eq!(
+            stats.misses, 3,
+            "hit/miss accounting still reflects all three original positions"
+        );
     }
 
     #[tokio::test]
     async fn image_all_hits_skips_provider_entirely() {
-        let key = CacheKey::derive_image([1u8; 32], "gemini", "mock-scope", "gemini-embedding-2", "test-image-v1", "image/png", "aGVsbG8=");
+        let key = CacheKey::derive_image(
+            [1u8; 32],
+            "gemini",
+            "mock-scope",
+            "gemini-embedding-2",
+            "test-image-v1",
+            "image/png",
+            "aGVsbG8=",
+        );
         let state = state_with(MockStore::with(vec![(key, vec![9.0])]));
 
-        let provider = Arc::new(MockImageProvider::returning(Ok((vec![], ProviderUsage::default()))));
-        let images = vec![ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() }];
+        let provider = Arc::new(MockImageProvider::returning(Ok((
+            vec![],
+            ProviderUsage::default(),
+        ))));
+        let images = vec![ImageInput {
+            mime_type: "image/png".to_string(),
+            data: "aGVsbG8=".to_string(),
+        }];
 
         let request = EmbedImageRequest {
             provider: provider.clone() as Arc<dyn ImageEmbeddingProvider>,
@@ -1505,14 +1731,25 @@ mod tests {
         assert_eq!(vectors, vec![vec![9.0]]);
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 0);
-        assert_eq!(provider.call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            provider
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     #[tokio::test]
     async fn image_different_owners_never_share_a_cache_entry() {
         let state = state_with(MockStore::empty());
-        let provider = Arc::new(MockImageProvider::returning(Ok((vec![vec![1.0]], ProviderUsage::default()))));
-        let images = vec![ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() }];
+        let provider = Arc::new(MockImageProvider::returning(Ok((
+            vec![vec![1.0]],
+            ProviderUsage::default(),
+        ))));
+        let images = vec![ImageInput {
+            mime_type: "image/png".to_string(),
+            data: "aGVsbG8=".to_string(),
+        }];
 
         let request_a = EmbedImageRequest {
             provider: provider.clone() as Arc<dyn ImageEmbeddingProvider>,
@@ -1534,15 +1771,29 @@ mod tests {
         };
         let (_vectors, stats_b) = embed_image_batch(&state, request_b).await.unwrap();
 
-        assert_eq!(stats_b.misses, 1, "a different owner_id must never hit the first owner's cache entry");
-        assert_eq!(provider.call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            stats_b.misses, 1,
+            "a different owner_id must never hit the first owner's cache entry"
+        );
+        assert_eq!(
+            provider
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
     }
 
     #[tokio::test]
     async fn delete_image_batch_removes_entries_so_a_later_request_misses_again() {
         let state = state_with(MockStore::empty());
-        let provider = Arc::new(MockImageProvider::returning(Ok((vec![vec![1.0]], ProviderUsage::default()))));
-        let images = vec![ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() }];
+        let provider = Arc::new(MockImageProvider::returning(Ok((
+            vec![vec![1.0]],
+            ProviderUsage::default(),
+        ))));
+        let images = vec![ImageInput {
+            mime_type: "image/png".to_string(),
+            data: "aGVsbG8=".to_string(),
+        }];
 
         let embed_request = EmbedImageRequest {
             provider: provider.clone() as Arc<dyn ImageEmbeddingProvider>,
@@ -1553,7 +1804,12 @@ mod tests {
             images: &images,
         };
         embed_image_batch(&state, embed_request).await.unwrap();
-        assert_eq!(provider.call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            provider
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
 
         let delete_request = DeleteImageRequest {
             provider: provider.as_ref(),
@@ -1573,9 +1829,13 @@ mod tests {
             model: "gemini-embedding-2",
             images: &images,
         };
-        embed_image_batch(&state, embed_request_again).await.unwrap();
+        embed_image_batch(&state, embed_request_again)
+            .await
+            .unwrap();
         assert_eq!(
-            provider.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            provider
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
             2,
             "after deletion, the same image must miss again and call the provider a second time"
         );
@@ -1600,7 +1860,13 @@ mod tests {
                 _model: &str,
                 _texts: &[String],
             ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
-                Ok((self.response.clone(), ProviderUsage { prompt_tokens: 1, total_tokens: 1 }))
+                Ok((
+                    self.response.clone(),
+                    ProviderUsage {
+                        prompt_tokens: 1,
+                        total_tokens: 1,
+                    },
+                ))
             }
 
             fn version(&self) -> &'static str {
@@ -1615,8 +1881,10 @@ mod tests {
         let state = state_with(MockStore::empty());
         let texts = vec!["identical text".to_string()];
 
-        let first: Arc<dyn EmbeddingProvider> =
-            Arc::new(ScopedProvider { scope: "https://api.openai.com", response: vec![vec![1.0]] });
+        let first: Arc<dyn EmbeddingProvider> = Arc::new(ScopedProvider {
+            scope: "https://api.openai.com",
+            response: vec![vec![1.0]],
+        });
         let (_, stats_first) = embed_batch(
             &state,
             EmbedRequest {
@@ -1630,10 +1898,15 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(stats_first.misses, 1, "first call against a cold store must miss");
+        assert_eq!(
+            stats_first.misses, 1,
+            "first call against a cold store must miss"
+        );
 
-        let second: Arc<dyn EmbeddingProvider> =
-            Arc::new(ScopedProvider { scope: "http://localhost:8000", response: vec![vec![2.0]] });
+        let second: Arc<dyn EmbeddingProvider> = Arc::new(ScopedProvider {
+            scope: "http://localhost:8000",
+            response: vec![vec![2.0]],
+        });
         let (vectors, stats_second) = embed_batch(
             &state,
             EmbedRequest {
@@ -1648,7 +1921,14 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(stats_second.misses, 1, "a different upstream endpoint must not hit the first one's entry");
-        assert_eq!(vectors, vec![vec![2.0]], "and must return its own vector, not the cached one");
+        assert_eq!(
+            stats_second.misses, 1,
+            "a different upstream endpoint must not hit the first one's entry"
+        );
+        assert_eq!(
+            vectors,
+            vec![vec![2.0]],
+            "and must return its own vector, not the cached one"
+        );
     }
 }

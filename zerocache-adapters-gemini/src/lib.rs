@@ -92,14 +92,19 @@ impl EmbeddingProvider for GeminiProvider {
                     .iter()
                     .map(|text| EmbedContentRequest {
                         model: qualified_model.clone(),
-                        content: Content { parts: vec![Part { text: text.clone() }] },
+                        content: Content {
+                            parts: vec![Part { text: text.clone() }],
+                        },
                     })
                     .collect(),
             };
 
             let response = self
                 .client
-                .post(format!("{}/v1beta/models/{model}:batchEmbedContents", self.base_url))
+                .post(format!(
+                    "{}/v1beta/models/{model}:batchEmbedContents",
+                    self.base_url
+                ))
                 .header("x-goog-api-key", api_key)
                 .json(&body)
                 .send()
@@ -197,7 +202,10 @@ impl ImageEmbeddingProvider for GeminiProvider {
 
             let response = self
                 .client
-                .post(format!("{}/v1beta/models/{model}:batchEmbedContents", self.base_url))
+                .post(format!(
+                    "{}/v1beta/models/{model}:batchEmbedContents",
+                    self.base_url
+                ))
                 .header("x-goog-api-key", api_key)
                 .json(&body)
                 .send()
@@ -267,13 +275,20 @@ mod tests {
 
         let provider = GeminiProvider::new(server.base_url());
         let (vectors, usage) = provider
-            .embed_batch("test-key", "text-embedding-004", &["a".to_string(), "b".to_string()])
+            .embed_batch(
+                "test-key",
+                "text-embedding-004",
+                &["a".to_string(), "b".to_string()],
+            )
             .await
             .unwrap();
 
         mock.assert_async().await;
         assert_eq!(vectors, vec![vec![1.0], vec![2.0]]);
-        assert_eq!(usage.prompt_tokens, 0, "Gemini does not report usage; must stay zero, not fabricated");
+        assert_eq!(
+            usage.prompt_tokens, 0,
+            "Gemini does not report usage; must stay zero, not fabricated"
+        );
         assert_eq!(usage.total_tokens, 0);
     }
 
@@ -282,13 +297,17 @@ mod tests {
         let server = MockServer::start_async().await;
         server
             .mock_async(|when, then| {
-                when.method(POST).path("/v1beta/models/text-embedding-004:batchEmbedContents");
-                then.status(403).json_body(json!({ "error": { "message": "API key not valid" } }));
+                when.method(POST)
+                    .path("/v1beta/models/text-embedding-004:batchEmbedContents");
+                then.status(403)
+                    .json_body(json!({ "error": { "message": "API key not valid" } }));
             })
             .await;
 
         let provider = GeminiProvider::new(server.base_url());
-        let result = provider.embed_batch("bad-key", "text-embedding-004", &["x".to_string()]).await;
+        let result = provider
+            .embed_batch("bad-key", "text-embedding-004", &["x".to_string()])
+            .await;
 
         assert!(result.is_err());
     }
@@ -298,13 +317,16 @@ mod tests {
         let server = MockServer::start_async().await;
         server
             .mock_async(|when, then| {
-                when.method(POST).path("/v1beta/models/text-embedding-004:batchEmbedContents");
+                when.method(POST)
+                    .path("/v1beta/models/text-embedding-004:batchEmbedContents");
                 then.status(200).body("not json");
             })
             .await;
 
         let provider = GeminiProvider::new(server.base_url());
-        let result = provider.embed_batch("test-key", "text-embedding-004", &["x".to_string()]).await;
+        let result = provider
+            .embed_batch("test-key", "text-embedding-004", &["x".to_string()])
+            .await;
 
         assert!(result.is_err());
     }
@@ -314,17 +336,26 @@ mod tests {
         let server = MockServer::start_async().await;
         server
             .mock_async(|when, then| {
-                when.method(POST).path("/v1beta/models/text-embedding-004:batchEmbedContents");
-                then.status(200).json_body(json!({ "embeddings": [{ "values": [1.0] }] }));
+                when.method(POST)
+                    .path("/v1beta/models/text-embedding-004:batchEmbedContents");
+                then.status(200)
+                    .json_body(json!({ "embeddings": [{ "values": [1.0] }] }));
             })
             .await;
 
         let provider = GeminiProvider::new(server.base_url());
         let result = provider
-            .embed_batch("test-key", "text-embedding-004", &["a".to_string(), "b".to_string()])
+            .embed_batch(
+                "test-key",
+                "text-embedding-004",
+                &["a".to_string(), "b".to_string()],
+            )
             .await;
 
-        assert!(result.is_err(), "a count mismatch must be a hard error, not a silent misalignment");
+        assert!(
+            result.is_err(),
+            "a count mismatch must be a hard error, not a silent misalignment"
+        );
     }
 
     #[tokio::test]
@@ -383,15 +414,22 @@ mod tests {
         let server = MockServer::start_async().await;
         let mock = server
             .mock_async(|when, then| {
-                when.method(POST).path("/v1beta/models/text-embedding-004:batchEmbedContents");
-                then.status(429).json_body(json!({ "error": { "message": "rate limit exceeded" } }));
+                when.method(POST)
+                    .path("/v1beta/models/text-embedding-004:batchEmbedContents");
+                then.status(429)
+                    .json_body(json!({ "error": { "message": "rate limit exceeded" } }));
             })
             .await;
 
         let provider = GeminiProvider::new(server.base_url());
-        let result = provider.embed_batch("test-key", "text-embedding-004", &["x".to_string()]).await;
+        let result = provider
+            .embed_batch("test-key", "text-embedding-004", &["x".to_string()])
+            .await;
 
-        assert!(result.is_err(), "must still fail once retries are exhausted, not hang or silently succeed");
+        assert!(
+            result.is_err(),
+            "must still fail once retries are exhausted, not hang or silently succeed"
+        );
         assert_eq!(
             mock.hits_async().await,
             (MAX_RETRIES + 1) as usize,
@@ -404,13 +442,17 @@ mod tests {
         let server = MockServer::start_async().await;
         let mock = server
             .mock_async(|when, then| {
-                when.method(POST).path("/v1beta/models/text-embedding-004:batchEmbedContents");
-                then.status(403).json_body(json!({ "error": { "message": "API key not valid" } }));
+                when.method(POST)
+                    .path("/v1beta/models/text-embedding-004:batchEmbedContents");
+                then.status(403)
+                    .json_body(json!({ "error": { "message": "API key not valid" } }));
             })
             .await;
 
         let provider = GeminiProvider::new(server.base_url());
-        let result = provider.embed_batch("bad-key", "text-embedding-004", &["x".to_string()]).await;
+        let result = provider
+            .embed_batch("bad-key", "text-embedding-004", &["x".to_string()])
+            .await;
 
         assert!(result.is_err());
         assert_eq!(
@@ -441,12 +483,21 @@ mod tests {
             .await;
 
         let provider = GeminiProvider::new(server.base_url());
-        let images = vec![ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() }];
-        let (vectors, usage) = provider.embed_image_batch("test-key", "gemini-embedding-2", &images).await.unwrap();
+        let images = vec![ImageInput {
+            mime_type: "image/png".to_string(),
+            data: "aGVsbG8=".to_string(),
+        }];
+        let (vectors, usage) = provider
+            .embed_image_batch("test-key", "gemini-embedding-2", &images)
+            .await
+            .unwrap();
 
         mock.assert_async().await;
         assert_eq!(vectors, vec![vec![0.5, 0.6]]);
-        assert_eq!(usage.prompt_tokens, 0, "Gemini embeddings never report usage, image path included");
+        assert_eq!(
+            usage.prompt_tokens, 0,
+            "Gemini embeddings never report usage, image path included"
+        );
     }
 
     #[tokio::test]
@@ -458,12 +509,16 @@ mod tests {
                     .path("/v1beta/models/gemini-embedding-2:batchEmbedContents")
                     .matches(|req| {
                         let body: serde_json::Value =
-                            serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
+                            serde_json::from_slice(req.body.as_deref().unwrap_or_default())
+                                .unwrap();
                         // Two requests entries, each with exactly one part --
                         // proves images are batched as independent embed
                         // requests, not combined into one interleaved part list.
                         body["requests"].as_array().map(|a| a.len()) == Some(2)
-                            && body["requests"][0]["content"]["parts"].as_array().map(|a| a.len()) == Some(1)
+                            && body["requests"][0]["content"]["parts"]
+                                .as_array()
+                                .map(|a| a.len())
+                                == Some(1)
                     });
                 then.status(200).json_body(json!({
                     "embeddings": [{ "values": [1.0] }, { "values": [2.0] }]
@@ -473,10 +528,19 @@ mod tests {
 
         let provider = GeminiProvider::new(server.base_url());
         let images = vec![
-            ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() },
-            ImageInput { mime_type: "image/jpeg".to_string(), data: "d29ybGQ=".to_string() },
+            ImageInput {
+                mime_type: "image/png".to_string(),
+                data: "aGVsbG8=".to_string(),
+            },
+            ImageInput {
+                mime_type: "image/jpeg".to_string(),
+                data: "d29ybGQ=".to_string(),
+            },
         ];
-        let (vectors, _usage) = provider.embed_image_batch("test-key", "gemini-embedding-2", &images).await.unwrap();
+        let (vectors, _usage) = provider
+            .embed_image_batch("test-key", "gemini-embedding-2", &images)
+            .await
+            .unwrap();
 
         mock.assert_async().await;
         assert_eq!(vectors, vec![vec![1.0], vec![2.0]]);
@@ -487,14 +551,21 @@ mod tests {
         let server = MockServer::start_async().await;
         server
             .mock_async(|when, then| {
-                when.method(POST).path("/v1beta/models/gemini-embedding-2:batchEmbedContents");
-                then.status(403).json_body(json!({ "error": { "message": "API key not valid" } }));
+                when.method(POST)
+                    .path("/v1beta/models/gemini-embedding-2:batchEmbedContents");
+                then.status(403)
+                    .json_body(json!({ "error": { "message": "API key not valid" } }));
             })
             .await;
 
         let provider = GeminiProvider::new(server.base_url());
-        let images = vec![ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() }];
-        let result = provider.embed_image_batch("bad-key", "gemini-embedding-2", &images).await;
+        let images = vec![ImageInput {
+            mime_type: "image/png".to_string(),
+            data: "aGVsbG8=".to_string(),
+        }];
+        let result = provider
+            .embed_image_batch("bad-key", "gemini-embedding-2", &images)
+            .await;
 
         assert!(result.is_err());
     }
@@ -504,18 +575,31 @@ mod tests {
         let server = MockServer::start_async().await;
         server
             .mock_async(|when, then| {
-                when.method(POST).path("/v1beta/models/gemini-embedding-2:batchEmbedContents");
-                then.status(200).json_body(json!({ "embeddings": [{ "values": [1.0] }] }));
+                when.method(POST)
+                    .path("/v1beta/models/gemini-embedding-2:batchEmbedContents");
+                then.status(200)
+                    .json_body(json!({ "embeddings": [{ "values": [1.0] }] }));
             })
             .await;
 
         let provider = GeminiProvider::new(server.base_url());
         let images = vec![
-            ImageInput { mime_type: "image/png".to_string(), data: "aGVsbG8=".to_string() },
-            ImageInput { mime_type: "image/png".to_string(), data: "d29ybGQ=".to_string() },
+            ImageInput {
+                mime_type: "image/png".to_string(),
+                data: "aGVsbG8=".to_string(),
+            },
+            ImageInput {
+                mime_type: "image/png".to_string(),
+                data: "d29ybGQ=".to_string(),
+            },
         ];
-        let result = provider.embed_image_batch("test-key", "gemini-embedding-2", &images).await;
+        let result = provider
+            .embed_image_batch("test-key", "gemini-embedding-2", &images)
+            .await;
 
-        assert!(result.is_err(), "a count mismatch must be a hard error, same discipline as the text path");
+        assert!(
+            result.is_err(),
+            "a count mismatch must be a hard error, same discipline as the text path"
+        );
     }
 }
