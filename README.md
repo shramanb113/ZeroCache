@@ -67,31 +67,31 @@ Dependencies point inward only — a hard, structurally-enforced rule via Cargo 
 
 ```mermaid
 flowchart TB
-    subgraph Interface["Interface / Transport"]
-        HTTP["zerocache-http<br/>axum · wire-shape translation · provider registry"]
+    subgraph layerInterface["Interface / Transport"]
+        nodeHttp["zerocache-http<br/>axum · wire-shape translation · provider registry"]
     end
-    subgraph Application["Application"]
-        App["orchestration: split hits/misses,<br/>call provider for misses only,<br/>write back, reassemble in order"]
+    subgraph layerApplication["Application"]
+        nodeApp["orchestration: split hits/misses,<br/>call provider for misses only,<br/>write back, reassemble in order"]
     end
-    subgraph Ports["Ports"]
-        Ports["EmbeddingStore · EmbeddingProvider ·<br/>ImageEmbeddingProvider trait contracts"]
+    subgraph layerPorts["Ports"]
+        nodePorts["EmbeddingStore · EmbeddingProvider ·<br/>ImageEmbeddingProvider trait contracts"]
     end
-    subgraph Adapters["Adapters"]
-        Store["Store adapters<br/>sled · redis"]
-        Provider["Provider adapters<br/>openai · mistral · gemini · huggingface<br/>bedrock · vertexai · azure"]
+    subgraph layerAdapters["Adapters"]
+        nodeStore["Store adapters<br/>sled · redis"]
+        nodeProvider["Provider adapters<br/>openai · mistral · gemini · huggingface<br/>bedrock · vertexai · azure"]
     end
-    subgraph Core["Core (domain)"]
-        Key["CacheKey derivation (blake3)<br/>hit/miss reconciliation<br/>zero I/O, zero async runtime"]
+    subgraph layerCore["Core (domain)"]
+        nodeKey["CacheKey derivation (blake3)<br/>hit/miss reconciliation<br/>zero I/O, zero async runtime"]
     end
 
-    Client(["Any OpenAI-compatible<br/>embedding client"]) -->|"POST /{provider}/v1/embeddings"| HTTP
-    HTTP --> App
-    App --> Ports
-    Ports --> Store
-    Ports --> Provider
-    App --> Key
-    Provider -->|"BYOK: your forwarded key"| Upstream(["Real provider API"])
-    HTTP -->|"ordered response +<br/>X-Zerocache-Hits/-Misses"| Client
+    nodeClient(["Any OpenAI-compatible<br/>embedding client"]) -->|"POST /{provider}/v1/embeddings"| nodeHttp
+    nodeHttp --> nodeApp
+    nodeApp --> nodePorts
+    nodePorts --> nodeStore
+    nodePorts --> nodeProvider
+    nodeApp --> nodeKey
+    nodeProvider -->|"BYOK: your forwarded key"| nodeUpstream(["Real provider API"])
+    nodeHttp -->|"ordered response +<br/>X-Zerocache-Hits/-Misses"| nodeClient
 ```
 
 | Crate | Responsibility |
