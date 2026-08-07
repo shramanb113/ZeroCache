@@ -89,8 +89,18 @@ pub struct AppState {
     // holds the lock across an .await, so there's no reason to pay for an
     // async-aware mutex. pub for the same reason every other AppState field
     // is: this codebase constructs AppState via plain struct literals, not
-    // a constructor, everywhere it's built (main.rs, tests).
+    // a constructor, everywhere it's built (main.rs, tests). Text-only --
+    // `image_in_flight` below is the image-embedding counterpart.
     pub in_flight: Mutex<HashMap<CacheKey, SharedFetch>>,
+    // The image-embedding counterpart to `in_flight`, used by
+    // fetch_image_coalesced. A separate map, not a shared one: an image and
+    // a text input can never collide on CacheKey (derive_image is
+    // domain-separated from derive), but keeping the maps apart also means
+    // a burst of image traffic can never contend the text path's lock, and
+    // vice versa. Same SharedFetch/SharedFetchOutput type aliases as
+    // `in_flight` -- both just map CacheKey -> resolved vectors + usage,
+    // regardless of whether the fetch behind them embedded text or images.
+    pub image_in_flight: Mutex<HashMap<CacheKey, SharedFetch>>,
 }
 
 // Cumulative counters since process start, in Prometheus text-exposition
@@ -385,14 +395,18 @@ pub struct EmbedImageRequest<'a> {
     pub images: &'a [ImageInput],
 }
 
-/// The image-embedding counterpart to `embed_batch`. Deliberately simpler in
-/// two ways, documented in this plan's Global Constraints: no text
-/// normalization (images aren't normalized), and no cross-request
-/// coalescing (fetch_coalesced stays text-only for now). It does dedupe
-/// misses that share a CacheKey within one batch -- two images with
-/// identical bytes+mime type are rare, but not rare enough to justify
-/// paying the provider twice for one, and the bookkeeping is the same
-/// shape `embed_batch` already pays for text.
+/// The image-embedding counterpart to `embed_batch`. Deliberately simpler
+/// in one way, documented in CLAUDE.md Deviations: no text normalization
+/// (images aren't normalized). It does dedupe misses that share a CacheKey
+/// within one batch -- two images with identical bytes+mime type are rare,
+/// but not rare enough to justify paying the provider twice for one, and
+/// the bookkeeping is the same shape `embed_batch` already pays for text.
+/// It also now coalesces across concurrent requests via
+/// `fetch_image_coalesced`/`AppState.image_in_flight`, the image
+/// counterpart to `embed_batch`'s `fetch_coalesced`/`AppState.in_flight`
+/// (CLAUDE.md Deviations item 20) -- originally deferred when multimodal
+/// embeddings first shipped, since image traffic didn't yet have a measured
+/// concurrent-miss gap the way text did.
 #[tracing::instrument(skip_all, fields(provider = %request.provider_name, images = request.images.len(), hits, misses))]
 pub async fn embed_image_batch(
     state: &AppState,
@@ -470,23 +484,32 @@ pub async fn embed_image_batch(
             index_to_unique_index.push((*index, unique_index));
         }
 
-        let (vectors, usage) = request
-            .provider
-            .embed_image_batch(request.api_key, request.model, &unique_miss_images)
-            .instrument(tracing::info_span!(
-                "provider_call",
-                images = unique_miss_images.len()
-            ))
-            .await
-            .map_err(AppError::Provider)?;
+        // Cross-request coalescing: if another concurrent request is
+        // already fetching one of our unique missing keys, piggyback on
+        // its result instead of independently calling the provider for the
+        // same image. See fetch_image_coalesced for the mechanics.
+        let (fetched, usage) = fetch_image_coalesced(
+            state,
+            Arc::clone(&request.provider),
+            request.api_key,
+            request.model,
+            &unique_keys,
+            &unique_miss_images,
+        )
+        .await?;
         provider_prompt_tokens = usage.prompt_tokens;
         provider_total_tokens = usage.total_tokens;
 
         for (index, unique_index) in &index_to_unique_index {
-            results[*index] = Some(vectors[*unique_index].clone());
+            let key = &unique_keys[*unique_index];
+            results[*index] = Some(fetched[key].clone());
         }
 
-        let writes: Vec<(CacheKey, Vec<f32>)> = unique_keys.into_iter().zip(vectors).collect();
+        let mut writes = Vec::with_capacity(unique_keys.len());
+        for key in &unique_keys {
+            writes.push((*key, fetched[key].clone()));
+        }
+
         let store = Arc::clone(&state.store);
         run_store_task(move || -> Result<(), AppError> {
             for (key, vector) in writes {
@@ -660,6 +683,103 @@ async fn fetch_coalesced(
         let mut in_flight = state.in_flight.lock().expect("in_flight mutex poisoned");
         for key in &claim_keys {
             in_flight.remove(key);
+        }
+    }
+
+    for waiter in piggyback_waiters {
+        let (vectors, _usage) = waiter.await.map_err(AppError::Provider)?;
+        resolved.extend(vectors.iter().map(|(k, v)| (*k, v.clone())));
+    }
+
+    Ok((resolved, claimed_usage))
+}
+
+/// The image-embedding counterpart to `fetch_coalesced`, coalescing against
+/// `AppState.image_in_flight` instead of `AppState.in_flight`. Identical
+/// shape and semantics -- same claim-or-piggyback logic, same
+/// only-the-claimer-reports-usage rule, same in-process-only scope -- just
+/// keyed on `ImageInput`s instead of `String` texts and calling
+/// `ImageEmbeddingProvider::embed_image_batch` instead of
+/// `EmbeddingProvider::embed_batch`. See `fetch_coalesced`'s doc comment for
+/// the full rationale; not repeated here to avoid the two drifting out of
+/// sync with each other in prose while the code itself stays in sync by
+/// construction.
+#[tracing::instrument(skip_all, fields(unique_keys = unique_keys.len(), claimed, piggybacked))]
+async fn fetch_image_coalesced(
+    state: &AppState,
+    provider: Arc<dyn ImageEmbeddingProvider>,
+    api_key: &str,
+    model: &str,
+    unique_keys: &[CacheKey],
+    unique_images: &[ImageInput],
+) -> Result<(HashMap<CacheKey, Vec<f32>>, ProviderUsage), AppError> {
+    let mut piggyback_waiters: Vec<SharedFetch> = Vec::new();
+    let mut claim_keys: Vec<CacheKey> = Vec::new();
+    let mut claim_images: Vec<ImageInput> = Vec::new();
+    let mut own_claim: Option<SharedFetch> = None;
+
+    {
+        let mut image_in_flight = state
+            .image_in_flight
+            .lock()
+            .expect("image_in_flight mutex poisoned");
+
+        for (key, image) in unique_keys.iter().zip(unique_images) {
+            if let Some(existing) = image_in_flight.get(key) {
+                piggyback_waiters.push(existing.clone());
+            } else {
+                claim_keys.push(*key);
+                claim_images.push(image.clone());
+            }
+        }
+
+        if !claim_keys.is_empty() {
+            let api_key = api_key.to_string();
+            let model = model.to_string();
+            let claim_keys_for_future = claim_keys.clone();
+            let claim_images_for_future = claim_images.clone();
+
+            let claim_count = claim_keys.len();
+            let fut: Pin<Box<dyn Future<Output = SharedFetchOutput> + Send>> = Box::pin(
+                async move {
+                    let (vectors, usage) = provider
+                        .embed_image_batch(&api_key, &model, &claim_images_for_future)
+                        .await?;
+                    let by_key = claim_keys_for_future.into_iter().zip(vectors).collect();
+                    Ok((Arc::new(by_key), usage))
+                }
+                .instrument(tracing::info_span!("provider_call", images = claim_count)),
+            );
+            let shared: SharedFetch = fut.shared();
+
+            for key in &claim_keys {
+                image_in_flight.insert(*key, shared.clone());
+            }
+            own_claim = Some(shared);
+        }
+    }
+
+    tracing::Span::current()
+        .record("claimed", claim_keys.len())
+        .record("piggybacked", piggyback_waiters.len());
+
+    let mut resolved: HashMap<CacheKey, Vec<f32>> = HashMap::with_capacity(unique_keys.len());
+    let mut claimed_usage = ProviderUsage::default();
+
+    if let Some(claim_fut) = own_claim {
+        let (vectors, usage) = claim_fut.await.map_err(AppError::Provider)?;
+        resolved.extend(vectors.iter().map(|(k, v)| (*k, v.clone())));
+        claimed_usage = usage;
+
+        // Remove our claimed keys now that they're resolved, so a later,
+        // genuinely new miss for the same key starts a fresh fetch instead
+        // of piggybacking on a completed, no-longer-useful future forever.
+        let mut image_in_flight = state
+            .image_in_flight
+            .lock()
+            .expect("image_in_flight mutex poisoned");
+        for key in &claim_keys {
+            image_in_flight.remove(key);
         }
     }
 
@@ -938,6 +1058,7 @@ mod tests {
             image_providers: StdHashMap::new(),
             metrics: Metrics::new(),
             in_flight: Mutex::new(StdHashMap::new()),
+            image_in_flight: Mutex::new(StdHashMap::new()),
         }
     }
 
@@ -1694,6 +1815,93 @@ mod tests {
             stats.misses, 3,
             "hit/miss accounting still reflects all three original positions"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_image_misses_across_separate_requests_are_coalesced_into_one_provider_call(
+    ) {
+        // The image counterpart to
+        // concurrent_identical_misses_across_separate_requests_are_coalesced_into_one_provider_call
+        // above -- proves cross-request coalescing now also applies to
+        // embed_image_batch, not just embed_batch (see CLAUDE.md Deviations
+        // item 20).
+        struct SlowCountingImageProvider {
+            call_count: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl ImageEmbeddingProvider for SlowCountingImageProvider {
+            async fn embed_image_batch(
+                &self,
+                _api_key: &str,
+                _model: &str,
+                images: &[ImageInput],
+            ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
+                self.call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Long enough that all 5 concurrent callers below genuinely
+                // overlap in time rather than happening to run one after
+                // another -- without this, the test could pass even if
+                // coalescing were broken, just by getting lucky on timing.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok((
+                    vec![vec![99.0]; images.len()],
+                    ProviderUsage {
+                        prompt_tokens: 7,
+                        total_tokens: 7,
+                    },
+                ))
+            }
+
+            fn version(&self) -> &'static str {
+                "mock-image-v1"
+            }
+
+            fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+                Ok("mock-scope".to_string())
+            }
+        }
+
+        let state = state_with(MockStore::empty());
+        let provider = Arc::new(SlowCountingImageProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let images = vec![ImageInput {
+            mime_type: "image/png".to_string(),
+            data: "bmV2ZXItYmVmb3JlLXNlZW4=".to_string(),
+        }];
+
+        let requests = (0..5).map(|_| {
+            embed_image_batch(
+                &state,
+                EmbedImageRequest {
+                    provider: Arc::clone(&provider) as Arc<dyn ImageEmbeddingProvider>,
+                    provider_name: "gemini",
+                    api_key: "test-key",
+                    owner_id: [1u8; 32],
+                    model: "gemini-embedding-2",
+                    images: &images,
+                },
+            )
+        });
+
+        let results = futures::future::join_all(requests).await;
+
+        let mut total_prompt_tokens = 0;
+        for result in &results {
+            let (vectors, stats) = result
+                .as_ref()
+                .expect("every concurrent request must still succeed");
+            assert_eq!(vectors, &vec![vec![99.0]], "every request must resolve to the correct vector, whether it claimed the fetch or piggybacked");
+            total_prompt_tokens += stats.provider_prompt_tokens;
+        }
+
+        assert_eq!(
+            provider.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "5 concurrent requests missing on the exact same never-before-seen image key must coalesce into exactly one provider call, not 5"
+        );
+        assert_eq!(total_prompt_tokens, 7, "usage must be attributed exactly once across all 5 requests, not once per request (double counting) or zero (lost)");
     }
 
     #[tokio::test]

@@ -135,6 +135,7 @@ async fn main() {
         image_providers,
         metrics: Metrics::new(),
         in_flight: std::sync::Mutex::new(HashMap::new()),
+        image_in_flight: std::sync::Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()

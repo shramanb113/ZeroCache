@@ -88,6 +88,11 @@ pub trait EmbeddingProvider: Send + Sync {
 /// `inline_data` part needs to interpret it. The `data:...;base64,` prefix a
 /// caller sends over HTTP is stripped before this struct is built -- that
 /// parsing is wire-shape translation, so it lives in zerocache-http, not here.
+///
+/// Clone so zerocache-http's fetch_image_coalesced can cheaply hand a copy
+/// into the 'static future backing a coalesced fetch, the same way `String`
+/// texts are cloned for the text path's equivalent future.
+#[derive(Clone)]
 pub struct ImageInput {
     pub mime_type: String,
     pub data: String,
