@@ -8,15 +8,38 @@
   </div>
   <svg
     class="flow__diagram"
-    viewBox="0 0 360 80"
+    viewBox="0 0 600 170"
     role="img"
     aria-label="Request flow from client through Zerocache to provider"
   >
-    <text x="10" y="45" class="flow__node-label">client</text>
-    <text x="150" y="45" class="flow__node-label">zerocache</text>
-    <text x="300" y="45" class="flow__node-label">provider</text>
-    <line x1="60" y1="40" x2="130" y2="40" class="flow__line flow__line--always" />
-    <line x1="180" y1="40" x2="290" y2="40" class="flow__line flow__line--conditional" />
+    <defs>
+      <marker id="flow-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" class="flow__arrowhead" />
+      </marker>
+      <filter id="flow-glow" x="-60%" y="-60%" width="220%" height="220%">
+        <feGaussianBlur stdDeviation="7" result="blur" />
+        <feMerge>
+          <feMergeNode in="blur" />
+          <feMergeNode in="SourceGraphic" />
+        </feMerge>
+      </filter>
+    </defs>
+
+    <line x1="132" y1="87" x2="243" y2="87" class="flow__line flow__line--always" marker-end="url(#flow-arrow)" />
+    <line x1="387" y1="87" x2="468" y2="87" class="flow__line flow__line--conditional" marker-end="url(#flow-arrow)" />
+
+    <g filter="url(#flow-glow)">
+      <rect x="245" y="52" width="140" height="70" rx="12" class="flow__node-bg flow__node-bg--focus" />
+    </g>
+    <rect x="20" y="60" width="110" height="55" rx="10" class="flow__node-bg" />
+    <rect x="245" y="52" width="140" height="70" rx="12" class="flow__node-bg flow__node-bg--focus" />
+    <rect x="470" y="60" width="110" height="55" rx="10" class="flow__node-bg" />
+
+    <text x="75" y="92" text-anchor="middle" class="flow__node-label">client</text>
+    <text x="315" y="92" text-anchor="middle" class="flow__node-label flow__node-label--focus">zerocache</text>
+    <text x="525" y="92" text-anchor="middle" class="flow__node-label">provider</text>
+
+    <circle class="flow__packet" r="6" cx="132" cy="87" />
   </svg>
   <p
     class="flow__caption"
@@ -43,6 +66,9 @@
     color: var(--muted);
     padding: 2px 10px;
     cursor: pointer;
+    transition:
+      color var(--duration-fast, 150ms) ease,
+      border-color var(--duration-fast, 150ms) ease;
   }
   .flow__controls button[aria-pressed="true"] {
     color: var(--paper);
@@ -50,17 +76,32 @@
   }
   .flow__diagram {
     width: 100%;
-    max-width: 360px;
+    max-width: 600px;
     height: auto;
+  }
+  .flow__node-bg {
+    fill: var(--surface);
+    stroke: var(--muted);
+    stroke-width: 1;
+  }
+  .flow__node-bg--focus {
+    stroke: var(--rust);
   }
   .flow__node-label {
     fill: var(--paper);
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: 15px;
+  }
+  .flow__node-label--focus {
+    fill: var(--rust);
+    font-weight: 600;
   }
   .flow__line {
     stroke: var(--muted);
     stroke-width: 2;
+  }
+  .flow__arrowhead {
+    fill: var(--muted);
   }
   .flow__line--conditional {
     stroke-dasharray: 8 4;
@@ -74,6 +115,14 @@
     stroke: var(--hit);
     --flow-duration: 80ms;
   }
+  .flow__packet {
+    fill: var(--miss);
+    filter: drop-shadow(0 0 4px var(--miss));
+  }
+  .flow[data-state="hit"] .flow__packet {
+    fill: var(--hit);
+    filter: drop-shadow(0 0 4px var(--hit));
+  }
   .flow__caption {
     font-size: 0.85rem;
     color: var(--muted);
@@ -82,9 +131,43 @@
 </style>
 
 <script>
+  import gsap from "gsap";
+
   document.querySelectorAll<HTMLElement>(".flow").forEach((flow) => {
     const caption = flow.querySelector<HTMLElement>(".flow__caption");
     const buttons = flow.querySelectorAll<HTMLButtonElement>("[data-state-btn]");
+    const packet = flow.querySelector<SVGCircleElement>(".flow__packet");
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    let timeline: gsap.core.Timeline | null = null;
+
+    const buildTimeline = (state: string) => {
+      timeline?.kill();
+      if (!packet) return;
+
+      if (reduceMotion) {
+        gsap.set(packet, { attr: { cx: state === "hit" ? 132 : 385 }, opacity: state === "hit" ? 0 : 1 });
+        return;
+      }
+
+      const tl = gsap.timeline({ repeat: -1, repeatDelay: 0.5 });
+      tl.set(packet, { attr: { cx: 132, cy: 87 }, opacity: 1 });
+      tl.to(packet, { attr: { cx: 243 }, duration: 0.45, ease: "power2.inOut" });
+
+      if (state === "miss") {
+        tl.to(packet, { attr: { cx: 387 }, duration: 0.15, ease: "none" }, ">0.15");
+        tl.to(packet, { attr: { cx: 468 }, duration: 0.5, ease: "power2.inOut" }, "<");
+        tl.to(packet, { opacity: 0, duration: 0.25 }, ">0.15");
+        tl.set(packet, { attr: { cx: 243 }, opacity: 1 });
+        tl.to(packet, { attr: { cx: 132 }, duration: 0.55, ease: "power2.inOut" }, ">0.2");
+      } else {
+        tl.to(packet, { attr: { cx: 132 }, duration: 0.3, ease: "power2.inOut" }, ">0.25");
+      }
+      tl.to(packet, { opacity: 0, duration: 0.25 }, ">0.1");
+
+      timeline = tl;
+    };
+
     const applyState = (state: string) => {
       flow.dataset.state = state;
       buttons.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.stateBtn === state)));
@@ -92,7 +175,9 @@
         caption.textContent =
           state === "hit" ? caption.dataset.captionHit ?? "" : caption.dataset.captionMiss ?? "";
       }
+      buildTimeline(state);
     };
+
     buttons.forEach((button) => {
       button.addEventListener("click", () => applyState(button.dataset.stateBtn ?? "miss"));
     });

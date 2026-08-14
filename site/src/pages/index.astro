@@ -25,19 +25,27 @@ curl http://localhost:8080/openai/v1/embeddings \\
   description="A drop-in, Rust-native embedding cache. Point your OpenAI-compatible client at Zerocache instead of the real provider."
 >
   <section class="hero">
-    <HashStrip />
-    <h1>Stop paying to re-embed text you've already embedded.</h1>
-    <p class="hero__sub">
-      Zerocache sits between your ingestion pipeline and your embedding provider. It intercepts
-      <code>/v1/embeddings</code>, serves identical inputs from a local content-addressed store, and
-      forwards only cache misses upstream. No SDK, no framework plugin — point your existing client
-      at a new <code>base_url</code>.
-    </p>
+    <div class="hero__copy">
+      <HashStrip />
+      <h1>Stop paying to re-embed text you've already embedded.</h1>
+      <p class="hero__sub">
+        Zerocache sits between your ingestion pipeline and your embedding provider. It intercepts
+        <code>/v1/embeddings</code>, serves identical inputs from a local content-addressed store, and
+        forwards only cache misses upstream. No SDK, no framework plugin — point your existing client
+        at a new <code>base_url</code>.
+      </p>
+      <div class="hero__cta">
+        <a class="hero__button" href="#quickstart">Try it →</a>
+        <a class="hero__button hero__button--ghost" href={`${base}architecture/`}>Read the architecture</a>
+      </div>
+    </div>
+    <div class="hero__visual">
+      <FlowDiagram />
+    </div>
   </section>
 
   <section class="section">
     <h2>How it works</h2>
-    <FlowDiagram />
     <ol class="steps">
       <li>
         Your client sends a normal <code>POST /{"{provider}"}/v1/embeddings</code> request to
@@ -72,7 +80,7 @@ curl http://localhost:8080/openai/v1/embeddings \\
     </p>
   </section>
 
-  <section class="section">
+  <section class="section" id="quickstart">
     <h2>Try it</h2>
     <CodeBlock code={quickstart} lang="bash" />
   </section>
@@ -90,7 +98,13 @@ curl http://localhost:8080/openai/v1/embeddings \\
        past the viewport at narrow widths instead of wrapping. minmax(0, 1fr)
        caps the track at the available space so children can shrink/wrap. */
     grid-template-columns: minmax(0, 1fr);
-    gap: var(--space-3);
+    gap: var(--space-5);
+    align-items: center;
+  }
+  @media (min-width: 900px) {
+    .hero {
+      grid-template-columns: minmax(0, 1.15fr) minmax(320px, 1fr);
+    }
   }
   .hero::before {
     content: "";
@@ -99,15 +113,61 @@ curl http://localhost:8080/openai/v1/embeddings \\
     background: radial-gradient(ellipse 60% 50% at 20% 15%, var(--glow), transparent 70%);
     pointer-events: none;
   }
+  .hero__copy {
+    display: grid;
+    gap: var(--space-3);
+    align-content: start;
+  }
   .hero h1 {
-    font-size: clamp(2rem, 4.5vw + 1rem, 2.75rem);
+    font-size: clamp(2.25rem, 2.6vw + 1.75rem, 3.5rem);
     line-height: 1.08;
     margin: 0;
-    max-width: 14ch;
+    max-width: 18ch;
   }
   .hero__sub {
-    max-width: 60ch;
+    max-width: 48ch;
+    font-size: 1.05rem;
     color: var(--muted);
+  }
+  .hero__cta {
+    display: flex;
+    gap: var(--space-3);
+    flex-wrap: wrap;
+    margin-top: var(--space-2);
+  }
+  .hero__button {
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+    text-decoration: none;
+    color: var(--ink);
+    background: var(--rust);
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius);
+    border: 1px solid var(--rust);
+    transition:
+      transform var(--duration-fast) var(--ease-standard),
+      background var(--duration-fast) var(--ease-standard);
+  }
+  .hero__button:hover {
+    transform: translateY(-1px);
+  }
+  .hero__button--ghost {
+    color: var(--paper);
+    background: transparent;
+    border-color: var(--muted);
+  }
+  .hero__button--ghost:hover {
+    border-color: var(--paper);
+  }
+  .hero__visual {
+    align-self: center;
+    padding: var(--space-4);
+    border: var(--hairline);
+    border-radius: calc(var(--radius) * 2);
+    background: rgba(24, 22, 15, 0.5);
+  }
+  .hero__visual :global(.flow__controls) {
+    justify-content: flex-start;
   }
   .steps {
     max-width: 60ch;
@@ -123,3 +183,17 @@ curl http://localhost:8080/openai/v1/embeddings \\
     margin: var(--space-3) 0;
   }
 </style>
+
+<script>
+  import gsap from "gsap";
+
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (!reduceMotion) {
+    gsap.timeline({ defaults: { ease: "power3.out" } })
+      .from(".hash-strip", { opacity: 0, y: 10, duration: 0.45 })
+      .from(".hero h1", { opacity: 0, y: 18, duration: 0.6 }, "-=0.25")
+      .from(".hero__sub", { opacity: 0, y: 12, duration: 0.5 }, "-=0.35")
+      .from(".hero__cta a", { opacity: 0, y: 10, duration: 0.4, stagger: 0.08 }, "-=0.3")
+      .from(".hero__visual", { opacity: 0, y: 16, duration: 0.6 }, "-=0.35");
+  }
+</script>

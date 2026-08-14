@@ -35,14 +35,19 @@ html,
 body {
   margin: 0;
   padding: 0;
-  background: var(--ink);
   color: var(--paper);
   font-family: var(--font-sans);
   line-height: 1.55;
 }
 
+body {
+  background:
+    radial-gradient(circle at 1px 1px, rgba(242, 238, 230, 0.045) 1px, transparent 0) 0 0 / 26px 26px,
+    var(--ink);
+}
+
 main {
-  max-width: 860px;
+  max-width: 1100px;
   margin: 0 auto;
   padding: var(--space-5) var(--space-4);
 }

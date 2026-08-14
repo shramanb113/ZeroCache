@@ -21,8 +21,18 @@ import StatCallout from "../components/StatCallout.astro";
     </p>
     <div class="chart chart--composition" role="img" aria-label="9-item re-index: 7 cache hits, 2 provider calls">
       <svg viewBox="0 0 320 40" preserveAspectRatio="none">
-        <rect x="0" y="8" width="245" height="24" rx="4" fill="var(--hit)" />
-        <rect x="247" y="8" width="73" height="24" rx="4" fill="var(--miss)" />
+        <defs>
+          <linearGradient id="grad-hit" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0%" stop-color="var(--hit)" stop-opacity="0.7" />
+            <stop offset="100%" stop-color="var(--hit)" />
+          </linearGradient>
+          <linearGradient id="grad-miss" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0%" stop-color="var(--miss)" stop-opacity="0.7" />
+            <stop offset="100%" stop-color="var(--miss)" />
+          </linearGradient>
+        </defs>
+        <rect x="0" y="8" width="245" height="24" rx="4" fill="url(#grad-hit)" class="chart__bar" data-animate-bar />
+        <rect x="247" y="8" width="73" height="24" rx="4" fill="url(#grad-miss)" class="chart__bar" data-animate-bar />
       </svg>
       <div class="chart__labels">
         <span class="chart__label chart__label--hit">7 cache hits (free)</span>
@@ -35,31 +45,29 @@ import StatCallout from "../components/StatCallout.astro";
     <h2>Miss vs. hit latency</h2>
     <p>Measured in the Mastra agentic battle-test, same corpus, before and after caching.</p>
     <div class="chart-grid">
-      <div class="chart chart--pair">
-        <h3 class="chart__title">Ingest (per doc)</h3>
-        <svg viewBox="0 0 120 100" role="img" aria-label="Ingest latency: 983 milliseconds before caching, 5 milliseconds after">
-          <rect x="20" y="4" width="24" height="86" rx="4" fill="var(--miss)" />
-          <rect x="76" y="87" width="24" height="3" rx="1.5" fill="var(--hit)" />
-          <text x="32" y="98" text-anchor="middle" class="chart__tick">before</text>
-          <text x="88" y="98" text-anchor="middle" class="chart__tick">after</text>
+      <div class="chart chart--dumbbell">
+        <h3 class="chart__title">Ingest (per doc) — 196× faster</h3>
+        <svg viewBox="0 0 220 40" role="img" aria-label="Ingest latency: 983 milliseconds before caching, 5 milliseconds after — 196 times faster">
+          <line x1="20" y1="20" x2="200" y2="20" class="chart__dumbbell-line" />
+          <circle cx="20" cy="20" r="7" fill="var(--miss)" class="chart__dot" data-animate-dot />
+          <circle cx="200" cy="20" r="7" fill="var(--hit)" class="chart__dot" data-animate-dot />
+          <text x="20" y="8" text-anchor="middle" class="chart__dot-label chart__dot-label--miss">983ms</text>
+          <text x="200" y="8" text-anchor="middle" class="chart__dot-label chart__dot-label--hit">5ms</text>
+          <text x="20" y="35" text-anchor="middle" class="chart__tick">before</text>
+          <text x="200" y="35" text-anchor="middle" class="chart__tick">after</text>
         </svg>
-        <div class="chart__values">
-          <span class="chart__value chart__value--miss">983ms</span>
-          <span class="chart__value chart__value--hit">5ms</span>
-        </div>
       </div>
-      <div class="chart chart--pair">
-        <h3 class="chart__title">Query</h3>
-        <svg viewBox="0 0 120 100" role="img" aria-label="Query latency: about 600 milliseconds before caching, about 1 millisecond after">
-          <rect x="20" y="4" width="24" height="86" rx="4" fill="var(--miss)" />
-          <rect x="76" y="88" width="24" height="2" rx="1" fill="var(--hit)" />
-          <text x="32" y="98" text-anchor="middle" class="chart__tick">before</text>
-          <text x="88" y="98" text-anchor="middle" class="chart__tick">after</text>
+      <div class="chart chart--dumbbell">
+        <h3 class="chart__title">Query — ~600× faster</h3>
+        <svg viewBox="0 0 220 40" role="img" aria-label="Query latency: about 600 milliseconds before caching, about 1 millisecond after — about 600 times faster">
+          <line x1="20" y1="20" x2="200" y2="20" class="chart__dumbbell-line" />
+          <circle cx="20" cy="20" r="7" fill="var(--miss)" class="chart__dot" data-animate-dot />
+          <circle cx="200" cy="20" r="7" fill="var(--hit)" class="chart__dot" data-animate-dot />
+          <text x="20" y="8" text-anchor="middle" class="chart__dot-label chart__dot-label--miss">~600ms</text>
+          <text x="200" y="8" text-anchor="middle" class="chart__dot-label chart__dot-label--hit">~1ms</text>
+          <text x="20" y="35" text-anchor="middle" class="chart__tick">before</text>
+          <text x="200" y="35" text-anchor="middle" class="chart__tick">after</text>
         </svg>
-        <div class="chart__values">
-          <span class="chart__value chart__value--miss">~600ms</span>
-          <span class="chart__value chart__value--hit">~1ms</span>
-        </div>
       </div>
     </div>
   </section>
@@ -85,15 +93,15 @@ import StatCallout from "../components/StatCallout.astro";
 <style>
   .chart-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
     gap: var(--space-4);
-    max-width: 400px;
+    max-width: 560px;
   }
   .chart {
     display: grid;
     gap: var(--space-2);
   }
-  .chart--pair svg {
+  .chart--dumbbell svg {
     width: 100%;
     height: auto;
   }
@@ -108,17 +116,26 @@ import StatCallout from "../components/StatCallout.astro";
     font-family: var(--font-mono);
     font-size: 6px;
   }
-  .chart__values {
-    display: flex;
-    justify-content: space-around;
+  .chart__dumbbell-line {
+    stroke: var(--muted);
+    stroke-width: 2;
+    opacity: 0.5;
+  }
+  .chart__dot {
+    stroke: var(--ink);
+    stroke-width: 2;
+    filter: drop-shadow(0 0 3px currentColor);
+  }
+  .chart__dot-label {
     font-family: var(--font-mono);
-    font-size: 0.8rem;
+    font-size: 9px;
+    font-weight: 600;
   }
-  .chart__value--miss {
-    color: var(--miss);
+  .chart__dot-label--miss {
+    fill: var(--miss);
   }
-  .chart__value--hit {
-    color: var(--hit);
+  .chart__dot-label--hit {
+    fill: var(--hit);
   }
   .chart--composition svg {
     width: 100%;
@@ -144,4 +161,56 @@ import StatCallout from "../components/StatCallout.astro";
     flex-wrap: wrap;
     margin: var(--space-3) 0;
   }
+  .chart__bar {
+    transform-box: fill-box;
+    transform-origin: left center;
+  }
 </style>
+
+<script>
+  import gsap from "gsap";
+
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  const revealOnIntersect = (el: Element, run: () => void) => {
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            run();
+            observer.unobserve(entry.target);
+          }
+        });
+      },
+      { threshold: 0.3 }
+    );
+    observer.observe(el);
+  };
+
+  document.querySelectorAll<HTMLElement>(".chart--composition").forEach((chart) => {
+    const bars = chart.querySelectorAll<SVGRectElement>("[data-animate-bar]");
+    if (bars.length === 0 || reduceMotion) return;
+    gsap.set(bars, { scaleX: 0 });
+    revealOnIntersect(chart, () => {
+      gsap.to(bars, { scaleX: 1, duration: 0.8, ease: "power3.out", stagger: 0.15 });
+    });
+  });
+
+  document.querySelectorAll<HTMLElement>(".chart--dumbbell").forEach((chart) => {
+    const line = chart.querySelector<SVGLineElement>(".chart__dumbbell-line");
+    const dots = chart.querySelectorAll<SVGCircleElement>("[data-animate-dot]");
+    const labels = chart.querySelectorAll<SVGTextElement>(".chart__dot-label");
+    if (!line || dots.length === 0 || reduceMotion) return;
+
+    gsap.set(line, { scaleX: 0, transformOrigin: "left center" });
+    gsap.set(dots, { scale: 0, transformOrigin: "center" });
+    gsap.set(labels, { opacity: 0 });
+
+    revealOnIntersect(chart, () => {
+      const tl = gsap.timeline();
+      tl.to(line, { scaleX: 1, duration: 0.5, ease: "power2.out" })
+        .to(dots, { scale: 1, duration: 0.5, ease: "back.out(2.2)", stagger: 0.12 }, "-=0.2")
+        .to(labels, { opacity: 1, duration: 0.35, stagger: 0.12 }, "-=0.4");
+    });
+  });
+</script>
