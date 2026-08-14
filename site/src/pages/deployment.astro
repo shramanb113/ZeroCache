@@ -1,0 +1,101 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import CodeBlock from "../components/CodeBlock.astro";
+
+const dockerRun = `docker run -p 8080:8080 \\
+  -e ZEROCACHE_STORAGE_BACKEND=sled \\
+  ghcr.io/shramanb113/zerocache:latest`;
+
+const composeSnippet = `services:
+  zerocache:
+    image: ghcr.io/shramanb113/zerocache:latest
+    ports: ["8080:8080"]
+    environment:
+      ZEROCACHE_STORAGE_BACKEND: redis
+      ZEROCACHE_REDIS_URL: redis://redis:6379
+    depends_on: [redis]
+  redis:
+    image: redis:7-alpine`;
+
+const envVars = [
+  ["ZEROCACHE_STORAGE_BACKEND", "sled (default) or redis"],
+  ["ZEROCACHE_TTL_SECONDS", "Unset by default — entries never expire. 0 or unparseable is treated as unset."],
+  ["ZEROCACHE_OPENAI_BASE_URL / _MISTRAL_ / _GEMINI_ / _HUGGINGFACE_BASE_URL", "Override for self-hosted, wire-compatible endpoints"],
+  ["ZEROCACHE_AZURE_OPENAI_BASE_URL / _AZURE_FOUNDRY_BASE_URL", "Azure resource hostnames — azure only registers as a provider once one of these is set"],
+  ["ZEROCACHE_AZURE_AUTH_MODE", "bearer (Entra token, default) or api-key"],
+  ["ZEROCACHE_BEDROCK_REGION", "Default AWS region for Bedrock requests that don't specify one"],
+  ["ZEROCACHE_VERTEX_PROJECT / _VERTEX_LOCATION", "Default GCP project/location for Vertex AI requests that don't specify one"],
+];
+---
+
+<BaseLayout
+  title="Deployment"
+  description="Run Zerocache via Docker, Docker Compose with Redis, or as a multi-replica Kubernetes deployment."
+>
+  <h1>Deployment</h1>
+
+  <section class="section">
+    <h2>Docker</h2>
+    <CodeBlock code={dockerRun} lang="bash" />
+    <p>No server-side provider credentials needed — every caller brings its own key per request.</p>
+  </section>
+
+  <section class="section">
+    <h2>Docker Compose (with Redis)</h2>
+    <CodeBlock code={composeSnippet} lang="yaml" />
+  </section>
+
+  <section class="section">
+    <h2>Kubernetes / multi-replica</h2>
+    <p>
+      Set <code>ZEROCACHE_STORAGE_BACKEND=redis</code> so every replica shares one store. Redis
+      writes are last-write-wins with no distributed lock — content-addressing means two replicas
+      racing to fill the same key both compute the same value, so this is safe. <code>GET /metrics</code>
+      is Prometheus text format specifically so a scrape-and-<code>sum()</code> aggregates hits and
+      misses across pods; a single pod's own counters aren't meaningful on their own once there's
+      more than one replica.
+    </p>
+  </section>
+
+  <section class="section">
+    <h2>Environment variables</h2>
+    <table class="table">
+      <thead><tr><th>Variable</th><th>Purpose</th></tr></thead>
+      <tbody>
+        {envVars.map(([name, purpose]) => (
+          <tr><td><code>{name}</code></td><td>{purpose}</td></tr>
+        ))}
+      </tbody>
+    </table>
+  </section>
+
+  <section class="section">
+    <h2>CI/CD</h2>
+    <p>
+      Every push runs the full workspace test suite and clippy with warnings denied. On a push to
+      <code>master</code>, a separate workflow builds and publishes a multi-stage Docker image to
+      GHCR after CI passes.
+    </p>
+  </section>
+</BaseLayout>
+
+<style>
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+.table th,
+.table td {
+  text-align: left;
+  padding: var(--space-2);
+  border-bottom: var(--hairline);
+  vertical-align: top;
+}
+.table th {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-weight: 400;
+  font-size: 0.8rem;
+}
+</style>
