@@ -1,0 +1,72 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import ProviderCard from "../components/ProviderCard.astro";
+
+const providers = [
+  { name: "OpenAI", auth: "Bearer key", text: true, image: false },
+  { name: "Mistral", auth: "Bearer key", text: true, image: false },
+  { name: "Gemini", auth: "Bearer key", text: true, image: true },
+  {
+    name: "HuggingFace",
+    auth: "Bearer key",
+    text: true,
+    image: false,
+    grammar: "model is part of the URL path, not the body",
+  },
+  {
+    name: "Bedrock",
+    auth: "Bearer key (AWS bearer API key)",
+    text: true,
+    image: false,
+    grammar: "[<region>/]<modelId>[#<input_type>]",
+  },
+  {
+    name: "Vertex AI",
+    auth: "Bearer (GCP OAuth2 token)",
+    text: true,
+    image: false,
+    grammar: "[<location>/<project>/]<modelId>[#<task_type>]",
+  },
+  {
+    name: "Azure",
+    auth: "Bearer (Entra token, default) or api-key",
+    text: true,
+    image: false,
+    grammar: "[foundry:]<deployment>[#<input_type>]",
+  },
+];
+---
+
+<BaseLayout
+  title="Providers"
+  description="All 7 embedding providers Zerocache supports, with auth style, text/image support, and model-string grammar."
+>
+  <h1>Providers</h1>
+  <p>
+    Every request is bring-your-own-key: Zerocache never holds a provider credential beyond the
+    duration of one request. <code>{"{provider}"}</code> in the URL path selects which adapter
+    handles the request; the three cloud providers encode routing coordinates (region, project,
+    input type) into the <code>model</code> string itself rather than a new wire field, since
+    <code>model</code> is already free-form per-request and already lands in the cache key.
+  </p>
+  <div class="provider-grid">
+    {providers.map((p) => (
+      <ProviderCard
+        name={p.name}
+        auth={p.auth}
+        text={p.text}
+        image={p.image}
+        grammar={p.grammar}
+      />
+    ))}
+  </div>
+</BaseLayout>
+
+<style>
+  .provider-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: var(--space-3);
+    margin-top: var(--space-4);
+  }
+</style>
