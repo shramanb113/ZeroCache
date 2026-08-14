@@ -1,0 +1,61 @@
+---
+interface Props {
+  hex?: string;
+}
+const { hex = "7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d906" } = Astro.props;
+---
+
+<div class="hash-strip" data-target={hex}>
+  <span class="hash-strip__label">CacheKey</span>
+  <span class="hash-strip__value"></span>
+</div>
+
+<style>
+  .hash-strip {
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--muted);
+    border: var(--hairline);
+    border-radius: var(--radius);
+    padding: var(--space-1) var(--space-2);
+  }
+  .hash-strip__label {
+    color: var(--rust);
+  }
+  .hash-strip__value {
+    color: var(--paper);
+    letter-spacing: 0.02em;
+  }
+</style>
+
+<script>
+  const CHARSET = "0123456789abcdef";
+  const el = document.querySelector<HTMLElement>(".hash-strip");
+  const valueEl = el?.querySelector<HTMLElement>(".hash-strip__value");
+  if (el && valueEl) {
+    const target = el.dataset.target ?? "";
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reduceMotion) {
+      valueEl.textContent = target;
+    } else {
+      let frame = 0;
+      const totalFrames = 18;
+      const interval = setInterval(() => {
+        frame += 1;
+        const resolved = Math.floor((frame / totalFrames) * target.length);
+        const scrambled = Array.from(
+          { length: target.length - resolved },
+          () => CHARSET[Math.floor(Math.random() * CHARSET.length)]
+        ).join("");
+        valueEl.textContent = target.slice(0, resolved) + scrambled;
+        if (frame >= totalFrames) {
+          clearInterval(interval);
+          valueEl.textContent = target;
+        }
+      }, 45);
+    }
+  }
+</script>
