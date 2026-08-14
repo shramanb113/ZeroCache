@@ -1,8 +1,104 @@
 ---
 import BaseLayout from "../layouts/BaseLayout.astro";
+import HashStrip from "../components/HashStrip.astro";
+import FlowDiagram from "../components/FlowDiagram.astro";
+import StatCallout from "../components/StatCallout.astro";
+import CodeBlock from "../components/CodeBlock.astro";
+
+const base = import.meta.env.BASE_URL;
+
+const quickstart = `docker run -p 8080:8080 ghcr.io/shramanb113/zerocache:latest
+
+curl http://localhost:8080/openai/v1/embeddings \\
+  -H "Authorization: Bearer $OPENAI_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model": "text-embedding-3-small", "input": "hello world"}'`;
 ---
 
-<BaseLayout title="Home" description="Placeholder — replaced in Task 9.">
-  <h1>Layout check</h1>
-  <p>Nav, footer, tokens, and fonts render correctly.</p>
+<BaseLayout
+  title="Home"
+  description="A drop-in, Rust-native embedding cache. Point your OpenAI-compatible client at Zerocache instead of the real provider."
+>
+  <section class="hero">
+    <HashStrip />
+    <h1>Stop paying to re-embed text you've already embedded.</h1>
+    <p class="hero__sub">
+      Zerocache sits between your ingestion pipeline and your embedding provider. It intercepts
+      <code>/v1/embeddings</code>, serves identical inputs from a local content-addressed store, and
+      forwards only cache misses upstream. No SDK, no framework plugin — point your existing client
+      at a new <code>base_url</code>.
+    </p>
+  </section>
+
+  <section class="section">
+    <h2>How it works</h2>
+    <FlowDiagram />
+    <ol class="steps">
+      <li>
+        Your client sends a normal <code>POST /{"{provider}"}/v1/embeddings</code> request to
+        Zerocache instead of the real provider.
+      </li>
+      <li>
+        Zerocache derives a content-addressed key from your forwarded API key, the provider, model,
+        and text.
+      </li>
+      <li>
+        Anything already in the store returns instantly. Anything new is batched to the real
+        provider, using your key.
+      </li>
+      <li>New vectors are written back and returned in the original request order.</li>
+      <li>
+        Concurrent misses on the exact same text are coalesced into one upstream call, not one per
+        request.
+      </li>
+    </ol>
+  </section>
+
+  <section class="section">
+    <h2>Measured, not claimed</h2>
+    <div class="stat-row">
+      <StatCallout value="7 / 9" label="cache hits re-indexing an edited corpus" tone="hit" />
+      <StatCallout value="983ms → 5ms" label="ingest latency, miss vs. hit" tone="hit" />
+      <StatCallout value="7" label="embedding providers supported" tone="neutral" />
+    </div>
+    <p>
+      Full methodology and all three consumer battle-tests on the
+      <a href={`${base}benchmarks/`}>Benchmarks</a> page.
+    </p>
+  </section>
+
+  <section class="section">
+    <h2>Try it</h2>
+    <CodeBlock code={quickstart} lang="bash" />
+  </section>
 </BaseLayout>
+
+<style>
+  .hero {
+    padding: var(--space-6) 0 var(--space-5);
+    display: grid;
+    gap: var(--space-3);
+  }
+  .hero h1 {
+    font-size: 2.25rem;
+    margin: 0;
+    max-width: 14ch;
+  }
+  .hero__sub {
+    max-width: 60ch;
+    color: var(--muted);
+  }
+  .steps {
+    max-width: 60ch;
+    padding-left: 1.2em;
+  }
+  .steps li {
+    margin-bottom: var(--space-2);
+  }
+  .stat-row {
+    display: flex;
+    gap: var(--space-5);
+    flex-wrap: wrap;
+    margin: var(--space-3) 0;
+  }
+</style>
