@@ -1,0 +1,144 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import FlowDiagram from "../components/FlowDiagram.astro";
+
+const layers = [
+  { name: "Interface / Transport", role: "HTTP surface, wire-shape translation, response shaping", ioAware: true },
+  { name: "Application", role: "Orchestrates end-to-end cache flow via ports", ioAware: false },
+  { name: "Ports", role: "Trait contracts for storage, provider, wire-shape access", ioAware: false },
+  { name: "Adapters", role: "Concrete implementations of ports", ioAware: true },
+  { name: "Core (domain)", role: "Cache key derivation, hit/miss reconciliation", ioAware: false },
+];
+
+const crates = [
+  ["zerocache-core", "Domain: CacheKey, owner_id derivation, reconciliation — no dependencies"],
+  ["zerocache-ports", "Trait definitions (incl. StoreError/ProviderError/ProviderUsage)"],
+  ["zerocache-adapters-sled", "EmbeddingStore impl, embedded/single-instance"],
+  ["zerocache-adapters-redis", "EmbeddingStore impl, shared/multi-instance"],
+  ["zerocache-adapters-openai", "EmbeddingProvider impl (OpenAI)"],
+  ["zerocache-adapters-mistral", "EmbeddingProvider impl (Mistral)"],
+  ["zerocache-adapters-gemini", "EmbeddingProvider + ImageEmbeddingProvider impl (Gemini)"],
+  ["zerocache-adapters-huggingface", "EmbeddingProvider impl (HuggingFace)"],
+  ["zerocache-adapters-cloud", "Shared cloud adapter kit: CloudRouter, TextWireStrategy, transport driver"],
+  ["zerocache-adapters-azure", "EmbeddingProvider impl (Azure OpenAI + Foundry Models)"],
+  ["zerocache-adapters-bedrock", "EmbeddingProvider impl (Amazon Bedrock: Titan, Cohere)"],
+  ["zerocache-adapters-vertexai", "EmbeddingProvider impl (GCP Vertex AI :predict)"],
+  ["zerocache-http", "axum transport, wire-shape translation, provider registry, application wiring"],
+];
+
+const principles = [
+  ["Content-addressed keys", "CacheKey = blake3(owner_id + provider + cache_scope + model + model_version + text). Model identity is included deliberately, so a model/version upgrade can't silently return a stale-but-plausible vector."],
+  ["Owner-scoped, not globally shared", "Two callers embedding identical text under the same model and same forwarded key share a hit for free; two different callers never do — cost fairness and to avoid a cache-timing existence-leak risk."],
+  ["Cache scope", "A hash-derived scope component so a self-hosted or region-specific upstream can never silently reuse a vector computed by a different upstream behind the same model string."],
+  ["In-process request coalescing", "Concurrent misses on the exact same key share one provider call instead of each paying for it independently — proven with 5 concurrent misses producing exactly 1 real provider call."],
+];
+---
+
+<BaseLayout
+  title="Architecture"
+  description="Zerocache's layered, dependency-inward architecture: core, ports, application, adapters, and transport."
+>
+  <h1>Architecture</h1>
+  <p>
+    Dependencies point inward only — a hard, structurally-enforced rule via Cargo workspace crate
+    boundaries, not just convention. Outer layers know about inner layers; inner layers never know
+    outer layers exist.
+  </p>
+
+  <section class="section">
+    <h2>Layers</h2>
+    <div style="overflow-x: auto;">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Layer</th>
+            <th>Responsibility</th>
+            <th>Knows about I/O?</th>
+          </tr>
+        </thead>
+        <tbody>
+          {layers.map((layer) => (
+            <tr>
+              <td>{layer.name}</td>
+              <td>{layer.role}</td>
+              <td>{layer.ioAware ? "Yes" : "No"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>What a hit vs. a miss actually costs</h2>
+    <FlowDiagram />
+  </section>
+
+  <section class="section">
+    <h2>Design principles</h2>
+    <dl class="principles">
+      {principles.map(([name, text]) => (
+        <div>
+          <dt>{name}</dt>
+          <dd>{text}</dd>
+        </div>
+      ))}
+    </dl>
+  </section>
+
+  <section class="section">
+    <h2>Workspace crates</h2>
+    <div style="overflow-x: auto;">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Crate</th>
+            <th>Responsibility</th>
+          </tr>
+        </thead>
+        <tbody>
+          {crates.map(([name, role]) => (
+            <tr>
+              <td><code>{name}</code></td>
+              <td>{role}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+  }
+  .table th,
+  .table td {
+    text-align: left;
+    padding: var(--space-2);
+    border-bottom: var(--hairline);
+    vertical-align: top;
+  }
+  .table th {
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-weight: 400;
+    font-size: 0.8rem;
+  }
+  .principles {
+    display: grid;
+    gap: var(--space-3);
+    margin: 0;
+  }
+  .principles dt {
+    font-weight: 600;
+    color: var(--paper);
+  }
+  .principles dd {
+    margin: 4px 0 0;
+    color: var(--muted);
+  }
+</style>
