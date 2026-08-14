@@ -1,0 +1,130 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import DecisionAccordion from "../components/DecisionAccordion.astro";
+
+const decisions = [
+  {
+    title: "Provider adapters take an explicit model parameter",
+    why: "The wire contract requires honoring whatever model the client sends per request.",
+    detail: "Without it, one adapter instance could only ever serve a single hardcoded model.",
+  },
+  {
+    title: "Store and provider traits require Send + Sync",
+    why: "zerocache-http shares them across async axum handlers behind Arc<dyn Trait>.",
+    detail: "A structural requirement of the concurrency model, not a stylistic choice.",
+  },
+  {
+    title: "Both port traits return Result, not bare values",
+    why: "Originally scaffolded without this, and it was a real gap.",
+    detail: "Failures panicked instead of surfacing as HTTP errors — fixed once discovered.",
+  },
+  {
+    title: "The Redis storage adapter shipped ahead of the PRD's own schedule",
+    why: "Kubernetes multi-replica deployment was a real near-term requirement, not a hypothetical.",
+    detail: "Confirmed with the PRD's author before building. Sled remains the default; Redis is opt-in.",
+  },
+  {
+    title: "GET /metrics ships in v1, ahead of the full observability spec",
+    why: "Prometheus's scrape-and-sum() model is the only way per-pod counters mean anything once multiple replicas exist.",
+    detail: "Deliberately scoped to just hit/miss/token counters — no per-consumer tagging or latency-saved-vs-baseline yet.",
+  },
+  {
+    title: "Per-request bring-your-own-key replaces one operator-configured provider",
+    why: "Any of seven providers can be selected per request, using the caller's own forwarded key — never Zerocache's.",
+    detail: "This also activated owner-scoping: the cache key now includes a hash of the caller's key, so no two callers ever share an entry.",
+  },
+  {
+    title: "EmbeddingProvider is async",
+    why: "Removed a real architectural wart — two runtimes and a thread-pool hop per request under the old blocking-inside-spawn_blocking design.",
+    detail: "Each adapter also chunks input into batches of 100 and builds its HTTP client with a uniform 30s timeout.",
+  },
+  {
+    title: "Provider timeouts, graceful shutdown, /health + /ready, bounded store calls",
+    why: "A hung upstream connection used to block a request forever.",
+    detail: "Verified for real, not just read for correctness: built and ran on Linux via WSL2, sent a genuine SIGTERM, confirmed a clean shutdown with no dropped in-flight request.",
+  },
+  {
+    title: "input accepts a bare string, not just an array",
+    why: "Real LangChain/TS battle-testing found embedQuery() sends the bare-string form.",
+    detail: "A real RAG app's question-answering path failed 100% of the time against Zerocache until this fix — document ingestion (the array form) had worked fine the whole time, masking the bug.",
+  },
+  {
+    title: "Malformed-JSON and wrong-shape errors use the app's own error envelope",
+    why: "They used to return axum's default plain-text body — a real inconsistency the LangChain battle-test flagged.",
+    detail: "Same status code and message axum already computed, just wrapped in the app's own { \"error\": \"...\" } shape.",
+  },
+  {
+    title: "Concurrent misses on the exact same key are coalesced into one provider call",
+    why: "5 concurrent misses on a never-before-seen text used to produce 5 real provider calls before this fix.",
+    detail: "In-process only — two replicas behind a load balancer each keep their own independent in-flight map. Proven with a dedicated concurrency test.",
+  },
+  {
+    title: "Provider adapters retry transient failures with exponential backoff",
+    why: "Motivated by a real 429 hit against Gemini during the Python/LlamaIndex battle-test, not a hypothetical.",
+    detail: "Retries 5xx/408/429/connection errors, never other 4xx.",
+  },
+  {
+    title: "Full request tracing, OTLP export optional",
+    why: "No collector required to run Zerocache locally, matching the existing pattern for optional env-gated behavior.",
+    detail: "A trace shows the full HTTP handler → cache lookup → provider call → store write path when enabled.",
+  },
+  {
+    title: "Image embeddings are a separate port, implemented by Gemini only",
+    why: "OpenAI's public API has no image-embedding endpoint at all, verified live at planning time.",
+    detail: "A default method bolted onto EmbeddingProvider would force dead code onto every text-only adapter.",
+  },
+  {
+    title: "HuggingFace: a fourth text-only provider, model in the URL path",
+    why: "HuggingFace's unified router is chat-completions-only and explicitly excludes embeddings — a genuinely different wire shape.",
+    detail: "Still fits the existing EmbeddingProvider trait unchanged, since model was already a per-call parameter.",
+  },
+  {
+    title: "Duplicate images in one batch are embedded once",
+    why: "Closes a gap the original image-embedding launch had deliberately deferred.",
+    detail: "Mirrors the text path's existing within-batch dedup exactly.",
+  },
+  {
+    title: "Four env vars let adapters point at self-hosted, wire-compatible endpoints",
+    why: "Helps only for services that speak the exact same wire protocol as the real provider.",
+    detail: "Does not add support for Azure, Bedrock, or Vertex AI — none of those are a base-URL swap.",
+  },
+  {
+    title: "Azure, Bedrock, and Vertex AI ship via a shared adapter kit, not three more copies",
+    why: "Each cloud is one API in front of several independent vendor wire shapes.",
+    detail: "Multi-vendor routing lives entirely in the caller's model string — no new wire field, since model was already free-form and already lands in the cache key. All three ship mock-only, with no live-key smoke test yet.",
+  },
+  {
+    title: "CacheKey gained a cache_scope component, invalidating every prior entry once",
+    why: "Without it, two different upstreams behind the same model string could silently share a vector.",
+    detail: "A wrong vector is silent in a way a cold cache start never is — judged the correct tradeoff.",
+  },
+  {
+    title: "Image embedding gets the same request coalescing as text",
+    why: "Closes the last gap the original image-embedding launch had explicitly deferred.",
+    detail: "A second, separate in-flight map — kept apart from the text path's so a burst of image traffic can never contend the text path's lock.",
+  },
+];
+---
+
+<BaseLayout
+  title="Engineering Decisions"
+  description="20 real tradeoffs and deviations from Zerocache's own spec, with the reasoning behind each — including what's deliberately not built yet."
+>
+  <h1>Engineering decisions</h1>
+  <p>
+    Zerocache's own internal spec keeps an explicit log of every place the shipped code diverges
+    from the original plan, and why. This page distills that log — expand any item for the full
+    reasoning.
+  </p>
+  <div class="decisions">
+    {decisions.map((d) => (
+      <DecisionAccordion title={d.title} why={d.why} detail={d.detail} />
+    ))}
+  </div>
+</BaseLayout>
+
+<style>
+  .decisions {
+    margin-top: var(--space-4);
+  }
+</style>
