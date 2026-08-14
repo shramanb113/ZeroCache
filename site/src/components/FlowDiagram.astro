@@ -1,0 +1,101 @@
+---
+---
+
+<div class="flow" data-state="miss">
+  <div class="flow__controls">
+    <button type="button" data-state-btn="miss" aria-pressed="true">miss</button>
+    <button type="button" data-state-btn="hit" aria-pressed="false">hit</button>
+  </div>
+  <svg
+    class="flow__diagram"
+    viewBox="0 0 360 80"
+    role="img"
+    aria-label="Request flow from client through Zerocache to provider"
+  >
+    <text x="10" y="45" class="flow__node-label">client</text>
+    <text x="150" y="45" class="flow__node-label">zerocache</text>
+    <text x="300" y="45" class="flow__node-label">provider</text>
+    <line x1="60" y1="40" x2="130" y2="40" class="flow__line flow__line--always" />
+    <line x1="180" y1="40" x2="290" y2="40" class="flow__line flow__line--conditional" />
+  </svg>
+  <p
+    class="flow__caption"
+    data-caption-miss="Cache miss — full round trip to the real provider"
+    data-caption-hit="Cache hit — served from the store, provider never called"
+  ></p>
+</div>
+
+<style>
+  .flow {
+    display: grid;
+    gap: var(--space-2);
+  }
+  .flow__controls {
+    display: flex;
+    gap: var(--space-2);
+  }
+  .flow__controls button {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    background: transparent;
+    border: var(--hairline);
+    border-radius: var(--radius);
+    color: var(--muted);
+    padding: 2px 10px;
+    cursor: pointer;
+  }
+  .flow__controls button[aria-pressed="true"] {
+    color: var(--paper);
+    border-color: var(--rust);
+  }
+  .flow__diagram {
+    width: 100%;
+    max-width: 360px;
+    height: auto;
+  }
+  .flow__node-label {
+    fill: var(--paper);
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+  .flow__line {
+    stroke: var(--muted);
+    stroke-width: 2;
+  }
+  .flow__line--conditional {
+    stroke-dasharray: 8 4;
+    transition: stroke var(--flow-duration, 600ms) ease;
+  }
+  .flow[data-state="miss"] .flow__line--conditional {
+    stroke: var(--miss);
+    --flow-duration: 600ms;
+  }
+  .flow[data-state="hit"] .flow__line--conditional {
+    stroke: var(--hit);
+    --flow-duration: 80ms;
+  }
+  .flow__caption {
+    font-size: 0.85rem;
+    color: var(--muted);
+    margin: 0;
+  }
+</style>
+
+<script>
+  document.querySelectorAll<HTMLElement>(".flow").forEach((flow) => {
+    const caption = flow.querySelector<HTMLElement>(".flow__caption");
+    const buttons = flow.querySelectorAll<HTMLButtonElement>("[data-state-btn]");
+    const applyState = (state: string) => {
+      flow.dataset.state = state;
+      buttons.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.stateBtn === state)));
+      if (caption) {
+        caption.textContent =
+          state === "hit" ? caption.dataset.captionHit ?? "" : caption.dataset.captionMiss ?? "";
+      }
+    };
+    buttons.forEach((button) => {
+      button.addEventListener("click", () => applyState(button.dataset.stateBtn ?? "miss"));
+    });
+    applyState("miss");
+  });
+</script>
