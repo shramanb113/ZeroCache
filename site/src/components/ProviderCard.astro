@@ -1,0 +1,72 @@
+---
+interface Props {
+  name: string;
+  auth: string;
+  text: boolean;
+  image: boolean;
+  grammar?: string;
+}
+const { name, auth, text, image, grammar } = Astro.props;
+---
+
+<article class="provider-card">
+  <h3 class="provider-card__name">{name}</h3>
+  <dl class="provider-card__meta">
+    <div>
+      <dt>auth</dt>
+      <dd>{auth}</dd>
+    </div>
+    <div>
+      <dt>text</dt>
+      <dd>{text ? "yes" : "no"}</dd>
+    </div>
+    <div>
+      <dt>images</dt>
+      <dd>{image ? "yes" : "no"}</dd>
+    </div>
+  </dl>
+  {grammar && <code class="provider-card__grammar">{grammar}</code>}
+</article>
+
+<style>
+  .provider-card {
+    border: var(--hairline);
+    border-radius: var(--radius);
+    padding: var(--space-3);
+    display: grid;
+    gap: var(--space-2);
+  }
+  .provider-card__name {
+    margin: 0;
+    font-family: var(--font-sans);
+    font-weight: 700;
+  }
+  .provider-card__meta {
+    margin: 0;
+    display: grid;
+    gap: 4px;
+    font-size: 0.8rem;
+  }
+  .provider-card__meta div {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+  .provider-card__meta dt {
+    color: var(--muted);
+    font-family: var(--font-mono);
+  }
+  .provider-card__meta dd {
+    margin: 0;
+    color: var(--paper);
+  }
+  .provider-card__grammar {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--rust);
+    background: var(--surface);
+    padding: 4px 6px;
+    border-radius: var(--radius);
+    word-break: break-all;
+  }
+</style>
