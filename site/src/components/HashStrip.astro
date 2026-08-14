@@ -21,6 +21,12 @@ const { hex = "7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d906" 
     border: var(--hairline);
     border-radius: var(--radius);
     padding: var(--space-1) var(--space-2);
+    /* The 64-char hex value has no natural break points, so without an
+       explicit cap it forces this badge (and its ancestors) wider than
+       narrow viewports. max-width + flex-wrap let it wrap onto a second
+       line instead of pushing the page into horizontal overflow. */
+    max-width: 100%;
+    flex-wrap: wrap;
   }
   .hash-strip__label {
     color: var(--rust);
@@ -28,6 +34,7 @@ const { hex = "7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d906" 
   .hash-strip__value {
     color: var(--paper);
     letter-spacing: 0.02em;
+    word-break: break-all;
   }
 </style>
 

@@ -5,7 +5,12 @@ import FlowDiagram from "../components/FlowDiagram.astro";
 import StatCallout from "../components/StatCallout.astro";
 import CodeBlock from "../components/CodeBlock.astro";
 
-const base = import.meta.env.BASE_URL;
+// astro.config.mjs sets `base: "/ZeroCache"` with no trailing slash, so
+// import.meta.env.BASE_URL is exactly "/ZeroCache" — normalize to always end
+// in "/" so link construction below (`${base}benchmarks/`) doesn't produce
+// a malformed path like "/ZeroCachebenchmarks/". Same pattern as Nav.astro.
+const rawBase = import.meta.env.BASE_URL;
+const base = rawBase.endsWith("/") ? rawBase : `${rawBase}/`;
 
 const quickstart = `docker run -p 8080:8080 ghcr.io/shramanb113/zerocache:latest
 
@@ -77,6 +82,12 @@ curl http://localhost:8080/openai/v1/embeddings \\
   .hero {
     padding: var(--space-6) 0 var(--space-5);
     display: grid;
+    /* Without an explicit track, an implicit auto column sizes to its
+       content's max-content width regardless of the container's own
+       (definite) width, so a long paragraph like .hero__sub blows out
+       past the viewport at narrow widths instead of wrapping. minmax(0, 1fr)
+       caps the track at the available space so children can shrink/wrap. */
+    grid-template-columns: minmax(0, 1fr);
     gap: var(--space-3);
   }
   .hero h1 {
