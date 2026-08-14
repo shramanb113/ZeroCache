@@ -1,0 +1,136 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import CodeBlock from "../components/CodeBlock.astro";
+
+const textRequest = `POST /{provider}/v1/embeddings
+Authorization: Bearer <caller's real provider API key>
+
+{ "model": "<real upstream model name>", "input": ["text1", "text2"] }`;
+
+const textResponse = `{
+  "object": "list",
+  "data": [{ "embedding": [...], "index": 0 }],
+  "model": "...",
+  "usage": {...}
+}`;
+
+const imageRequest = `POST /gemini/v1/images/embeddings
+Authorization: Bearer <caller's real Gemini API key>
+
+{ "model": "gemini-embedding-2", "input": ["data:image/png;base64,<...>"] }`;
+
+const deleteExample = `DELETE /{provider}/v1/embeddings
+Authorization: Bearer <caller's real provider API key>
+
+{ "model": "...", "input": ["text1", "text2"] }
+
+→ { "deleted": 2 }`;
+
+const errorShapes = [
+  ["401", "Missing or malformed Authorization header"],
+  ["404", "Unknown {provider}, or a provider that doesn't support images/embeddings on this route"],
+  ["422", "Valid JSON, missing or wrong-typed required field"],
+  ["400", "JSON that isn't syntactically valid, or a malformed image data URI"],
+];
+
+const operational = [
+  ["GET /health", "Liveness. Zero I/O — proves only that the process/router is up."],
+  ["GET /ready", "Readiness. 503 on a store-level error; a cache miss on the sentinel key is healthy."],
+  ["GET /metrics", "Prometheus text format: cache hits/misses and provider prompt tokens, labeled by provider and content_type."],
+];
+---
+
+<BaseLayout
+  title="API Reference"
+  description="The full Zerocache wire contract: endpoints, request/response shapes, error semantics, and operational endpoints."
+>
+  <h1>API reference</h1>
+  <p>
+    Every request carries the caller's own provider API key. Two different callers' identical
+    requests never share a cache entry — the cache key is owner-scoped, not just content-addressed.
+  </p>
+
+  <section class="section">
+    <h2>Text embeddings</h2>
+    <CodeBlock code={textRequest} lang="http" />
+    <p>Response:</p>
+    <CodeBlock code={textResponse} lang="json" />
+    <p>
+      <code>input</code> accepts either a JSON array of strings or a single bare JSON string — both
+      are valid, matching OpenAI's real <code>input: string | string[]</code> contract.
+    </p>
+  </section>
+
+  <section class="section">
+    <h2>Image embeddings (Gemini only)</h2>
+    <CodeBlock code={imageRequest} lang="http" />
+    <p>
+      Each <code>input</code> entry is a <code>data:&lt;mime_type&gt;;base64,&lt;data&gt;</code> URI.
+      No other provider implements image embeddings — they 404 with a message naming exactly what's
+      unsupported.
+    </p>
+  </section>
+
+  <section class="section">
+    <h2>Deleting cache entries</h2>
+    <CodeBlock code={deleteExample} lang="http" />
+    <p>The count reflects how many keys were requested for deletion, not how many actually existed — deletion is idempotent.</p>
+  </section>
+
+  <section class="section">
+    <h2>Error shapes</h2>
+    <table class="table">
+      <thead><tr><th>Status</th><th>Meaning</th></tr></thead>
+      <tbody>
+        {errorShapes.map(([status, meaning]) => (
+          <tr><td><code>{status}</code></td><td>{meaning}</td></tr>
+        ))}
+      </tbody>
+    </table>
+    <p>Every error path returns the same <code>{"{ \"error\": \"...\" }"}</code> JSON shape.</p>
+  </section>
+
+  <section class="section">
+    <h2>Response headers</h2>
+    <p>
+      <code>X-Zerocache-Hits</code> / <code>X-Zerocache-Misses</code> accompany every response.
+      <code>usage</code> reflects only tokens actually billed for this request's misses — 0 for an
+      all-hit batch, 0 for a coalesced request that piggybacked, and always 0 for Gemini, which
+      never reports usage.
+    </p>
+  </section>
+
+  <section class="section">
+    <h2>Operational endpoints</h2>
+    <p>Unauthenticated, outside the versioned API contract:</p>
+    <table class="table">
+      <thead><tr><th>Endpoint</th><th>Purpose</th></tr></thead>
+      <tbody>
+        {operational.map(([endpoint, purpose]) => (
+          <tr><td><code>{endpoint}</code></td><td>{purpose}</td></tr>
+        ))}
+      </tbody>
+    </table>
+  </section>
+</BaseLayout>
+
+<style>
+  .table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+  }
+  .table th,
+  .table td {
+    text-align: left;
+    padding: var(--space-2);
+    border-bottom: var(--hairline);
+    vertical-align: top;
+  }
+  .table th {
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-weight: 400;
+    font-size: 0.8rem;
+  }
+</style>
