@@ -1,0 +1,147 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import StatCallout from "../components/StatCallout.astro";
+---
+
+<BaseLayout
+  title="Benchmarks"
+  description="Real, measured results from three independent consumer battle-tests: LangChain/TS, LlamaIndex/Python, and an agentic Mastra RAG pipeline."
+>
+  <h1>Benchmarks</h1>
+  <p>
+    Every number on this page came from a real battle-test against a live local Zerocache instance
+    with real provider keys — not a synthetic benchmark.
+  </p>
+
+  <section class="section">
+    <h2>Re-indexing an edited corpus</h2>
+    <p>
+      A 9-document corpus, re-indexed after editing one document and adding another. The other 7,
+      byte-identical between versions, were served from cache for free.
+    </p>
+    <div class="chart chart--composition" role="img" aria-label="9-item re-index: 7 cache hits, 2 provider calls">
+      <svg viewBox="0 0 320 40" preserveAspectRatio="none">
+        <rect x="0" y="8" width="245" height="24" rx="4" fill="var(--hit)" />
+        <rect x="247" y="8" width="73" height="24" rx="4" fill="var(--miss)" />
+      </svg>
+      <div class="chart__labels">
+        <span class="chart__label chart__label--hit">7 cache hits (free)</span>
+        <span class="chart__label chart__label--miss">2 provider calls</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Miss vs. hit latency</h2>
+    <p>Measured in the Mastra agentic battle-test, same corpus, before and after caching.</p>
+    <div class="chart-grid">
+      <div class="chart chart--pair">
+        <h3 class="chart__title">Ingest (per doc)</h3>
+        <svg viewBox="0 0 120 100" role="img" aria-label="Ingest latency: 983 milliseconds before caching, 5 milliseconds after">
+          <rect x="20" y="4" width="24" height="86" rx="4" fill="var(--miss)" />
+          <rect x="76" y="87" width="24" height="3" rx="1.5" fill="var(--hit)" />
+          <text x="32" y="98" text-anchor="middle" class="chart__tick">before</text>
+          <text x="88" y="98" text-anchor="middle" class="chart__tick">after</text>
+        </svg>
+        <div class="chart__values">
+          <span class="chart__value chart__value--miss">983ms</span>
+          <span class="chart__value chart__value--hit">5ms</span>
+        </div>
+      </div>
+      <div class="chart chart--pair">
+        <h3 class="chart__title">Query</h3>
+        <svg viewBox="0 0 120 100" role="img" aria-label="Query latency: about 600 milliseconds before caching, about 1 millisecond after">
+          <rect x="20" y="4" width="24" height="86" rx="4" fill="var(--miss)" />
+          <rect x="76" y="88" width="24" height="2" rx="1" fill="var(--hit)" />
+          <text x="32" y="98" text-anchor="middle" class="chart__tick">before</text>
+          <text x="88" y="98" text-anchor="middle" class="chart__tick">after</text>
+        </svg>
+        <div class="chart__values">
+          <span class="chart__value chart__value--miss">~600ms</span>
+          <span class="chart__value chart__value--hit">~1ms</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Three independent consumers</h2>
+    <div class="stat-row">
+      <StatCallout value="18/18" label="Mastra agentic checks passed" tone="hit" />
+      <StatCallout value="18/19" label="LlamaIndex/Python real-key tests passed (1 external rate-limit)" tone="hit" />
+      <StatCallout value="17/17" label="LangChain/TS real-key tests passed" tone="hit" />
+    </div>
+    <p>
+      LangChain/TS (a raw embedding client, OpenAI) found the bare-string <code>input</code> gap and
+      the first measured coalescing number. LlamaIndex/Python (Gemini, a second language ecosystem)
+      confirmed the fixes held against a second provider. Mastra (an <em>agentic</em> pipeline —
+      an LLM deciding which tool to call, not a direct embedding client) confirmed the same behavior
+      holds when Zerocache is several layers removed from the caller, and exercised the
+      <code>DELETE</code> routes end-to-end for the first time.
+    </p>
+  </section>
+</BaseLayout>
+
+<style>
+  .chart-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: var(--space-4);
+    max-width: 400px;
+  }
+  .chart {
+    display: grid;
+    gap: var(--space-2);
+  }
+  .chart--pair svg {
+    width: 100%;
+    height: auto;
+  }
+  .chart__title {
+    margin: 0;
+    font-size: 0.85rem;
+    color: var(--muted);
+    font-weight: 400;
+  }
+  .chart__tick {
+    fill: var(--muted);
+    font-family: var(--font-mono);
+    font-size: 6px;
+  }
+  .chart__values {
+    display: flex;
+    justify-content: space-around;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+  }
+  .chart__value--miss {
+    color: var(--miss);
+  }
+  .chart__value--hit {
+    color: var(--hit);
+  }
+  .chart--composition svg {
+    width: 100%;
+    height: 40px;
+    max-width: 480px;
+  }
+  .chart__labels {
+    display: flex;
+    justify-content: space-between;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    max-width: 480px;
+  }
+  .chart__label--hit {
+    color: var(--hit);
+  }
+  .chart__label--miss {
+    color: var(--miss);
+  }
+  .stat-row {
+    display: flex;
+    gap: var(--space-5);
+    flex-wrap: wrap;
+    margin: var(--space-3) 0;
+  }
+</style>
