@@ -1,0 +1,67 @@
+---
+import { Code } from "astro:components";
+
+interface Props {
+  code: string;
+  lang?: string;
+}
+const { code, lang = "bash" } = Astro.props;
+---
+
+<div class="code-block">
+  <button class="code-block__copy" type="button" data-code={code} aria-label="Copy code">
+    copy
+  </button>
+  <Code code={code} lang={lang} theme="material-theme-darker" />
+</div>
+
+<style>
+  .code-block {
+    position: relative;
+    border: var(--hairline);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .code-block :global(pre) {
+    margin: 0;
+    padding: var(--space-3);
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    overflow-x: auto;
+  }
+  .code-block__copy {
+    position: absolute;
+    top: var(--space-2);
+    right: var(--space-2);
+    background: var(--surface);
+    color: var(--muted);
+    border: var(--hairline);
+    border-radius: var(--radius);
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    padding: 2px 8px;
+    cursor: pointer;
+  }
+  .code-block__copy:hover {
+    color: var(--paper);
+  }
+  .code-block__copy[data-copied="true"] {
+    color: var(--hit);
+    border-color: var(--hit);
+  }
+</style>
+
+<script>
+  document.querySelectorAll<HTMLButtonElement>(".code-block__copy").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const code = button.dataset.code ?? "";
+      await navigator.clipboard.writeText(code);
+      button.textContent = "copied";
+      button.dataset.copied = "true";
+      setTimeout(() => {
+        button.textContent = "copy";
+        delete button.dataset.copied;
+      }, 1500);
+    });
+  });
+</script>
