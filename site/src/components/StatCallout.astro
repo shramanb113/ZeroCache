@@ -1,0 +1,36 @@
+---
+interface Props {
+  value: string;
+  label: string;
+  tone?: "hit" | "miss" | "neutral";
+}
+const { value, label, tone = "neutral" } = Astro.props;
+---
+
+<div class={`stat stat--${tone}`}>
+  <span class="stat__value">{value}</span>
+  <span class="stat__label">{label}</span>
+</div>
+
+<style>
+  .stat {
+    display: grid;
+    gap: 2px;
+  }
+  .stat__value {
+    font-family: var(--font-mono);
+    font-size: 2rem;
+    font-weight: 600;
+    color: var(--paper);
+  }
+  .stat--hit .stat__value {
+    color: var(--hit);
+  }
+  .stat--miss .stat__value {
+    color: var(--miss);
+  }
+  .stat__label {
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+</style>
