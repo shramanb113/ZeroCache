@@ -80,6 +80,8 @@ curl http://localhost:8080/openai/v1/embeddings \\
 
 <style>
   .hero {
+    position: relative;
+    overflow: hidden;
     padding: var(--space-6) 0 var(--space-5);
     display: grid;
     /* Without an explicit track, an implicit auto column sizes to its
@@ -90,8 +92,16 @@ curl http://localhost:8080/openai/v1/embeddings \\
     grid-template-columns: minmax(0, 1fr);
     gap: var(--space-3);
   }
+  .hero::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(ellipse 60% 50% at 20% 15%, var(--glow), transparent 70%);
+    pointer-events: none;
+  }
   .hero h1 {
-    font-size: 2.25rem;
+    font-size: clamp(2rem, 4.5vw + 1rem, 2.75rem);
+    line-height: 1.08;
     margin: 0;
     max-width: 14ch;
   }

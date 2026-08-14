@@ -3,14 +3,21 @@ interface Props {
   title: string;
   why: string;
   detail: string;
+  index?: number;
 }
-const { title, why, detail } = Astro.props;
+const { title, why, detail, index } = Astro.props;
 ---
 
 <details class="decision">
   <summary class="decision__summary">
-    <span class="decision__title">{title}</span>
-    <span class="decision__why">{why}</span>
+    {index !== undefined && (
+      <span class="decision__index" aria-hidden="true">{String(index + 1).padStart(2, "0")}</span>
+    )}
+    <span class="decision__chevron" aria-hidden="true"></span>
+    <span class="decision__text">
+      <span class="decision__title">{title}</span>
+      <span class="decision__why">{why}</span>
+    </span>
   </summary>
   <p class="decision__detail">{detail}</p>
 </details>
@@ -23,15 +30,44 @@ const { title, why, detail } = Astro.props;
   .decision__summary {
     cursor: pointer;
     display: grid;
-    gap: 4px;
+    grid-template-columns: auto auto 1fr;
+    align-items: start;
+    gap: var(--space-2);
     list-style: none;
   }
   .decision__summary::-webkit-details-marker {
     display: none;
   }
+  .decision__summary:hover .decision__title {
+    color: var(--rust);
+  }
+  .decision__index {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--muted);
+    padding-top: 3px;
+  }
+  .decision__chevron {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    margin-top: 6px;
+    border-right: 1.5px solid var(--muted);
+    border-bottom: 1.5px solid var(--muted);
+    transform: rotate(-45deg);
+    transition: transform var(--duration-fast) var(--ease-standard);
+  }
+  .decision[open] .decision__chevron {
+    transform: rotate(45deg);
+  }
+  .decision__text {
+    display: grid;
+    gap: 4px;
+  }
   .decision__title {
     font-weight: 600;
     color: var(--paper);
+    transition: color var(--duration-fast) var(--ease-standard);
   }
   .decision__why {
     font-size: 0.85rem;
@@ -39,6 +75,7 @@ const { title, why, detail } = Astro.props;
   }
   .decision__detail {
     margin: var(--space-2) 0 0;
+    padding-left: calc(1.5em + var(--space-2) * 2);
     font-size: 0.9rem;
     color: var(--muted);
   }

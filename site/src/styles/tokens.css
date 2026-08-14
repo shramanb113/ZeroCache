@@ -19,6 +19,12 @@
 
   --radius: 3px;
   --hairline: 1px solid var(--muted);
+
+  --glow: rgba(196, 98, 47, 0.14);
+  --tracking-tight: -0.02em;
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --duration-fast: 150ms;
+  --duration-standard: 250ms;
 }
 
 * {
@@ -46,7 +52,35 @@ h2,
 h3 {
   font-family: var(--font-sans);
   font-weight: 700;
-  line-height: 1.2;
+  line-height: 1.15;
+  letter-spacing: var(--tracking-tight);
+}
+
+/* Numbered eyebrow above every top-level section heading, site-wide.
+   Pure CSS counters — no markup change needed on any page, so it can't
+   drift from the sections a page actually has. Scoped to `.section > h2`
+   because that's the only pattern used across all seven pages (verified
+   against every page's source before adding this). */
+main {
+  counter-reset: section-counter;
+}
+.section {
+  counter-increment: section-counter;
+}
+.section > h2 {
+  position: relative;
+  padding-left: 2.6em;
+}
+.section > h2::before {
+  content: "§ " counter(section-counter, decimal-leading-zero);
+  position: absolute;
+  left: 0;
+  top: 0.2em;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: var(--rust);
 }
 
 code {
@@ -69,7 +103,9 @@ a {
 body.js-reveal .section {
   opacity: 0;
   transform: translateY(4px);
-  transition: opacity 150ms ease, transform 150ms ease;
+  transition:
+    opacity var(--duration-standard) var(--ease-standard),
+    transform var(--duration-standard) var(--ease-standard);
 }
 
 body.js-reveal .section.is-visible {

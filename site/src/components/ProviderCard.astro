@@ -18,11 +18,15 @@ const { name, auth, text, image, grammar } = Astro.props;
     </div>
     <div>
       <dt>text</dt>
-      <dd>{text ? "yes" : "no"}</dd>
+      <dd class={`provider-card__dd ${text ? "provider-card__dd--yes" : "provider-card__dd--no"}`}>
+        {text ? "yes" : "no"}
+      </dd>
     </div>
     <div>
       <dt>images</dt>
-      <dd>{image ? "yes" : "no"}</dd>
+      <dd class={`provider-card__dd ${image ? "provider-card__dd--yes" : "provider-card__dd--no"}`}>
+        {image ? "yes" : "no"}
+      </dd>
     </div>
   </dl>
   {grammar && <code class="provider-card__grammar">{grammar}</code>}
@@ -35,6 +39,13 @@ const { name, auth, text, image, grammar } = Astro.props;
     padding: var(--space-3);
     display: grid;
     gap: var(--space-2);
+    transition:
+      border-color var(--duration-standard) var(--ease-standard),
+      transform var(--duration-standard) var(--ease-standard);
+  }
+  .provider-card:hover {
+    border-color: var(--rust);
+    transform: translateY(-2px);
   }
   .provider-card__name {
     margin: 0;
@@ -59,6 +70,25 @@ const { name, auth, text, image, grammar } = Astro.props;
   .provider-card__meta dd {
     margin: 0;
     color: var(--paper);
+  }
+  .provider-card__dd {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .provider-card__dd::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex: none;
+  }
+  .provider-card__dd--yes::before {
+    background: var(--hit);
+  }
+  .provider-card__dd--no::before {
+    background: transparent;
+    border: 1px solid var(--muted);
   }
   .provider-card__grammar {
     font-family: var(--font-mono);

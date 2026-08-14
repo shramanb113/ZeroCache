@@ -117,8 +117,8 @@ const decisions = [
     reasoning.
   </p>
   <div class="decisions">
-    {decisions.map((d) => (
-      <DecisionAccordion title={d.title} why={d.why} detail={d.detail} />
+    {decisions.map((d, i) => (
+      <DecisionAccordion title={d.title} why={d.why} detail={d.detail} index={i} />
     ))}
   </div>
 </BaseLayout>

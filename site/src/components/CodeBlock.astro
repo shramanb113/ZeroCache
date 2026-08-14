@@ -41,9 +41,16 @@ const { code, lang = "bash" } = Astro.props;
     font-size: 0.7rem;
     padding: 2px 8px;
     cursor: pointer;
+    transition:
+      color var(--duration-fast) var(--ease-standard),
+      border-color var(--duration-fast) var(--ease-standard),
+      transform 100ms var(--ease-standard);
   }
   .code-block__copy:hover {
     color: var(--paper);
+  }
+  .code-block__copy:active {
+    transform: scale(0.94);
   }
   .code-block__copy[data-copied="true"] {
     color: var(--hit);

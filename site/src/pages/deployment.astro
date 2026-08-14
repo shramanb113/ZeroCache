@@ -82,6 +82,7 @@ const envVars = [
 <style>
 .table {
   width: 100%;
+  table-layout: fixed;
   border-collapse: collapse;
   font-size: 0.9rem;
 }
@@ -91,6 +92,9 @@ const envVars = [
   padding: var(--space-2);
   border-bottom: var(--hairline);
   vertical-align: top;
+}
+.table td code {
+  overflow-wrap: anywhere;
 }
 .table th {
   color: var(--muted);

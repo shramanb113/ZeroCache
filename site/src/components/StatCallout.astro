@@ -17,6 +17,20 @@ const { value, label, tone = "neutral" } = Astro.props;
     display: grid;
     gap: 2px;
   }
+  .stat::before {
+    content: "";
+    display: block;
+    width: 22px;
+    height: 2px;
+    margin-bottom: var(--space-1);
+    background: var(--muted);
+  }
+  .stat--hit::before {
+    background: var(--hit);
+  }
+  .stat--miss::before {
+    background: var(--miss);
+  }
   .stat__value {
     font-family: var(--font-mono);
     font-size: 2rem;
