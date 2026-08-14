@@ -1,0 +1,45 @@
+---
+interface Props {
+  title: string;
+  why: string;
+  detail: string;
+}
+const { title, why, detail } = Astro.props;
+---
+
+<details class="decision">
+  <summary class="decision__summary">
+    <span class="decision__title">{title}</span>
+    <span class="decision__why">{why}</span>
+  </summary>
+  <p class="decision__detail">{detail}</p>
+</details>
+
+<style>
+  .decision {
+    border-bottom: var(--hairline);
+    padding: var(--space-3) 0;
+  }
+  .decision__summary {
+    cursor: pointer;
+    display: grid;
+    gap: 4px;
+    list-style: none;
+  }
+  .decision__summary::-webkit-details-marker {
+    display: none;
+  }
+  .decision__title {
+    font-weight: 600;
+    color: var(--paper);
+  }
+  .decision__why {
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  .decision__detail {
+    margin: var(--space-2) 0 0;
+    font-size: 0.9rem;
+    color: var(--muted);
+  }
+</style>
