@@ -1,0 +1,85 @@
+---
+// astro.config.mjs sets `base: "/ZeroCache"` with no trailing slash, so
+// import.meta.env.BASE_URL is exactly "/ZeroCache" — normalize to always end
+// in "/" so link construction below (`${base}architecture/`) doesn't produce
+// a malformed path like "/ZeroCachearchitecture/".
+const rawBase = import.meta.env.BASE_URL;
+const base = rawBase.endsWith("/") ? rawBase : `${rawBase}/`;
+const { pathname } = Astro.url;
+const links = [
+  { href: `${base}architecture/`, label: "architecture" },
+  { href: `${base}providers/`, label: "providers" },
+  { href: `${base}api/`, label: "api" },
+  { href: `${base}deployment/`, label: "deployment" },
+  { href: `${base}benchmarks/`, label: "benchmarks" },
+  { href: `${base}decisions/`, label: "decisions" },
+];
+---
+
+<nav class="nav">
+  <a class="nav__brand" href={base}>ZEROCACHE</a>
+  <ul class="nav__links">
+    {links.map((link) => (
+      <li>
+        <a
+          href={link.href}
+          class:list={["nav__link", { "nav__link--active": pathname === link.href }]}
+        >
+          {link.label}
+        </a>
+      </li>
+    ))}
+  </ul>
+  <a class="nav__gh" href="https://github.com/shramanb113/ZeroCache" target="_blank" rel="noopener">
+    GitHub
+  </a>
+</nav>
+
+<style>
+  .nav {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    padding: var(--space-3) var(--space-4);
+    border-bottom: var(--hairline);
+    flex-wrap: wrap;
+  }
+  .nav__brand {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    color: var(--paper);
+    text-decoration: none;
+    letter-spacing: 0.04em;
+  }
+  .nav__links {
+    display: flex;
+    gap: var(--space-3);
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    flex-wrap: wrap;
+  }
+  .nav__link {
+    color: var(--muted);
+    text-decoration: none;
+    padding-bottom: 2px;
+    border-bottom: 2px solid transparent;
+  }
+  .nav__link:hover,
+  .nav__link--active {
+    color: var(--paper);
+    border-bottom-color: var(--rust);
+  }
+  .nav__gh {
+    margin-left: auto;
+    color: var(--muted);
+    text-decoration: none;
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+  }
+  .nav__gh:hover {
+    color: var(--paper);
+  }
+</style>
