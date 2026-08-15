@@ -173,18 +173,26 @@ import StatCallout from "../components/StatCallout.astro";
   const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
   const revealOnIntersect = (el: Element, run: () => void) => {
+    let done = false;
+    const fire = () => {
+      if (done) return;
+      done = true;
+      run();
+      observer.unobserve(el);
+    };
     const observer = new IntersectionObserver(
       (entries) => {
         entries.forEach((entry) => {
-          if (entry.isIntersecting) {
-            run();
-            observer.unobserve(entry.target);
-          }
+          if (entry.isIntersecting) fire();
         });
       },
       { threshold: 0.3 }
     );
     observer.observe(el);
+    // Safety net: a tab that's never foregrounded (print, backgrounded on load)
+    // never fires an IntersectionObserver callback, which would otherwise leave
+    // this chart's geometry collapsed (scale/opacity 0) forever.
+    setTimeout(fire, 2500);
   };
 
   document.querySelectorAll<HTMLElement>(".chart--composition").forEach((chart) => {

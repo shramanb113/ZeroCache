@@ -127,3 +127,10 @@ body.js-reveal .section.is-visible {
     transition-duration: 0.001ms !important;
   }
 }
+
+@media print {
+  body.js-reveal .section {
+    opacity: 1 !important;
+    transform: none !important;
+  }
+}

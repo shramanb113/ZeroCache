@@ -6,6 +6,7 @@ on:
     paths:
       - "site/**"
       - ".github/workflows/pages-deploy.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,7 +15,7 @@ permissions:
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
