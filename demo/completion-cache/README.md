@@ -43,3 +43,44 @@ starts cold for its own keys every time (the completion cache has no
 
 Exact-match only — no semantic-similarity tier, no streaming, no real
 tool execution. Those are deferred (see Deviations item 21).
+
+---
+
+# agent.mjs — a real tool-calling agent
+
+`battle-test.mjs` uses a scripted multi-turn chain. `agent.mjs` is an
+actual ReAct-style agent loop: the model picks a tool, the harness runs
+it, feeds the result back, and repeats until the model produces a final
+answer. Every step is a real `/v1/chat/completions` call with a `tools`
+array at `temperature: 0`.
+
+Scenario: a support-triage agent with three tools over in-script data
+(`search_kb`, `get_order`, `resolve_ticket`) resolving a 3-ticket suite.
+
+```sh
+# terminal 1 — point Zerocache at any OpenAI-wire-compatible endpoint
+ZEROCACHE_OPENAI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai \
+  cargo run -p zerocache-http
+
+# terminal 2
+OPENAI_API_KEY=<key> MODEL=gemini-3.5-flash-lite PACE_MS=5000 \
+  node demo/completion-cache/agent.mjs
+```
+
+`MODEL` defaults to `gpt-4o-mini` (expects a real OpenAI key + default
+base URL). `PACE_MS` (default 7000) spaces out **cold-run** calls so a
+provider free-tier per-minute quota doesn't trip; the repeat run is all
+cache hits and never waits.
+
+## The money case it demonstrates
+
+A CI / eval loop: the same ticket suite runs on every commit. Run 1 pays
+full price. Run 2 — identical prompts, tool definitions, and model — is
+served **entirely** from the completion cache, including every
+intermediate tool-call turn: zero upstream calls, 100% off input and
+output tokens, byte-identical resolutions.
+
+Measured against live Gemini (`gemini-3.5-flash-lite`), a 3-ticket run:
+~9 model calls + 9 tool calls on the cold run; the repeat run reused all
+9 and re-billed nothing (~4.4k prompt + ~355 completion tokens saved per
+re-run). It scales with suite size, run frequency, and model price.
