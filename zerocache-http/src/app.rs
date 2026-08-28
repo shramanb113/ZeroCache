@@ -1470,7 +1470,11 @@ mod tests {
         assert_eq!(stats_second.misses, 0);
 
         let calls = provider.recorded_calls();
-        assert_eq!(calls.len(), 1, "the variant must not trigger a second provider call");
+        assert_eq!(
+            calls.len(),
+            1,
+            "the variant must not trigger a second provider call"
+        );
         assert_eq!(
             calls[0],
             vec!["Hello World.".to_string()],
