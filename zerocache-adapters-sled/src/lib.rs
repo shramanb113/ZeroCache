@@ -1,17 +1,27 @@
 use std::time::{Duration, SystemTime};
 
 use zerocache_core::CacheKey;
-use zerocache_ports::{EmbeddingStore, StoreError};
+use zerocache_ports::{CompletionStore, EmbeddingStore, StoreError};
 
 pub struct SledStore {
     db: sled::Db,
+    // Cached chat-completion response blobs live in their own tree, not the
+    // default keyspace: the value encoding differs (an opaque serialized
+    // record, not an fp32 vector) and keeping them separate makes each side
+    // independently iterable/clearable. `CacheKey::derive_completion` is
+    // already domain-separated from `derive`, so this is tidiness, not a
+    // correctness requirement.
+    completions: sled::Tree,
     ttl: Option<Duration>,
 }
 
 impl SledStore {
     pub fn open(path: impl AsRef<std::path::Path>, ttl: Option<Duration>) -> sled::Result<Self> {
+        let db = sled::open(path)?;
+        let completions = db.open_tree("completions")?;
         Ok(Self {
-            db: sled::open(path)?,
+            db,
+            completions,
             ttl,
         })
     }
@@ -50,6 +60,42 @@ impl EmbeddingStore for SledStore {
 
     fn delete(&self, key: &CacheKey) -> Result<(), StoreError> {
         self.db
+            .remove(key.as_bytes())
+            .map_err(|e| StoreError(e.to_string()))?;
+        Ok(())
+    }
+}
+
+impl CompletionStore for SledStore {
+    fn get(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, StoreError> {
+        let raw = self
+            .completions
+            .get(key.as_bytes())
+            .map_err(|e| StoreError(e.to_string()))?;
+
+        let Some(bytes) = raw else { return Ok(None) };
+        let (expires_at, blob) = decode_blob(&bytes);
+
+        if let Some(expires_at) = expires_at {
+            if SystemTime::now() > expires_at {
+                let _ = self.completions.remove(key.as_bytes());
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(blob))
+    }
+
+    fn put(&self, key: CacheKey, value: Vec<u8>) -> Result<(), StoreError> {
+        let expires_at = self.ttl.map(|ttl| SystemTime::now() + ttl);
+        self.completions
+            .insert(key.as_bytes(), encode_blob(expires_at, &value))
+            .map_err(|e| StoreError(e.to_string()))?;
+        Ok(())
+    }
+
+    fn delete(&self, key: &CacheKey) -> Result<(), StoreError> {
+        self.completions
             .remove(key.as_bytes())
             .map_err(|e| StoreError(e.to_string()))?;
         Ok(())
@@ -95,6 +141,39 @@ fn decode(bytes: &[u8]) -> (Option<SystemTime>, Vec<f32>) {
     (expires_at, vector)
 }
 
+// Same 8-byte little-endian expiry prefix as `encode`/`decode` above (0 =
+// never expires), but the payload is an opaque blob (a serialized
+// completion record) rather than an fp32 vector.
+fn encode_blob(expires_at: Option<SystemTime>, blob: &[u8]) -> Vec<u8> {
+    let expires_at_secs: u64 = expires_at
+        .map(|t| {
+            t.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        })
+        .unwrap_or(0);
+
+    let mut out = Vec::with_capacity(8 + blob.len());
+    out.extend_from_slice(&expires_at_secs.to_le_bytes());
+    out.extend_from_slice(blob);
+    out
+}
+
+fn decode_blob(bytes: &[u8]) -> (Option<SystemTime>, Vec<u8>) {
+    let expires_at_secs = u64::from_le_bytes(
+        bytes[0..8]
+            .try_into()
+            .expect("stored value always has an 8-byte expiry prefix"),
+    );
+    let expires_at = if expires_at_secs == 0 {
+        None
+    } else {
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(expires_at_secs))
+    };
+
+    (expires_at, bytes[8..].to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,9 +202,12 @@ mod tests {
         let store = SledStore::open(&dir, None).unwrap();
         let key = CacheKey::derive([1u8; 32], "openai", "test-scope", "m", "v1", "hello");
 
-        assert_eq!(store.get(&key).unwrap(), None);
-        store.put(key, vec![1.0, 2.5, -3.25]).unwrap();
-        assert_eq!(store.get(&key).unwrap(), Some(vec![1.0, 2.5, -3.25]));
+        assert_eq!(EmbeddingStore::get(&store, &key).unwrap(), None);
+        EmbeddingStore::put(&store, key, vec![1.0, 2.5, -3.25]).unwrap();
+        assert_eq!(
+            EmbeddingStore::get(&store, &key).unwrap(),
+            Some(vec![1.0, 2.5, -3.25])
+        );
 
         drop(store);
         std::fs::remove_dir_all(dir).ok();
@@ -144,11 +226,11 @@ mod tests {
             "to be deleted",
         );
 
-        store.put(key, vec![1.0]).unwrap();
-        assert_eq!(store.get(&key).unwrap(), Some(vec![1.0]));
+        EmbeddingStore::put(&store, key, vec![1.0]).unwrap();
+        assert_eq!(EmbeddingStore::get(&store, &key).unwrap(), Some(vec![1.0]));
 
-        store.delete(&key).unwrap();
-        assert_eq!(store.get(&key).unwrap(), None);
+        EmbeddingStore::delete(&store, &key).unwrap();
+        assert_eq!(EmbeddingStore::get(&store, &key).unwrap(), None);
 
         drop(store);
         std::fs::remove_dir_all(dir).ok();
@@ -167,7 +249,7 @@ mod tests {
             "never existed",
         );
 
-        assert!(store.delete(&key).is_ok());
+        assert!(EmbeddingStore::delete(&store, &key).is_ok());
 
         drop(store);
         std::fs::remove_dir_all(dir).ok();
@@ -187,12 +269,12 @@ mod tests {
             "expires immediately",
         );
 
-        store.put(key, vec![1.0]).unwrap();
+        EmbeddingStore::put(&store, key, vec![1.0]).unwrap();
         // The clock must advance past the expiry instant, which a zero-second
         // TTL guarantees for any nonzero wall-clock delay between put and get.
         std::thread::sleep(Duration::from_millis(10));
         assert_eq!(
-            store.get(&key).unwrap(),
+            EmbeddingStore::get(&store, &key).unwrap(),
             None,
             "an expired entry must read as a miss, not a hit"
         );
@@ -214,9 +296,9 @@ mod tests {
             "expires in an hour",
         );
 
-        store.put(key, vec![1.0]).unwrap();
+        EmbeddingStore::put(&store, key, vec![1.0]).unwrap();
         assert_eq!(
-            store.get(&key).unwrap(),
+            EmbeddingStore::get(&store, &key).unwrap(),
             Some(vec![1.0]),
             "an entry well within its TTL must still hit"
         );
@@ -238,12 +320,115 @@ mod tests {
             "lives forever",
         );
 
-        store.put(key, vec![1.0]).unwrap();
+        EmbeddingStore::put(&store, key, vec![1.0]).unwrap();
         std::thread::sleep(Duration::from_millis(10));
         assert_eq!(
-            store.get(&key).unwrap(),
+            EmbeddingStore::get(&store, &key).unwrap(),
             Some(vec![1.0]),
             "with no TTL configured, an entry must never expire"
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn completion_key(text: &str) -> CacheKey {
+        CacheKey::derive_completion([1u8; 32], "openai", "test-scope", "gpt-4o", "v1", text)
+    }
+
+    #[test]
+    fn completion_put_then_get_roundtrips() {
+        let dir = temp_dir();
+        let store = SledStore::open(&dir, None).unwrap();
+        let key = completion_key("req-a");
+
+        assert_eq!(CompletionStore::get(&store, &key).unwrap(), None);
+        CompletionStore::put(&store, key, b"{\"body\":1}".to_vec()).unwrap();
+        assert_eq!(
+            CompletionStore::get(&store, &key).unwrap(),
+            Some(b"{\"body\":1}".to_vec())
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn completion_delete_removes_an_entry() {
+        let dir = temp_dir();
+        let store = SledStore::open(&dir, None).unwrap();
+        let key = completion_key("req-b");
+
+        CompletionStore::put(&store, key, b"blob".to_vec()).unwrap();
+        CompletionStore::delete(&store, &key).unwrap();
+        assert_eq!(CompletionStore::get(&store, &key).unwrap(), None);
+
+        drop(store);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn completion_delete_on_a_missing_key_is_not_an_error() {
+        let dir = temp_dir();
+        let store = SledStore::open(&dir, None).unwrap();
+        assert!(CompletionStore::delete(&store, &completion_key("never")).is_ok());
+
+        drop(store);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn completion_entry_past_its_ttl_reads_as_a_miss() {
+        let dir = temp_dir();
+        let store = SledStore::open(&dir, Some(Duration::from_secs(0))).unwrap();
+        let key = completion_key("expires-now");
+
+        CompletionStore::put(&store, key, b"blob".to_vec()).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(
+            CompletionStore::get(&store, &key).unwrap(),
+            None,
+            "an expired completion entry must read as a miss"
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn completion_entry_within_its_ttl_still_reads_as_a_hit() {
+        let dir = temp_dir();
+        let store = SledStore::open(&dir, Some(Duration::from_secs(3600))).unwrap();
+        let key = completion_key("expires-in-an-hour");
+
+        CompletionStore::put(&store, key, b"blob".to_vec()).unwrap();
+        assert_eq!(
+            CompletionStore::get(&store, &key).unwrap(),
+            Some(b"blob".to_vec())
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn completion_and_embedding_entries_do_not_interfere() {
+        let dir = temp_dir();
+        let store = SledStore::open(&dir, None).unwrap();
+        let embedding_key =
+            CacheKey::derive([1u8; 32], "openai", "test-scope", "gpt-4o", "v1", "shared");
+        let comp_key = completion_key("shared");
+
+        EmbeddingStore::put(&store, embedding_key, vec![1.0, 2.0]).unwrap();
+        CompletionStore::put(&store, comp_key, b"completion-blob".to_vec()).unwrap();
+
+        assert_eq!(
+            EmbeddingStore::get(&store, &embedding_key).unwrap(),
+            Some(vec![1.0, 2.0])
+        );
+        assert_eq!(
+            CompletionStore::get(&store, &comp_key).unwrap(),
+            Some(b"completion-blob".to_vec())
         );
 
         drop(store);
