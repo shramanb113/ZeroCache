@@ -4113,6 +4113,7 @@ name = "zerocache-ports"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "serde_json",
  "zerocache-core",
 ]
 

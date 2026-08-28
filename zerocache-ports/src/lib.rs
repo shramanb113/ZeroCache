@@ -40,6 +40,65 @@ pub trait EmbeddingStore: Send + Sync {
     fn delete(&self, key: &CacheKey) -> Result<(), StoreError>;
 }
 
+/// Opaque byte store for cached chat-completion responses. Separate from
+/// `EmbeddingStore` because the stored value is a serialized response
+/// record, not a raw f32 vector -- a `sled`/`redis` adapter implements both
+/// traits on one struct. The record format (response body + token counts)
+/// is `zerocache-http`'s concern; this trait only moves bytes.
+pub trait CompletionStore: Send + Sync {
+    fn get(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, StoreError>;
+    fn put(&self, key: CacheKey, value: Vec<u8>) -> Result<(), StoreError>;
+    fn delete(&self, key: &CacheKey) -> Result<(), StoreError>;
+}
+
+/// Token counts from a chat-completion response, used only for the
+/// tokens-saved metric on a cache hit. All zero when the provider omits a
+/// usage block or the upstream call returned a non-2xx.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompletionUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+}
+
+/// One upstream chat-completion result. `status` is the HTTP status the
+/// provider returned: the proxy forwards a non-2xx body to the caller
+/// verbatim and never caches it, so the adapter surfaces it as `Ok` with
+/// the real status rather than `Err`. `Err(ProviderError)` is reserved for
+/// transport failures (connection, timeout) where there is no response at
+/// all.
+///
+/// `Clone` so a resolved response can flow through a coalesced in-flight
+/// fetch, the same way `EmbeddingProvider`'s results already do.
+#[derive(Debug, Clone)]
+pub struct ChatCompletionResponse {
+    pub status: u16,
+    pub body: serde_json::Value,
+    pub usage: CompletionUsage,
+}
+
+#[async_trait::async_trait]
+pub trait ChatCompletionProvider: Send + Sync {
+    /// Forwards `request` -- a full OpenAI `/v1/chat/completions` JSON body
+    /// -- to the upstream endpoint using the caller's `api_key`, returning
+    /// the response as-is (no wire-shape translation; the chat shape is the
+    /// contract on both sides).
+    async fn chat_completion(
+        &self,
+        api_key: &str,
+        request: &serde_json::Value,
+    ) -> Result<ChatCompletionResponse, ProviderError>;
+
+    /// Adapter build identifier for cache-key versioning -- see
+    /// `EmbeddingProvider::version`.
+    fn version(&self) -> &'static str;
+
+    /// Upstream-weights identifier for `model` -- see
+    /// `EmbeddingProvider::cache_scope`. For the OpenAI-shaped chat adapter
+    /// this is just the configured base URL.
+    fn cache_scope(&self, model: &str) -> Result<String, ProviderError>;
+}
+
 #[async_trait::async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     async fn embed_batch(
