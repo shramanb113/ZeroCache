@@ -179,7 +179,7 @@ PRD §7 originally assumed a single global key space with namespacing/auth defer
 ## Non-goals for v1 (do not implement without a scope discussion)
 
 - Live/conversational query embedding caching (deferred — low reuse rate, unproven).
-- Semantic/fuzzy similarity matching — v1 is exact-match only.
+- Semantic/fuzzy similarity matching *on the embedding vector* (cosine / ANN nearest-neighbour) — still a non-goal, and a near-pointless one for an embedding cache: finding a near neighbour requires computing the very embedding you're trying to avoid. **Text canonicalization near-match IS in as of 2026-08-28**, though: the cache key hashes `canonicalize_text(text)` (NFC + lowercase + whitespace/quote/dash folding + trailing-sentence-punctuation trim), so inputs differing only in casing/encoding/punctuation share one entry, while the vector stored under it is still a real embedding of the whitespace-`normalize_text`ed original (first miss in the group wins). See `zerocache-core/src/canonicalize.rs` and the `key_texts`/`provider_texts` split in `embed_batch`. `normalize_text` (whitespace-only, feeds the provider) is unchanged.
 - Vector quantization/compression — deferred until a real hit-rate number justifies it.
 - Multi-provider *failover* (automatic fallback if a provider call fails) — still out of scope. (Multi-*provider support* itself is no longer a non-goal, nor is multi-instance *storage* — see "Deviations" above; `zerocache-adapters-redis`, `-mistral`, `-gemini` all exist. Failover specifically — trying a second provider after the first fails — is a different feature, not built.)
 - Any framework-specific SDK/client package in TS or Python — if a consumer needs to install a Zerocache-specific package, the neutrality goal has failed.

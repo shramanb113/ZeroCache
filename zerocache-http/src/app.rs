@@ -9,7 +9,7 @@ use futures::future::{FutureExt, Shared};
 use prometheus::{Encoder, IntCounterVec, Opts, Registry, TextEncoder};
 use tracing::Instrument;
 
-use zerocache_core::{normalize_text, reconcile, CacheKey};
+use zerocache_core::{canonicalize_text, normalize_text, reconcile, CacheKey};
 use zerocache_ports::ImageInput;
 use zerocache_ports::{
     EmbeddingProvider, EmbeddingStore, ImageEmbeddingProvider, ProviderError, ProviderUsage,
@@ -262,12 +262,26 @@ pub async fn embed_batch(
         .provider
         .cache_scope(request.model)
         .map_err(AppError::Provider)?;
-    let normalized_texts: Vec<String> = request
+    // Two derived forms of each input, deliberately split:
+    //  - `provider_texts` (whitespace-only `normalize_text`) is what actually
+    //    gets embedded, so a stored vector is always a real embedding of a
+    //    real caller's actual text.
+    //  - `key_texts` (`canonicalize_text`: also case-folded, NFC'd, quote/dash
+    //    -folded, trailing-punctuation-trimmed) is what the cache key hashes,
+    //    so inputs that differ only in those respects share one entry. The
+    //    first miss in such a group wins: its `provider_texts` form is the one
+    //    embedded and stored for the whole group.
+    let provider_texts: Vec<String> = request
         .texts
         .iter()
         .map(|text| normalize_text(text))
         .collect();
-    let keys: Vec<CacheKey> = normalized_texts
+    let key_texts: Vec<String> = request
+        .texts
+        .iter()
+        .map(|text| canonicalize_text(text))
+        .collect();
+    let keys: Vec<CacheKey> = key_texts
         .iter()
         .map(|text| {
             CacheKey::derive(
@@ -321,7 +335,7 @@ pub async fn embed_batch(
 
         for (index, key) in &reconciled.misses {
             let unique_index = *key_to_unique_index.entry(*key).or_insert_with(|| {
-                unique_miss_texts.push(normalized_texts[*index].clone());
+                unique_miss_texts.push(provider_texts[*index].clone());
                 unique_keys.push(*key);
                 unique_miss_texts.len() - 1
             });
@@ -826,7 +840,9 @@ pub async fn delete_batch(state: &AppState, request: DeleteRequest<'_>) -> Resul
                 &cache_scope,
                 request.model,
                 provider_version,
-                &normalize_text(text),
+                // Must mirror `embed_batch`'s key derivation exactly, so a
+                // DELETE removes the entry a canonical-equal POST wrote.
+                &canonicalize_text(text),
             )
         })
         .collect();
@@ -1366,6 +1382,194 @@ mod tests {
         assert_eq!(
             stats_v2.misses, 1,
             "a different adapter version must not hit the old version's cache entry"
+        );
+    }
+
+    /// A provider mock that records every batch it is asked to embed and
+    /// returns one distinct vector per call position, so a test can assert
+    /// both *how many* provider calls happened and *what exact text* each
+    /// one received.
+    struct RecordingProvider {
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl RecordingProvider {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recorded_calls(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for RecordingProvider {
+        async fn embed_batch(
+            &self,
+            _api_key: &str,
+            _model: &str,
+            texts: &[String],
+        ) -> Result<(Vec<Vec<f32>>, ProviderUsage), ProviderError> {
+            self.calls.lock().unwrap().push(texts.to_vec());
+            let vectors = (0..texts.len()).map(|i| vec![i as f32]).collect();
+            Ok((vectors, ProviderUsage::default()))
+        }
+
+        fn version(&self) -> &'static str {
+            "mock-v1"
+        }
+
+        fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+            Ok("mock-scope".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn casing_and_punctuation_variants_share_one_cache_entry() {
+        let state = state_with(MockStore::empty());
+        let provider: Arc<RecordingProvider> = Arc::new(RecordingProvider::new());
+
+        let first = vec!["Hello   World.".to_string()];
+        let (_, stats_first) = embed_batch(
+            &state,
+            EmbedRequest {
+                provider: Arc::clone(&provider) as Arc<dyn EmbeddingProvider>,
+                provider_name: "openai",
+                api_key: "key",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &first,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats_first.misses, 1, "first phrasing must be a cold miss");
+
+        let second = vec!["hello world".to_string()];
+        let (_, stats_second) = embed_batch(
+            &state,
+            EmbedRequest {
+                provider: Arc::clone(&provider) as Arc<dyn EmbeddingProvider>,
+                provider_name: "openai",
+                api_key: "key",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &second,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            stats_second.hits, 1,
+            "a casing/punctuation-only variant must hit the entry the first phrasing wrote"
+        );
+        assert_eq!(stats_second.misses, 0);
+
+        let calls = provider.recorded_calls();
+        assert_eq!(calls.len(), 1, "the variant must not trigger a second provider call");
+        assert_eq!(
+            calls[0],
+            vec!["Hello World.".to_string()],
+            "the provider must receive the whitespace-normalized original text, \
+             not the lowercased/punctuation-stripped canonical form"
+        );
+    }
+
+    #[tokio::test]
+    async fn casing_variants_within_one_batch_call_provider_once() {
+        let state = state_with(MockStore::empty());
+        let provider: Arc<RecordingProvider> = Arc::new(RecordingProvider::new());
+
+        let texts = vec![
+            "Foo Bar".to_string(),
+            "foo   bar".to_string(),
+            "FOO BAR.".to_string(),
+        ];
+        let (vectors, stats) = embed_batch(
+            &state,
+            EmbedRequest {
+                provider: Arc::clone(&provider) as Arc<dyn EmbeddingProvider>,
+                provider_name: "openai",
+                api_key: "key",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &texts,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.misses, 3, "all three positions are misses");
+        let calls = provider.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            vec!["Foo Bar".to_string()],
+            "the three canonical-equal variants collapse to one provider input, \
+             the first position's whitespace-normalized form"
+        );
+        assert_eq!(
+            vectors,
+            vec![vec![0.0], vec![0.0], vec![0.0]],
+            "every position gets the one fetched vector, order preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_matches_entries_canonically() {
+        let state = state_with(MockStore::empty());
+        let provider: Arc<RecordingProvider> = Arc::new(RecordingProvider::new());
+
+        let written = vec!["Hello World!".to_string()];
+        embed_batch(
+            &state,
+            EmbedRequest {
+                provider: Arc::clone(&provider) as Arc<dyn EmbeddingProvider>,
+                provider_name: "openai",
+                api_key: "key",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &written,
+            },
+        )
+        .await
+        .unwrap();
+
+        let to_delete = vec!["hello world".to_string()];
+        let deleted = delete_batch(
+            &state,
+            DeleteRequest {
+                provider: &*provider,
+                provider_name: "openai",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &to_delete,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleted, 1);
+
+        let (_, stats) = embed_batch(
+            &state,
+            EmbedRequest {
+                provider: Arc::clone(&provider) as Arc<dyn EmbeddingProvider>,
+                provider_name: "openai",
+                api_key: "key",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &written,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stats.misses, 1,
+            "a canonical-equal DELETE must have removed the entry the original POST wrote"
         );
     }
 
