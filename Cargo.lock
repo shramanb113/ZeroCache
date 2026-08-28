@@ -4073,6 +4073,7 @@ name = "zerocache-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "serde_json",
  "unicode-normalization",
 ]
 

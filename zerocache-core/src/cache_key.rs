@@ -63,6 +63,41 @@ impl CacheKey {
         Self(*hasher.finalize().as_bytes())
     }
 
+    /// Cache key for a chat-completion response. Domain-separated from
+    /// `derive` / `derive_image` via the "chat-completion\0" literal below
+    /// the model-version field, so a completion key can never collide with a
+    /// text or image embedding key even if `canonical_request` happens to
+    /// equal some embedding entry's literal text byte-for-byte.
+    ///
+    /// `canonical_request` is the output of
+    /// `canonicalize_completion_request` -- an order-independent
+    /// serialization of every part of the request that changes the
+    /// completion (messages, tools, generation params), with `model` and the
+    /// non-output-affecting fields already removed.
+    pub fn derive_completion(
+        owner_id: [u8; 32],
+        provider: &str,
+        cache_scope: &str,
+        model: &str,
+        model_version: &str,
+        canonical_request: &str,
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&owner_id);
+        hasher.update(b"\0");
+        hasher.update(provider.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(cache_scope.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(model.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(model_version.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(b"chat-completion\0");
+        hasher.update(canonical_request.as_bytes());
+        Self(*hasher.finalize().as_bytes())
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -254,6 +289,98 @@ mod tests {
             a, b,
             "the same bytes decoded under a different mime type are a different image"
         );
+    }
+
+    #[test]
+    fn derive_completion_same_inputs_produce_same_key() {
+        let a = CacheKey::derive_completion(
+            OWNER_A,
+            "openai",
+            SCOPE_A,
+            "gpt-4o",
+            "v1",
+            r#"{"messages":["hi"],"temperature":0}"#,
+        );
+        let b = CacheKey::derive_completion(
+            OWNER_A,
+            "openai",
+            SCOPE_A,
+            "gpt-4o",
+            "v1",
+            r#"{"messages":["hi"],"temperature":0}"#,
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn derive_completion_different_canonical_request_produces_different_key() {
+        let a = CacheKey::derive_completion(
+            OWNER_A,
+            "openai",
+            SCOPE_A,
+            "gpt-4o",
+            "v1",
+            r#"{"messages":["a"]}"#,
+        );
+        let b = CacheKey::derive_completion(
+            OWNER_A,
+            "openai",
+            SCOPE_A,
+            "gpt-4o",
+            "v1",
+            r#"{"messages":["b"]}"#,
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn derive_completion_different_owner_produces_different_key() {
+        let a = CacheKey::derive_completion(OWNER_A, "openai", SCOPE_A, "gpt-4o", "v1", "x");
+        let b = CacheKey::derive_completion(OWNER_B, "openai", SCOPE_A, "gpt-4o", "v1", "x");
+        assert_ne!(a, b, "two different callers must never share a completion");
+    }
+
+    #[test]
+    fn derive_completion_different_cache_scope_produces_different_key() {
+        let a = CacheKey::derive_completion(OWNER_A, "openai", SCOPE_A, "gpt-4o", "v1", "x");
+        let b = CacheKey::derive_completion(OWNER_A, "openai", SCOPE_B, "gpt-4o", "v1", "x");
+        assert_ne!(
+            a, b,
+            "a completion from a different upstream endpoint must not be reused"
+        );
+    }
+
+    #[test]
+    fn derive_completion_field_boundary_is_not_ambiguous() {
+        let a = CacheKey::derive_completion(OWNER_A, "openai", SCOPE_A, "gpt", "4o", "x");
+        let b = CacheKey::derive_completion(OWNER_A, "openai", SCOPE_A, "gpt4", "o", "x");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn derive_completion_never_collides_with_a_text_key_of_identical_bytes() {
+        // The "chat-completion\0" domain-separation literal must make this
+        // impossible even when every other field lines up exactly.
+        let text_key = CacheKey::derive(OWNER_A, "openai", SCOPE_A, "gpt-4o", "v1", "hello");
+        let completion_key =
+            CacheKey::derive_completion(OWNER_A, "openai", SCOPE_A, "gpt-4o", "v1", "hello");
+        assert_ne!(text_key, completion_key);
+    }
+
+    #[test]
+    fn derive_completion_never_collides_with_an_image_key() {
+        let image_key = CacheKey::derive_image(
+            OWNER_A,
+            "openai",
+            SCOPE_A,
+            "gpt-4o",
+            "v1",
+            "image/png",
+            "hello",
+        );
+        let completion_key =
+            CacheKey::derive_completion(OWNER_A, "openai", SCOPE_A, "gpt-4o", "v1", "hello");
+        assert_ne!(image_key, completion_key);
     }
 
     #[test]
