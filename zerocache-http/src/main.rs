@@ -1,4 +1,5 @@
 mod app;
+mod completion;
 mod config;
 mod image;
 mod otel;
@@ -20,6 +21,7 @@ use app::{
     check_store_readiness, delete_batch, embed_batch, AppError, AppState, DeleteRequest,
     EmbedRequest, Metrics,
 };
+use completion::{complete, CompletionRequest};
 use config::{
     Config, StorageBackend, DEFAULT_GEMINI_BASE_URL, DEFAULT_HUGGINGFACE_BASE_URL,
     DEFAULT_MISTRAL_BASE_URL, DEFAULT_OPENAI_BASE_URL,
@@ -37,7 +39,7 @@ use zerocache_adapters_redis::RedisStore;
 use zerocache_adapters_sled::SledStore;
 use zerocache_adapters_vertexai::new_provider as new_vertexai_provider;
 use zerocache_core::derive_owner_id;
-use zerocache_ports::{EmbeddingProvider, EmbeddingStore, ImageEmbeddingProvider};
+use zerocache_ports::{CompletionStore, EmbeddingProvider, EmbeddingStore, ImageEmbeddingProvider};
 
 #[tokio::main]
 async fn main() {
@@ -45,14 +47,33 @@ async fn main() {
     let config = Config::from_env();
     log_overridden_base_urls(&config);
 
-    let store: Arc<dyn EmbeddingStore> = match config.storage_backend {
-        StorageBackend::Sled => Arc::new(
-            SledStore::open(&config.storage_path, config.ttl).expect("failed to open sled store"),
-        ),
-        StorageBackend::Redis => Arc::new(
-            RedisStore::connect(&config.redis_url, config.ttl).expect("failed to connect to redis"),
-        ),
-    };
+    // One concrete store instance, exposed as two trait objects: the
+    // embedding path and the completion path (crate::completion) share the
+    // same sled DB / redis pool -- opening a second handle to the same sled
+    // directory would fail its exclusive lock.
+    let (store, completion_store): (Arc<dyn EmbeddingStore>, Arc<dyn CompletionStore>) =
+        match config.storage_backend {
+            StorageBackend::Sled => {
+                let sled = Arc::new(
+                    SledStore::open(&config.storage_path, config.ttl)
+                        .expect("failed to open sled store"),
+                );
+                (
+                    Arc::clone(&sled) as Arc<dyn EmbeddingStore>,
+                    sled as Arc<dyn CompletionStore>,
+                )
+            }
+            StorageBackend::Redis => {
+                let redis = Arc::new(
+                    RedisStore::connect(&config.redis_url, config.ttl)
+                        .expect("failed to connect to redis"),
+                );
+                (
+                    Arc::clone(&redis) as Arc<dyn EmbeddingStore>,
+                    redis as Arc<dyn CompletionStore>,
+                )
+            }
+        };
 
     let gemini_provider = Arc::new(GeminiProvider::new(config.gemini_base_url.clone()));
 
@@ -129,6 +150,21 @@ async fn main() {
 
     let port = config.port;
 
+    // Chat-completion providers, keyed by `{provider}` path segment. v1
+    // registers only the OpenAI-shaped adapter -- which also covers any
+    // OpenAI-wire-compatible self-hosted endpoint via
+    // ZEROCACHE_OPENAI_BASE_URL, exactly like the embedding path. Other
+    // providers (mistral, the cloud adapters, Anthropic's /v1/messages
+    // shape) are follow-ups; until then they 404 out of a missing key.
+    let mut completion_providers: HashMap<
+        String,
+        Arc<dyn zerocache_ports::ChatCompletionProvider>,
+    > = HashMap::new();
+    completion_providers.insert(
+        "openai".to_string(),
+        Arc::new(OpenAiProvider::new(config.openai_base_url.clone())),
+    );
+
     let state = Arc::new(AppState {
         store,
         providers,
@@ -136,6 +172,9 @@ async fn main() {
         metrics: Metrics::new(),
         in_flight: std::sync::Mutex::new(HashMap::new()),
         image_in_flight: std::sync::Mutex::new(HashMap::new()),
+        completion_store,
+        completion_providers,
+        completion_in_flight: std::sync::Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -146,6 +185,10 @@ async fn main() {
         .route(
             "/:provider/v1/images/embeddings",
             post(image_embeddings_handler).delete(delete_image_handler),
+        )
+        .route(
+            "/:provider/v1/chat/completions",
+            post(chat_completions_handler),
         )
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
@@ -608,6 +651,100 @@ async fn delete_image_handler(
         })?;
 
     Ok(Json(DeleteResponse { deleted }))
+}
+
+/// `POST /{provider}/v1/chat/completions` -- the semantic completion cache.
+/// The request/response body is the OpenAI chat shape, forwarded verbatim
+/// to the upstream provider on a miss; a hit replays the stored body with a
+/// `200`. An `X-Zerocache-Completion-Hit: true|false` header says which.
+///
+/// Only deterministic requests (temperature 0 or an explicit seed) are ever
+/// cached -- anything else is a transparent passthrough. See
+/// `crate::completion`.
+#[tracing::instrument(skip_all, fields(provider = %provider_name))]
+async fn chat_completions_handler(
+    State(state): State<Arc<AppState>>,
+    Path(provider_name): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let Json(request_body) = body.map_err(json_rejection_to_error_response)?;
+
+    let api_key = extract_bearer_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "missing or malformed Authorization header (expected 'Bearer <key>')"
+                    .to_string(),
+            }),
+        )
+    })?;
+
+    let provider = state
+        .completion_providers
+        .get(&provider_name)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("unknown provider '{provider_name}'"),
+                }),
+            )
+        })?;
+
+    let model = request_body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ErrorResponse {
+                    error: "request body is missing a string 'model' field".to_string(),
+                }),
+            )
+        })?
+        .to_string();
+
+    let owner_id = derive_owner_id(&api_key);
+
+    let outcome = complete(
+        &state,
+        CompletionRequest {
+            provider,
+            provider_name: &provider_name,
+            api_key: &api_key,
+            owner_id,
+            model: &model,
+            body: &request_body,
+        },
+    )
+    .await
+    .map_err(|err| {
+        let status = match &err {
+            AppError::Provider(_) => StatusCode::BAD_GATEWAY,
+            AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (
+            status,
+            Json(ErrorResponse {
+                error: err.to_string(),
+            }),
+        )
+    })?;
+
+    // Forward the upstream status verbatim (a hit is always 200); a value
+    // outside the valid range would only come from a broken upstream, so
+    // fall back to 502 rather than panic.
+    let status = StatusCode::from_u16(outcome.response.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = (status, Json(outcome.response.body)).into_response();
+    response.headers_mut().insert(
+        "x-zerocache-completion-hit",
+        if outcome.hit { "true" } else { "false" }
+            .parse()
+            .expect("static ascii is a valid header value"),
+    );
+    Ok(response)
 }
 
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {

@@ -12,6 +12,7 @@ use tracing::Instrument;
 use zerocache_core::{canonicalize_text, normalize_text, reconcile, CacheKey};
 use zerocache_ports::ImageInput;
 use zerocache_ports::{
+    ChatCompletionProvider, ChatCompletionResponse, CompletionStore, CompletionUsage,
     EmbeddingProvider, EmbeddingStore, ImageEmbeddingProvider, ProviderError, ProviderUsage,
     StoreError,
 };
@@ -24,6 +25,16 @@ use zerocache_ports::{
 /// `Shared`'s `Output: Clone` bound.
 type SharedFetchOutput = Result<(Arc<HashMap<CacheKey, Vec<f32>>>, ProviderUsage), ProviderError>;
 type SharedFetch = Shared<Pin<Box<dyn Future<Output = SharedFetchOutput> + Send>>>;
+
+/// What a coalesced *completion* fetch resolves to: the single shared
+/// upstream response, `Arc`-wrapped so every waiter's clone is cheap.
+/// `ChatCompletionResponse` and `ProviderError` are both `Clone`, which
+/// together satisfy `Shared`'s `Output: Clone` bound. Consumed by
+/// `crate::completion::fetch_completion_coalesced`; the alias lives here
+/// next to `SharedFetch` and because `AppState` holds a map of them.
+pub(crate) type SharedCompletionOutput = Result<Arc<ChatCompletionResponse>, ProviderError>;
+pub(crate) type SharedCompletion =
+    Shared<Pin<Box<dyn Future<Output = SharedCompletionOutput> + Send>>>;
 
 // A store call is not bounded by PROVIDER_TIMEOUT, which only applies to
 // provider HTTP calls -- without this, a stuck store backend (e.g. a stale
@@ -51,7 +62,7 @@ const STORE_TIMEOUT: Duration = Duration::from_secs(5);
 /// whole loop, not each individual key -- a per-batch budget, not a
 /// per-operation one. Fine given `MAX_BATCH_SIZE = 100`, but worth knowing
 /// if that constant ever grows.
-async fn run_store_task<T, F>(task: F) -> Result<T, AppError>
+pub(crate) async fn run_store_task<T, F>(task: F) -> Result<T, AppError>
 where
     F: FnOnce() -> Result<T, AppError> + Send + 'static,
     T: Send + 'static,
@@ -101,6 +112,22 @@ pub struct AppState {
     // `in_flight` -- both just map CacheKey -> resolved vectors + usage,
     // regardless of whether the fetch behind them embedded text or images.
     pub image_in_flight: Mutex<HashMap<CacheKey, SharedFetch>>,
+    // --- semantic LLM completion cache (see crate::completion) ---
+    // Opaque byte store for cached chat-completion responses. A sled/redis
+    // adapter implements both this and `store` on one struct, so in
+    // main.rs this is a second trait-object Arc over the very same backend
+    // instance, never a second open handle.
+    pub completion_store: Arc<dyn CompletionStore>,
+    // Keyed by `{provider}` path segment, exactly like `providers`. Only the
+    // OpenAI-shaped chat adapter is registered today; an unknown or
+    // unregistered provider 404s straight out of a missing map key.
+    pub completion_providers: HashMap<String, Arc<dyn ChatCompletionProvider>>,
+    // The completion counterpart to `in_flight`: concurrent requests missing
+    // on the exact same completion CacheKey share one upstream call. A
+    // separate map for the same reason `image_in_flight` is separate --
+    // domain-separated keys can't collide, and independent locks keep one
+    // path's traffic from contending another's.
+    pub completion_in_flight: Mutex<HashMap<CacheKey, SharedCompletion>>,
 }
 
 // Cumulative counters since process start, in Prometheus text-exposition
@@ -114,6 +141,15 @@ pub struct Metrics {
     hits: IntCounterVec,
     misses: IntCounterVec,
     prompt_tokens_billed: IntCounterVec,
+    // Completion cache (crate::completion). Labeled by `provider` only -- no
+    // content_type split, since these are chat completions, not embeddings.
+    // "tokens saved" (not "billed"): on a hit we know exactly what the
+    // provider would have charged, from the stored response's own usage
+    // block, so this is the direct money-saved number.
+    completion_hits: IntCounterVec,
+    completion_misses: IntCounterVec,
+    completion_prompt_tokens_saved: IntCounterVec,
+    completion_completion_tokens_saved: IntCounterVec,
 }
 
 impl Metrics {
@@ -145,21 +181,62 @@ impl Metrics {
         )
         .expect("metric name/help/labels are hardcoded and valid");
 
-        registry
-            .register(Box::new(hits.clone()))
-            .expect("registering a metric once on a fresh registry cannot fail");
-        registry
-            .register(Box::new(misses.clone()))
-            .expect("registering a metric once on a fresh registry cannot fail");
-        registry
-            .register(Box::new(prompt_tokens_billed.clone()))
-            .expect("registering a metric once on a fresh registry cannot fail");
+        let completion_hits = IntCounterVec::new(
+            Opts::new(
+                "zerocache_completion_cache_hits_total",
+                "Total chat-completion requests served from cache without a provider call",
+            ),
+            &["provider"],
+        )
+        .expect("metric name/help/labels are hardcoded and valid");
+        let completion_misses = IntCounterVec::new(
+            Opts::new(
+                "zerocache_completion_cache_misses_total",
+                "Total chat-completion requests that required a provider call",
+            ),
+            &["provider"],
+        )
+        .expect("metric name/help/labels are hardcoded and valid");
+        let completion_prompt_tokens_saved = IntCounterVec::new(
+            Opts::new(
+                "zerocache_completion_prompt_tokens_saved_total",
+                "Prompt tokens not billed by the provider because a completion was served from cache",
+            ),
+            &["provider"],
+        )
+        .expect("metric name/help/labels are hardcoded and valid");
+        let completion_completion_tokens_saved = IntCounterVec::new(
+            Opts::new(
+                "zerocache_completion_completion_tokens_saved_total",
+                "Completion tokens not billed by the provider because a completion was served from cache",
+            ),
+            &["provider"],
+        )
+        .expect("metric name/help/labels are hardcoded and valid");
+
+        for collector in [
+            &hits,
+            &misses,
+            &prompt_tokens_billed,
+            &completion_hits,
+            &completion_misses,
+            &completion_prompt_tokens_saved,
+            &completion_completion_tokens_saved,
+        ] {
+            registry
+                .register(Box::new(collector.clone()))
+                .expect("registering a metric once on a fresh registry cannot fail");
+        }
 
         Self {
             registry,
             hits,
             misses,
             prompt_tokens_billed,
+            completion_hits,
+            completion_misses,
+            completion_prompt_tokens_saved,
+            completion_completion_tokens_saved,
         }
     }
 
@@ -173,6 +250,26 @@ impl Metrics {
         self.prompt_tokens_billed
             .with_label_values(&[provider, content_type])
             .inc_by(stats.provider_prompt_tokens as u64);
+    }
+
+    /// A completion served from cache: one hit, plus the prompt/completion
+    /// tokens the caller was not billed for (taken from the stored
+    /// response's own usage block).
+    pub(crate) fn record_completion_hit(&self, provider: &str, usage: &CompletionUsage) {
+        self.completion_hits.with_label_values(&[provider]).inc();
+        self.completion_prompt_tokens_saved
+            .with_label_values(&[provider])
+            .inc_by(usage.prompt_tokens as u64);
+        self.completion_completion_tokens_saved
+            .with_label_values(&[provider])
+            .inc_by(usage.completion_tokens as u64);
+    }
+
+    /// A completion that required a provider call (including one that
+    /// piggybacked on a coalesced in-flight fetch -- it still wasn't in the
+    /// store).
+    pub(crate) fn record_completion_miss(&self, provider: &str) {
+        self.completion_misses.with_label_values(&[provider]).inc();
     }
 
     /// Renders all registered metrics in Prometheus text exposition format.
@@ -1067,6 +1164,23 @@ mod tests {
     const OWNER_A: [u8; 32] = [1u8; 32];
     const OWNER_B: [u8; 32] = [2u8; 32];
 
+    // The embedding-path tests don't exercise the completion cache; this
+    // stand-in keeps `AppState` constructible without pulling a real
+    // CompletionStore into every test.
+    struct NoopCompletionStore;
+
+    impl CompletionStore for NoopCompletionStore {
+        fn get(&self, _key: &CacheKey) -> Result<Option<Vec<u8>>, StoreError> {
+            Ok(None)
+        }
+        fn put(&self, _key: CacheKey, _value: Vec<u8>) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn delete(&self, _key: &CacheKey) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
     fn state_with(store: impl EmbeddingStore + 'static) -> AppState {
         AppState {
             store: Arc::new(store),
@@ -1075,6 +1189,9 @@ mod tests {
             metrics: Metrics::new(),
             in_flight: Mutex::new(StdHashMap::new()),
             image_in_flight: Mutex::new(StdHashMap::new()),
+            completion_store: Arc::new(NoopCompletionStore),
+            completion_providers: StdHashMap::new(),
+            completion_in_flight: Mutex::new(StdHashMap::new()),
         }
     }
 

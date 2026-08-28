@@ -18,6 +18,7 @@ zerocache-adapters-vertexai = { path = "../zerocache-adapters-vertexai" }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.151"
 prometheus = "0.13"
 async-trait = "0.1"
 futures = "0.3"
