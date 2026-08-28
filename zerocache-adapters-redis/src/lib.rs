@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use redis::Commands;
 use zerocache_core::CacheKey;
-use zerocache_ports::{EmbeddingStore, StoreError};
+use zerocache_ports::{CompletionStore, EmbeddingStore, StoreError};
 
 // redis-rs sets no socket timeout by default, so a stale or half-dead TCP
 // connection (the Redis process died without a clean FIN, or a network
@@ -85,9 +85,55 @@ impl EmbeddingStore for RedisStore {
     }
 }
 
+impl CompletionStore for RedisStore {
+    fn get(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, StoreError> {
+        let mut conn = self.pool.get().map_err(|e| StoreError(e.to_string()))?;
+        apply_socket_timeouts(&conn)?;
+        let raw: Option<Vec<u8>> = conn
+            .get(completion_redis_key(key))
+            .map_err(|e| StoreError(e.to_string()))?;
+        Ok(raw)
+    }
+
+    fn put(&self, key: CacheKey, value: Vec<u8>) -> Result<(), StoreError> {
+        let mut conn = self.pool.get().map_err(|e| StoreError(e.to_string()))?;
+        apply_socket_timeouts(&conn)?;
+        match self.ttl {
+            Some(ttl) => {
+                conn.set_ex::<_, _, ()>(completion_redis_key(&key), value, ttl.as_secs())
+                    .map_err(|e| StoreError(e.to_string()))?;
+            }
+            None => {
+                conn.set::<_, _, ()>(completion_redis_key(&key), value)
+                    .map_err(|e| StoreError(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn delete(&self, key: &CacheKey) -> Result<(), StoreError> {
+        let mut conn = self.pool.get().map_err(|e| StoreError(e.to_string()))?;
+        apply_socket_timeouts(&conn)?;
+        conn.del::<_, ()>(completion_redis_key(key))
+            .map_err(|e| StoreError(e.to_string()))?;
+        Ok(())
+    }
+}
+
 fn redis_key(key: &CacheKey) -> Vec<u8> {
     let mut out = Vec::with_capacity(10 + 32);
     out.extend_from_slice(b"zerocache:");
+    out.extend_from_slice(key.as_bytes());
+    out
+}
+
+// A distinct prefix from `redis_key` so completion blobs and embedding
+// vectors occupy separate parts of the Redis keyspace -- independently
+// scannable/flushable. `CacheKey::derive_completion` is already
+// domain-separated, so this is operational tidiness, not correctness.
+fn completion_redis_key(key: &CacheKey) -> Vec<u8> {
+    let mut out = Vec::with_capacity(21 + 32);
+    out.extend_from_slice(b"zerocache:completion:");
     out.extend_from_slice(key.as_bytes());
     out
 }
@@ -140,9 +186,12 @@ mod live_redis_tests {
         let store = RedisStore::connect(&url, None).unwrap();
         let key = CacheKey::derive([1u8; 32], "openai", "test-scope", "m", "v1", "hello");
 
-        assert_eq!(store.get(&key).unwrap(), None);
-        store.put(key, vec![1.0, 2.5, -3.25]).unwrap();
-        assert_eq!(store.get(&key).unwrap(), Some(vec![1.0, 2.5, -3.25]));
+        assert_eq!(EmbeddingStore::get(&store, &key).unwrap(), None);
+        EmbeddingStore::put(&store, key, vec![1.0, 2.5, -3.25]).unwrap();
+        assert_eq!(
+            EmbeddingStore::get(&store, &key).unwrap(),
+            Some(vec![1.0, 2.5, -3.25])
+        );
     }
 
     #[test]
@@ -159,11 +208,11 @@ mod live_redis_tests {
             "to be deleted",
         );
 
-        store.put(key, vec![1.0]).unwrap();
-        assert_eq!(store.get(&key).unwrap(), Some(vec![1.0]));
+        EmbeddingStore::put(&store, key, vec![1.0]).unwrap();
+        assert_eq!(EmbeddingStore::get(&store, &key).unwrap(), Some(vec![1.0]));
 
-        store.delete(&key).unwrap();
-        assert_eq!(store.get(&key).unwrap(), None);
+        EmbeddingStore::delete(&store, &key).unwrap();
+        assert_eq!(EmbeddingStore::get(&store, &key).unwrap(), None);
     }
 
     #[test]
@@ -180,7 +229,7 @@ mod live_redis_tests {
             "never existed",
         );
 
-        assert!(store.delete(&key).is_ok());
+        assert!(EmbeddingStore::delete(&store, &key).is_ok());
     }
 
     #[test]
@@ -202,10 +251,10 @@ mod live_redis_tests {
             "expires almost immediately",
         );
 
-        store.put(key, vec![1.0]).unwrap();
+        EmbeddingStore::put(&store, key, vec![1.0]).unwrap();
         std::thread::sleep(Duration::from_millis(1500));
         assert_eq!(
-            store.get(&key).unwrap(),
+            EmbeddingStore::get(&store, &key).unwrap(),
             None,
             "an entry past its Redis-native TTL must read as a miss"
         );
@@ -225,9 +274,9 @@ mod live_redis_tests {
             "expires in an hour",
         );
 
-        store.put(key, vec![1.0]).unwrap();
+        EmbeddingStore::put(&store, key, vec![1.0]).unwrap();
         assert_eq!(
-            store.get(&key).unwrap(),
+            EmbeddingStore::get(&store, &key).unwrap(),
             Some(vec![1.0]),
             "an entry well within its TTL must still hit"
         );
@@ -247,10 +296,10 @@ mod live_redis_tests {
             "lives forever",
         );
 
-        store.put(key, vec![1.0]).unwrap();
+        EmbeddingStore::put(&store, key, vec![1.0]).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(
-            store.get(&key).unwrap(),
+            EmbeddingStore::get(&store, &key).unwrap(),
             Some(vec![1.0]),
             "with no TTL configured, an entry must never expire"
         );
@@ -275,8 +324,80 @@ mod live_redis_tests {
                 "v1",
                 &format!("fast op {i}"),
             );
-            store.put(key, vec![i as f32]).unwrap();
-            assert_eq!(store.get(&key).unwrap(), Some(vec![i as f32]));
+            EmbeddingStore::put(&store, key, vec![i as f32]).unwrap();
+            assert_eq!(
+                EmbeddingStore::get(&store, &key).unwrap(),
+                Some(vec![i as f32])
+            );
         }
+    }
+
+    fn completion_key(text: &str) -> CacheKey {
+        CacheKey::derive_completion([1u8; 32], "openai", "test-scope", "gpt-4o", "v1", text)
+    }
+
+    #[test]
+    #[ignore]
+    fn completion_put_then_get_roundtrips_against_a_real_redis() {
+        let (_container, url) = start_redis();
+        let store = RedisStore::connect(&url, None).unwrap();
+        let key = completion_key("req-a");
+
+        assert_eq!(CompletionStore::get(&store, &key).unwrap(), None);
+        CompletionStore::put(&store, key, b"{\"body\":1}".to_vec()).unwrap();
+        assert_eq!(
+            CompletionStore::get(&store, &key).unwrap(),
+            Some(b"{\"body\":1}".to_vec())
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn completion_delete_removes_an_entry_from_a_real_redis() {
+        let (_container, url) = start_redis();
+        let store = RedisStore::connect(&url, None).unwrap();
+        let key = completion_key("req-b");
+
+        CompletionStore::put(&store, key, b"blob".to_vec()).unwrap();
+        CompletionStore::delete(&store, &key).unwrap();
+        assert_eq!(CompletionStore::get(&store, &key).unwrap(), None);
+    }
+
+    #[test]
+    #[ignore]
+    fn completion_entry_past_its_ttl_reads_as_a_miss_on_a_real_redis() {
+        let (_container, url) = start_redis();
+        let store = RedisStore::connect(&url, Some(Duration::from_secs(1))).unwrap();
+        let key = completion_key("expires-almost-immediately");
+
+        CompletionStore::put(&store, key, b"blob".to_vec()).unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(
+            CompletionStore::get(&store, &key).unwrap(),
+            None,
+            "an entry past its Redis-native TTL must read as a miss"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn completion_and_embedding_entries_do_not_interfere_on_a_real_redis() {
+        let (_container, url) = start_redis();
+        let store = RedisStore::connect(&url, None).unwrap();
+        let embedding_key =
+            CacheKey::derive([1u8; 32], "openai", "test-scope", "gpt-4o", "v1", "shared");
+        let comp_key = completion_key("shared");
+
+        EmbeddingStore::put(&store, embedding_key, vec![1.0, 2.0]).unwrap();
+        CompletionStore::put(&store, comp_key, b"completion-blob".to_vec()).unwrap();
+
+        assert_eq!(
+            EmbeddingStore::get(&store, &embedding_key).unwrap(),
+            Some(vec![1.0, 2.0])
+        );
+        assert_eq!(
+            CompletionStore::get(&store, &comp_key).unwrap(),
+            Some(b"completion-blob".to_vec())
+        );
     }
 }
