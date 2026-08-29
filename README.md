@@ -1,198 +1,266 @@
 # Zerocache
 
-**A drop-in, Rust-native embedding cache.** Point your existing OpenAI-compatible embedding client at Zerocache instead of the real provider, and identical text/image inputs stop costing you a second API call.
+**A self-hosted caching proxy for LLM and embedding APIs.** Point your existing OpenAI-compatible client at Zerocache instead of the provider, and repeated chat completions and embeddings come back in **~1 ms** instead of costing another API call.
 
 [![CI](https://github.com/shramanb113/ZeroCache/actions/workflows/ci.yml/badge.svg)](https://github.com/shramanb113/ZeroCache/actions/workflows/ci.yml)
 [![Docker Publish](https://github.com/shramanb113/ZeroCache/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/shramanb113/ZeroCache/actions/workflows/docker-publish.yml)
 ![Rust](https://img.shields.io/badge/rust-1.97.1-orange)
-![Providers](https://img.shields.io/badge/providers-7-blue)
-
-No SDK to install. No framework plugin. No server-side provider credentials for Zerocache to leak — every request brings its own API key.
+![Image](https://img.shields.io/badge/image-14.7MB%20scratch-blue)
 
 ```
-Your app  ──▶  Zerocache  ──▶  Real provider (only on a cache miss)
-              (drop-in base_url swap)
+Your app  ──▶  Zerocache  ──▶  Real provider  (only on a cache miss)
+              one base_url swap · your key, per request · no SDK
 ```
+
+Provider-side prompt caching discounts *input* tokens for a few minutes and **still runs the model**. Zerocache serves the **whole response** — 100 % off input *and* output — for as long as you keep the entry, across runs, across machines. A cache hit is ~1 ms; a cold embedding call is 200–800 ms; a cold LLM call is 1–20 s. On an agent's second pass through the same task, that's the difference between 45 s and 2 s.
+
+No SDK to install. No framework plugin. No server-side provider credentials for Zerocache to hold or leak — every request brings its own key.
 
 ---
 
 ## Table of contents
 
-- [Why Zerocache exists](#why-zerocache-exists)
-- [How it works](#how-it-works)
+- [What it does](#what-it-does)
+- [Quickstart](#quickstart)
+- [Chat completions](#chat-completions)
+- [Embeddings](#embeddings)
+- [Live savings dashboard](#live-savings-dashboard)
+- [How the cache key works](#how-the-cache-key-works)
 - [Architecture](#architecture)
 - [Supported providers](#supported-providers)
-- [Quickstart](#quickstart)
-  - [Docker (recommended)](#docker-recommended)
-  - [Docker Compose (with Redis)](#docker-compose-with-redis)
-  - [From source](#from-source)
 - [Configuration reference](#configuration-reference)
-- [API reference](#api-reference)
-  - [Text embeddings](#text-embeddings)
-  - [Image embeddings](#image-embeddings-gemini-only)
-  - [Provider model-string grammars](#provider-model-string-grammars-cloud-providers)
-  - [Error shapes](#error-shapes)
-  - [Response headers](#response-headers)
-  - [Operational endpoints](#operational-endpoints)
 - [Deployment](#deployment)
-  - [Docker image](#docker-image)
-  - [Kubernetes / multi-replica](#kubernetes--multi-replica)
-  - [CI/CD pipeline](#cicd-pipeline)
 - [Observability](#observability)
+- [Roadmap](#roadmap)
+- [What Zerocache is *not* (yet)](#what-zerocache-is-not-yet)
 - [Testing](#testing)
-- [Project status](#project-status)
-- [Non-goals (v1)](#non-goals-v1)
-- [Contributing / further reading](#contributing--further-reading)
+- [Further reading](#further-reading)
 - [License](#license)
 
 ---
 
-## Why Zerocache exists
+## What it does
 
-RAG ingestion pipelines re-embed text that's already been embedded before — during re-indexing, pipeline re-runs, CI test suites, or overlapping corpora across projects and teams. Every re-embed is pure waste: it costs real input tokens and adds real latency for a result that's byte-identical to something already computed.
+Zerocache is one process that sits between your app and every LLM / embedding provider you use.
 
-Zerocache eliminates that waste at the wire level, transparently, independent of which language or framework produced the request. A real measured example from this repo's own agentic battle-test: re-indexing a 9-document corpus after editing one document and adding another cost exactly **2 provider calls out of 9** — the other 7, byte-identical between versions, were served from cache for free.
+| Surface | What gets cached | Status |
+| --- | --- | --- |
+| **`POST /{provider}/v1/chat/completions`** | Whole chat completions, keyed by a canonicalized request body. A hit is 100 % off input **and** output tokens and returns in ~1 ms. | **Live** — exact-match, 9 built-in OpenAI-wire providers, non-streaming, deterministic requests only (`temperature: 0` or an explicit `seed`). |
+| **`POST /{provider}/v1/embeddings`** | Embedding vectors, keyed by content + model + tenant. Identical text stops costing a second call. | **Live** — 7 providers, text + image, light text canonicalization (casing / Unicode / punctuation fold to one entry). |
+| **`GET /dashboard`** | — | **Live** — a browser dashboard that polls `/metrics` and shows hit rate, tokens not billed, and an estimated dollar figure, live, per provider. |
 
-## How it works
+Everything is **BYOK**: the caller sends `Authorization: Bearer <their own provider key>` on every request. Zerocache forwards that key upstream on a miss and never stores it — only a hash of it, to keep each caller's cache private.
 
-1. Your embedding client sends a normal `POST /v1/embeddings`-shaped request — except the URL now points at Zerocache, with a provider name in the path (`/openai/v1/embeddings`, `/gemini/v1/embeddings`, etc.).
-2. Zerocache derives a content-addressed cache key from `owner_id + provider + cache_scope + model + model_version + text`, using your forwarded API key (hashed, never stored raw) to keep your cache private to you.
-3. Any input already in the store is returned instantly. Anything new is batched into a single call to the *real* upstream provider, using *your* forwarded key — Zerocache never sees or stores a provider credential beyond the duration of that one request.
-4. New vectors are written back to the store and returned alongside the cache hits, in the original request order.
-5. Concurrent requests that miss on the *exact same* text are automatically coalesced into one upstream call, not one per request.
+**Where the savings actually come from** (agreed before building, not marketing):
 
-## Architecture
+- **Repeated runs** — CI/eval loops, prompt tuning, re-asks. A full hit is 100 % off; provider prompt caching is an input-only discount on a request that still executes.
+- **Auxiliary LLM calls** — the short "summarize this" / "classify that" calls agents fire constantly, which recur verbatim across runs.
+- **Retry / flap storms** — a burst of identical requests collapses to one upstream call (in-process coalescing).
+- **Multi-agent fan-out** — templated prompts across N workers.
+- **RAG re-indexing** — re-embedding a corpus after editing a few documents costs only the deltas.
 
-Dependencies point inward only — a hard, structurally-enforced rule via Cargo workspace crate boundaries, not just convention:
+A measured example from this repo's own agentic battle-test: re-running a 3-ticket support-triage agent suite (10 model calls + 9 tool calls per run) a second time was **100 % cache hits, zero upstream calls, byte-identical resolutions** — ~5.1 k prompt + ~370 completion tokens saved per suite, every intermediate tool-call turn included.
 
-```mermaid
-flowchart TB
-    subgraph layerInterface["Interface / Transport"]
-        nodeHttp["zerocache-http<br/>axum · wire-shape translation · provider registry"]
-    end
-    subgraph layerApplication["Application"]
-        nodeApp["orchestration: split hits/misses,<br/>call provider for misses only,<br/>write back, reassemble in order"]
-    end
-    subgraph layerPorts["Ports"]
-        nodePorts["EmbeddingStore · EmbeddingProvider ·<br/>ImageEmbeddingProvider trait contracts"]
-    end
-    subgraph layerAdapters["Adapters"]
-        nodeStore["Store adapters<br/>sled · redis"]
-        nodeProvider["Provider adapters<br/>openai · mistral · gemini · huggingface<br/>bedrock · vertexai · azure"]
-    end
-    subgraph layerCore["Core (domain)"]
-        nodeKey["CacheKey derivation (blake3)<br/>hit/miss reconciliation<br/>zero I/O, zero async runtime"]
-    end
-
-    nodeClient(["Any OpenAI-compatible<br/>embedding client"]) -->|"POST /{provider}/v1/embeddings"| nodeHttp
-    nodeHttp --> nodeApp
-    nodeApp --> nodePorts
-    nodePorts --> nodeStore
-    nodePorts --> nodeProvider
-    nodeApp --> nodeKey
-    nodeProvider -->|"BYOK: your forwarded key"| nodeUpstream(["Real provider API"])
-    nodeHttp -->|"ordered response +<br/>X-Zerocache-Hits/-Misses"| nodeClient
-```
-
-| Crate | Responsibility |
-| --- | --- |
-| `zerocache-core` | Domain logic: `CacheKey`/`CacheKey::derive_image` derivation, hit/miss reconciliation. No I/O, no async runtime, no framework awareness. |
-| `zerocache-ports` | `EmbeddingStore` / `EmbeddingProvider` / `ImageEmbeddingProvider` trait contracts, `StoreError`/`ProviderError`/`ProviderUsage`. |
-| `zerocache-adapters-sled` | `EmbeddingStore` backed by [sled](https://github.com/spacejam/sled) — embedded, single-process. Local dev / single-instance. |
-| `zerocache-adapters-redis` | `EmbeddingStore` backed by Redis — shared, network-accessible, connection-pooled. Use for any multi-replica deployment. |
-| `zerocache-adapters-openai` | `EmbeddingProvider` for OpenAI. |
-| `zerocache-adapters-mistral` | `EmbeddingProvider` for Mistral. |
-| `zerocache-adapters-gemini` | `EmbeddingProvider` **and** `ImageEmbeddingProvider` for Gemini — the only provider with image-embedding support. |
-| `zerocache-adapters-huggingface` | `EmbeddingProvider` for HuggingFace Inference Providers. |
-| `zerocache-adapters-cloud` | Shared kit for the three cloud adapters below: HTTP transport driver (client, timeouts, retry, chunking, usage accounting) plus a `CloudRouter`/`TextWireStrategy` strategy-pattern abstraction, since each cloud is one API in front of several independent model vendors. |
-| `zerocache-adapters-bedrock` | `EmbeddingProvider` for Amazon Bedrock (Titan, Cohere). |
-| `zerocache-adapters-vertexai` | `EmbeddingProvider` for GCP Vertex AI's native `:predict` endpoint. |
-| `zerocache-adapters-azure` | `EmbeddingProvider` for Azure — both the GA OpenAI `/openai/v1` surface and Foundry Models. |
-| `zerocache-http` | axum HTTP server, wire-shape translation, provider registry, application wiring. Registers all seven provider adapters. |
-
-The cache key is `blake3(owner_id, provider, cache_scope, model, model_version, text)`:
-
-- **`owner_id`** — a hash of your forwarded API key (never the raw key), so two different callers never share a cache entry even for identical text.
-- **`provider` + `model` + `model_version`** — so a different provider, model, or adapter version can never silently return a stale-but-plausible vector.
-- **`cache_scope`** — provider-specific routing identity: the configured base URL for the four "simple" adapters (so repointing `ZEROCACHE_OPENAI_BASE_URL` at a self-hosted vLLM instance starts from a cold cache, never a wrong hit), and `{endpoint_base}\0{canonical}\0kit{version}` for the three cloud adapters (so `us-east-1` and `eu-west-1` Bedrock, or two different GCP Vertex AI projects, can never collide even when the caller's `model` string looks identical).
-
-## Supported providers
-
-| `{provider}` | Text embeddings | Image embeddings | Auth to Zerocache | Notes |
-| --- | :---: | :---: | --- | --- |
-| `openai` | ✅ | — | `Authorization: Bearer <key>` | Configurable base URL — self-hosted vLLM/LM Studio work too. |
-| `mistral` | ✅ | — | `Authorization: Bearer <key>` | Configurable base URL. |
-| `gemini` | ✅ | ✅ | `Authorization: Bearer <key>` | Only provider with image embeddings. Never reports token usage. |
-| `huggingface` | ✅ | — | `Authorization: Bearer <key>` | Model is part of the URL path, not the JSON body — a genuine wire-shape difference from the other three. |
-| `bedrock` | ✅ | — | `Authorization: Bearer <key>` | Amazon's own bearer API keys — no AWS SigV4. Titan and Cohere vendor models behind one router. |
-| `vertexai` | ✅ | — | `Authorization: Bearer <key>` | GCP's native `:predict` endpoint (Vertex's OpenAI-compatible surface is chat-only). |
-| `azure` | ✅ | — | `Authorization: Bearer <key>` | Two surfaces in one adapter: Azure OpenAI GA `/openai/v1` and Foundry Models — routed by a `foundry:` model prefix. Only registers if at least one of its two base-URL env vars is set. |
-
-Every caller brings their own key for whichever provider they call — Zerocache holds no provider credentials of its own (BYOK: bring-your-own-key).
+---
 
 ## Quickstart
 
-### Docker (recommended)
-
 ```sh
 docker run -d --name zerocache -p 8080:8080 ghcr.io/shramanb113/zerocache:latest
+curl http://localhost:8080/health          # -> 200
+open http://localhost:8080/dashboard       # live savings view
 ```
 
-That's it — no provider key needed to start the container; you supply one per request (see [API reference](#api-reference)). Confirm it's up:
+The image is a 14.7 MB `FROM scratch` build — one static musl binary, no shell, no libc, no CA-cert bundle. It runs as a non-root user and ships a built-in `HEALTHCHECK`. No provider key is needed to start it; you supply one per request.
 
-```sh
-curl http://localhost:8080/health
-```
-
-The image runs as a non-root user, ships a built-in `HEALTHCHECK` against `/health`, and defaults to the embedded `sled` store at `/data` inside the container — mount a volume there if you want the cache to survive a restart:
+Persist the cache across restarts with a named volume:
 
 ```sh
 docker run -d --name zerocache -p 8080:8080 -v zerocache-data:/data ghcr.io/shramanb113/zerocache:latest
 ```
 
-> **Bind mounts vs named volumes:** the container runs as uid `10001`. A **named volume** (`-v zerocache-data:/data`, as above) inherits the image's ownership and just works. A **bind mount** to a host directory (`-v ./local-data:/data`) takes the *host* directory's ownership instead — if that directory isn't writable by uid `10001`, sled fails to open and the process exits. Prefer named volumes unless you specifically need the data on a host path, in which case `chown -R 10001:10001` that directory first.
+> Named volume (`-v zerocache-data:/data`) inherits the image's `uid 10001` and just works. A **bind mount** to a host path takes that path's ownership — `chown -R 10001:10001` it first, or sled won't open.
 
-### Docker Compose (with Redis)
-
-For local development against the Redis backend (what you'd run in a multi-replica deployment):
+**From source** (Rust 1.97.1 via [rustup](https://rustup.rs)):
 
 ```sh
-docker compose up -d --build
+cargo run -p zerocache-http    # dashboard at http://localhost:8080/dashboard
 ```
 
-This brings up `zerocache-http` wired to a `redis` service (`ZEROCACHE_STORAGE_BACKEND=redis`), both on the same compose network. See [`docker-compose.yml`](./docker-compose.yml).
+---
 
-### From source
+## Chat completions
 
-Prerequisites: Rust via [rustup](https://rustup.rs), toolchain `1.97.1` (edition 2021).
+```
+POST /{provider}/v1/chat/completions
+Authorization: Bearer <your own key for that provider>
+
+{ "model": "...", "messages": [...], "temperature": 0 }      # OpenAI chat shape, forwarded verbatim on a miss
+
+→ the upstream response body, unchanged           # 200 on a cache hit, served in ~1 ms
+  X-Zerocache-Completion-Hit: true | false
+```
 
 ```sh
-cargo build --workspace
-cargo test --workspace
-cargo run -p zerocache-http
+# first call: real, billed. second identical call: free, instant.
+curl http://localhost:8080/openai/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-real-key" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Summarize: ..."}],"temperature":0}'
 ```
 
-Real-Redis integration tests are `#[ignore]`d by default (they spin up an ephemeral container via `testcontainers`, so they need Docker running):
+**`{provider}`** is any name in the chat-provider registry — the built-ins `openai`, `mistral`, `gemini`, `groq`, `deepseek`, `together`, `openrouter`, `xai`, `fireworks` (each a real hosted OpenAI-wire endpoint, registered with zero config), plus anything you add via `ZEROCACHE_CHAT_PROVIDERS="name=url,…"` (self-hosted vLLM/Ollama, an internal gateway).
 
-```sh
-cargo test -p zerocache-adapters-redis -- --ignored
+**What's cached, what's not:**
+
+- Only **deterministic** requests: `temperature == 0` *or* an explicit `seed`, with `n` absent/`1`. Anything else is a transparent passthrough — forwarded, nothing stored, nothing counted.
+- The cache key is the **canonicalized** request body: order-independent, and blind to `user` / `stream` / `metadata` / key order / number spelling. Two requests that differ only in those share an entry.
+- A **non-2xx** upstream response is forwarded with its real status and **never** cached. Only 2xx is stored.
+- Concurrent identical misses within one instance are **coalesced** into a single upstream call.
+- Per-caller namespaced (`owner_id`) and per-endpoint scoped (`cache_scope`), exactly like embeddings — two callers, or the same model string against two different upstreams, never collide.
+
+`X-Zerocache-Completion-Hit` tells you which path a response took. `/metrics` exposes `zerocache_completion_cache_hits_total` / `_misses_total` / `_prompt_tokens_saved_total` / `_completion_tokens_saved_total`, all `provider`-labeled.
+
+---
+
+## Embeddings
+
 ```
+POST /{provider}/v1/embeddings
+Authorization: Bearer <your own key for that provider>
+
+{ "model": "<real upstream model>", "input": ["text 1", "text 2"] }   # or a single bare string
+
+→ { "object": "list", "data": [ { "embedding": [...], "index": 0 }, ... ], "model": "...", "usage": {...} }
+  X-Zerocache-Hits / X-Zerocache-Misses
+```
+
+`{provider}` is one of `openai`, `mistral`, `gemini`, `huggingface`, `bedrock`, `vertexai`, `azure`. `input` accepts a JSON array **or** a single bare string (OpenAI's real `string | string[]` contract), so `embedQuery()`-style calls from LangChain / LlamaIndex work unmodified.
+
+- Inputs differing only in **casing / Unicode form / quote-dash style / trailing sentence punctuation** fold to one cache entry (the vector stored under it is still a real embedding of some caller's actual text).
+- **Image embeddings** (Gemini only): `POST /gemini/v1/images/embeddings` with `input` as `data:<mime>;base64,<…>` URIs. Every other provider `404`s.
+- **Cloud provider routing** — Azure / Bedrock / Vertex AI encode region / project / task-type in the `model` string (no new wire field, since `model` is already free-form and part of the key):
+
+  | provider | grammar | example |
+  | --- | --- | --- |
+  | `bedrock` | `[<region>/]<modelId>[#<input_type>]` | `us-east-1/cohere.embed-english-v3#search_query` |
+  | `vertexai` | `[<location>/<project>/]<modelId>[#<task_type>]` | `us-central1/my-proj/text-embedding-005#RETRIEVAL_DOCUMENT` |
+  | `azure` | `[foundry:]<deployment>[#<input_type>]` | `foundry:cohere-embed-v3-english#document` |
+
+- `DELETE /{provider}/v1/embeddings` (same body) drops the entries a matching `POST` would hit, scoped to your `owner_id`. Response `{"deleted": <count>}`, idempotent.
+- Optional `ZEROCACHE_TTL_SECONDS` sets a per-entry expiry (unset = never).
+
+---
+
+## Live savings dashboard
+
+`GET /dashboard` — an Astro + React + Recharts single-page app **embedded in the binary**, served on the same origin as `/metrics` (no CORS, no config). It polls `/metrics` every 2 s and shows:
+
+- estimated **total cost avoided** since the process started (completions measured exactly from the stored `usage` block; embeddings estimated from `hits × avg tokens per observed miss`);
+- hit rate per cache, tokens not billed, a per-provider table;
+- a session chart of cost avoided over time, with editable per-provider prices (`$/Mtok`, persisted in the browser).
+
+Screenshot this mid-run. It's the artifact.
+
+---
+
+## How the cache key works
+
+**Chat:** `owner_id + provider + cache_scope + model + adapter_version + canonicalize_completion_request(body)`, domain-separated by a `"chat-completion\0"` literal.
+
+**Embeddings:** `blake3(owner_id + provider + cache_scope + model + model_version + canonicalize_text(text))`; image path is domain-separated by `"image\0"`.
+
+- **`owner_id`** — `blake3` of your forwarded API key (never the raw key). Two callers never share an entry, even for identical input.
+- **`provider` + `model` + `model_version`** — a different provider, model, or adapter version can never silently hand back a stale-but-plausible vector or completion.
+- **`cache_scope`** — the configured endpoint identity. Repointing `ZEROCACHE_OPENAI_BASE_URL` at a self-hosted vLLM starts a cold cache, never a wrong hit; `us-east-1` and `eu-west-1` Bedrock, or two GCP projects, never collide even when the `model` string looks identical.
+
+---
+
+## Architecture
+
+Dependencies point inward only — enforced by Cargo workspace crate boundaries, not convention.
+
+```mermaid
+flowchart TB
+    subgraph layerInterface["Interface / Transport"]
+        nodeHttp["zerocache-http<br/>axum · wire-shape translation · provider registry · /dashboard"]
+    end
+    subgraph layerApplication["Application"]
+        nodeApp["orchestration: split hits/misses,<br/>call provider for misses only,<br/>coalesce, write back, reassemble in order"]
+    end
+    subgraph layerPorts["Ports"]
+        nodePorts["EmbeddingStore · EmbeddingProvider · ImageEmbeddingProvider ·<br/>CompletionStore · ChatCompletionProvider"]
+    end
+    subgraph layerAdapters["Adapters"]
+        nodeStore["Store adapters<br/>sled · redis"]
+        nodeProvider["Provider adapters<br/>openai · mistral · gemini · huggingface · bedrock · vertexai · azure<br/>+ OpenAiWireChatProvider (9 chat endpoints)"]
+    end
+    subgraph layerCore["Core (domain)"]
+        nodeKey["CacheKey (blake3) · reconciliation ·<br/>request canonicalization · determinism gate<br/>zero I/O, zero async runtime"]
+    end
+
+    nodeClient(["Any OpenAI-compatible client"]) -->|"POST /{provider}/v1/{chat/completions,embeddings}"| nodeHttp
+    nodeHttp --> nodeApp --> nodePorts
+    nodePorts --> nodeStore
+    nodePorts --> nodeProvider
+    nodeApp --> nodeKey
+    nodeProvider -->|"BYOK: your forwarded key"| nodeUpstream(["Real provider API"])
+    nodeHttp -->|"ordered response + X-Zerocache-* headers"| nodeClient
+```
+
+| Crate | Responsibility |
+| --- | --- |
+| `zerocache-core` | Domain: cache-key derivation, hit/miss reconciliation, request canonicalization, the completion determinism gate. No I/O, no async, no framework awareness. |
+| `zerocache-ports` | Trait contracts: `EmbeddingStore` / `EmbeddingProvider` / `ImageEmbeddingProvider` / `CompletionStore` / `ChatCompletionProvider`. |
+| `zerocache-adapters-sled` | Embedded store (sled). Local dev / single instance. |
+| `zerocache-adapters-redis` | Shared store (Redis, pooled, no distributed lock). Any multi-replica deployment. |
+| `zerocache-adapters-openai` | OpenAI embeddings **+** `OpenAiWireChatProvider` — the generic OpenAI-wire chat proxy behind all 9 chat providers. |
+| `zerocache-adapters-{mistral,gemini,huggingface}` | Embedding providers (`gemini` also does image embeddings). |
+| `zerocache-adapters-cloud` | Shared kit for the three cloud adapters: transport driver + a `CloudRouter` / `TextWireStrategy` strategy pattern (each cloud fronts several model vendors). |
+| `zerocache-adapters-{bedrock,vertexai,azure}` | Embedding providers for Amazon Bedrock, GCP Vertex AI, Azure (OpenAI GA + Foundry). |
+| `zerocache-http` | axum server, wire translation, provider registry, application wiring, the embedded dashboard. |
+
+---
+
+## Supported providers
+
+**Chat completions** (`/{provider}/v1/chat/completions`) — all OpenAI-wire, zero config:
+`openai` · `mistral` · `gemini` · `groq` · `deepseek` · `together` · `openrouter` · `xai` · `fireworks`, plus any name added via `ZEROCACHE_CHAT_PROVIDERS`.
+
+**Embeddings** (`/{provider}/v1/embeddings`):
+
+| `{provider}` | Text | Image | Notes |
+| --- | :---: | :---: | --- |
+| `openai` | ✅ | — | Configurable base URL — self-hosted vLLM / LM Studio work too. |
+| `mistral` | ✅ | — | Configurable base URL. |
+| `gemini` | ✅ | ✅ | Only provider with image embeddings. Never reports token usage. |
+| `huggingface` | ✅ | — | Model is in the URL path, not the body — a real wire-shape difference. |
+| `bedrock` | ✅ | — | Amazon bearer API keys — no AWS SigV4. Titan + Cohere behind one router. |
+| `vertexai` | ✅ | — | GCP native `:predict` endpoint. |
+| `azure` | ✅ | — | Azure OpenAI GA `/openai/v1` **and** Foundry Models. Registers only if a base-URL env var is set. |
+
+---
 
 ## Configuration reference
 
-Every setting is an environment variable — there is no config file. Everything is optional; Zerocache starts with sensible defaults and zero provider keys.
+Every setting is an environment variable — no config file. Everything is optional.
 
 **Core**
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `ZEROCACHE_PORT` | `8080` | HTTP listen port (binds `0.0.0.0`). |
+| `ZEROCACHE_PORT` | `8080` | Binds `0.0.0.0`. |
 | `ZEROCACHE_STORAGE_BACKEND` | `sled` | `sled` or `redis`. |
-| `ZEROCACHE_STORAGE_PATH` | `./data` (`/data` in the Docker image) | sled only. |
+| `ZEROCACHE_STORAGE_PATH` | `./data` (`/data` in Docker) | sled only. |
 | `ZEROCACHE_REDIS_URL` | `redis://127.0.0.1:6379` | redis only. |
-| `ZEROCACHE_TTL_SECONDS` | unset (never expires) | Per-store-instance expiry. `0` or an unparseable value is treated as unset, with a startup warning. |
+| `ZEROCACHE_TTL_SECONDS` | unset (never expires) | Per-entry expiry. `0` / unparseable → unset + startup warning. |
 
-**Simple provider base-URL overrides** — a bare origin (scheme + host + optional port), **no** `/v1` suffix, **no** trailing slash:
+**Chat providers**
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `ZEROCACHE_CHAT_PROVIDERS` | unset | `"name=url,name=url"` — override a built-in's URL or add a new provider. The URL is the prefix *up to but not including* `/chat/completions` (so Gemini's `…/v1beta/openai` works). Malformed entries are skipped with a warning, never blocking startup. Independent of `ZEROCACHE_OPENAI_BASE_URL`, which is embeddings-only. |
+
+**Embedding provider base URLs** — a bare origin (scheme + host + optional port), **no** `/v1`, **no** trailing slash:
 
 | Variable | Default |
 | --- | --- |
@@ -201,199 +269,83 @@ Every setting is an environment variable — there is no config file. Everything
 | `ZEROCACHE_GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com` |
 | `ZEROCACHE_HUGGINGFACE_BASE_URL` | `https://router.huggingface.co/hf-inference` |
 
-**Azure**
+**Azure** — `ZEROCACHE_AZURE_OPENAI_BASE_URL`, `_AZURE_FOUNDRY_BASE_URL`, `_AZURE_FOUNDRY_API_VERSION` (`2024-05-01-preview`), `_AZURE_AUTH_MODE` (`bearer` | `api-key`). Setting either base URL registers the `azure` provider.
+**Bedrock** — `ZEROCACHE_BEDROCK_REGION` (`us-east-1`), `_BEDROCK_ENDPOINT_TEMPLATE`.
+**Vertex AI** — `ZEROCACHE_VERTEX_PROJECT` (unset → `model` must carry `<location>/<project>/`), `_VERTEX_LOCATION` (`us-central1`), `_VERTEX_ENDPOINT_TEMPLATE`.
+**Observability** — `OTEL_EXPORTER_OTLP_ENDPOINT` (unset → console only), `RUST_LOG` (`info`).
 
-| Variable | Default | Notes |
-| --- | --- | --- |
-| `ZEROCACHE_AZURE_OPENAI_BASE_URL` | unset | e.g. `https://my-resource.openai.azure.com`. Setting **either** this or the Foundry URL below registers the `azure` provider. |
-| `ZEROCACHE_AZURE_FOUNDRY_BASE_URL` | unset | e.g. `https://my-resource.services.ai.azure.com`. |
-| `ZEROCACHE_AZURE_FOUNDRY_API_VERSION` | `2024-05-01-preview` | Foundry surface only — the GA `/openai/v1` path takes no api-version. |
-| `ZEROCACHE_AZURE_AUTH_MODE` | `bearer` | `bearer` (Entra ID token, recommended) or `api-key`. An unrecognized value warns and falls back to `bearer`. |
-
-**Amazon Bedrock**
-
-| Variable | Default |
-| --- | --- |
-| `ZEROCACHE_BEDROCK_REGION` | `us-east-1` |
-| `ZEROCACHE_BEDROCK_ENDPOINT_TEMPLATE` | `https://bedrock-runtime.{region}.amazonaws.com` |
-
-**GCP Vertex AI**
-
-| Variable | Default | Notes |
-| --- | --- | --- |
-| `ZEROCACHE_VERTEX_PROJECT` | unset | If unset, every `vertexai` request's `model` must carry `<location>/<project>/` itself. |
-| `ZEROCACHE_VERTEX_LOCATION` | `us-central1` | |
-| `ZEROCACHE_VERTEX_ENDPOINT_TEMPLATE` | `https://{location}-aiplatform.googleapis.com` | `global`/`us`/`eu` multi-region locations resolve to the correct real Google host automatically. |
-
-**Observability** (optional, off by default)
-
-| Variable | Default |
-| --- | --- |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset — no OTLP export, console logging only |
-| `RUST_LOG` | `info` |
-
-## API reference
-
-### Text embeddings
-
-```
-POST /{provider}/v1/embeddings
-Authorization: Bearer <your own API key for that provider>
-Content-Type: application/json
-
-{ "model": "<real upstream model name>", "input": ["text 1", "text 2"] }
-```
-
-```
-→ 200 OK
-{
-  "object": "list",
-  "data": [ { "embedding": [0.001, -0.02, ...], "index": 0 }, ... ],
-  "model": "...",
-  "usage": { "prompt_tokens": 12, "total_tokens": 12 }
-}
-```
-
-`{provider}` is one of `openai`, `mistral`, `gemini`, `huggingface`, `bedrock`, `vertexai`, `azure`. `input` accepts either a JSON array of strings or a single bare string, matching OpenAI's real `input: string | string[]` contract — so `embedQuery()`-style single-string calls (LangChain, LlamaIndex, etc.) work without modification.
-
-Example, OpenAI:
-```sh
-curl https://your-zerocache-host/openai/v1/embeddings \
-  -H "Authorization: Bearer sk-your-real-openai-key" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "text-embedding-3-small", "input": "hello world"}'
-```
-
-Example, Bedrock (region + Cohere input_type encoded in `model`):
-```sh
-curl https://your-zerocache-host/bedrock/v1/embeddings \
-  -H "Authorization: Bearer your-bedrock-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "us-east-1/cohere.embed-english-v3#search_query", "input": ["find me something"]}'
-```
-
-A matching `DELETE /{provider}/v1/embeddings` (identical body shape) removes the cache entries a matching `POST` would have hit, scoped to your own `owner_id`. Response: `{"deleted": <count>}` — the count of keys *requested*, not how many actually existed (deletion is idempotent).
-
-### Image embeddings (Gemini only)
-
-```
-POST /gemini/v1/images/embeddings
-Authorization: Bearer <your Gemini API key>
-Content-Type: application/json
-
-{ "model": "gemini-embedding-001", "input": ["data:image/png;base64,<...>", ...] }
-```
-
-Every other provider `404`s on this route with `{"error": "provider '<name>' does not support image embeddings"}`. Same `DELETE`, error-shape, and per-caller isolation semantics as the text endpoint.
-
-### Provider model-string grammars (cloud providers)
-
-Azure, Bedrock, and Vertex AI encode routing coordinates into the `model` string itself rather than a new wire field — `model` is already free-form per-request and already part of the cache key, so this needs no framework-specific changes on the client side:
-
-| `{provider}` | Grammar | Example |
-| --- | --- | --- |
-| `bedrock` | `[<region>/]<modelId>[#<input_type>]` | `us-east-1/cohere.embed-english-v3#search_query` |
-| `vertexai` | `[<location>/<project>/]<modelId>[#<task_type>]` | `us-central1/my-proj/text-embedding-005#RETRIEVAL_DOCUMENT` |
-| `azure` | `[foundry:]<deployment>[#<input_type>]` | `foundry:cohere-embed-v3-english#document` |
-
-The `#<input_type>`/`#<task_type>` qualifier is included deliberately: for the vendors that accept it, it's a required-or-near-required parameter that *changes the output vector* (e.g. document vs. query embeddings). Hardcoding one value would silently give every caller the same embedding style regardless of use case — a failure mode that's invisible until retrieval quality degrades. It's caller-controlled and folded into the cache key so document- and query-style embeddings of the same text are never confused with each other.
-
-### Error shapes
-
-| Condition | Status | Body |
-| --- | --- | --- |
-| Missing/malformed `Authorization` | `401` | `{"error": "..."}` |
-| Unknown `{provider}` | `404` | `{"error": "..."}` |
-| Malformed JSON | `400` | `{"error": "..."}` |
-| Valid JSON, missing/wrong-typed field | `422` | `{"error": "..."}` |
-| Malformed image data URI | `400` | `{"error": "..."}` |
-
-Every error path — including axum's own body-rejection errors — returns the same `{"error": "..."}` shape, never a bare plain-text response.
-
-### Response headers
-
-- `X-Zerocache-Hits` / `X-Zerocache-Misses` — counts for this request's batch.
-- `usage` in the body reflects only what was **actually billed** for this request: `0` for an all-hit batch, `0` for a request that piggybacked on another in-flight identical request (in-process coalescing — see below), and always `0` for Gemini, which never reports token usage on any endpoint.
-
-Concurrent requests that miss on the *exact same* cache key within one Zerocache instance are coalesced into a single upstream call — proven with a dedicated test asserting exactly one provider call across 5 genuinely-overlapping concurrent requests. This is in-process only; two different replicas behind a load balancer each still fetch independently (cross-replica coalescing would need a distributed lock and isn't built).
-
-### Operational endpoints (unauthenticated, outside the versioned API)
-
-```
-GET /health    liveness — 200 OK means only the process/router is up, zero I/O
-GET /ready     readiness — 200 OK if the configured store answers a get(); 503 otherwise
-GET /metrics   Prometheus text format
-```
+---
 
 ## Deployment
 
-### Docker image
-
-Built from the repo-root [`Dockerfile`](./Dockerfile): a multi-stage build using [`cargo-chef`](https://github.com/LukeMathWalker/cargo-chef) for dependency-layer caching (so a source-only change doesn't force a full dependency recompile), a `debian:bookworm-slim` runtime stage, a non-root `zerocache` user (uid `10001`), and a `curl`-based `HEALTHCHECK` against `/health` that respects a custom `ZEROCACHE_PORT`. Published to **GitHub Container Registry**:
+**Docker image** — multi-stage build (`Dockerfile`): a `node:22` stage builds the dashboard from source, `cargo-chef` caches the dependency layer, the Rust builder produces a **static `x86_64-unknown-linux-musl`** binary (rustls, no OpenSSL), and the runtime stage is `FROM scratch` — just that binary. ~14.7 MB. Published to GHCR on every green `master`:
 
 ```sh
 docker pull ghcr.io/shramanb113/zerocache:latest
-# or pin to an exact commit:
 docker pull ghcr.io/shramanb113/zerocache:<commit-sha>
 ```
 
-### Kubernetes / multi-replica
+**Kubernetes / multi-replica** — the default `sled` store is per-process, so replicas don't share hits. Set `ZEROCACHE_STORAGE_BACKEND=redis` + `ZEROCACHE_REDIS_URL` for a shared cache (no distributed lock needed — content-addressed keys make last-write-wins safe). `/health` + `/ready` are standard liveness/readiness probes; scrape `/metrics` per pod and `sum()`.
 
-`ZEROCACHE_STORAGE_BACKEND=sled` (the default) is embedded and single-process — each replica keeps its own private cache, which is fine for a single instance but means replicas never share hits. For any deployment with more than one instance, set `ZEROCACHE_STORAGE_BACKEND=redis` and point `ZEROCACHE_REDIS_URL` at a shared Redis: it's connection-pooled with no distributed locking, since content-addressed keys mean two replicas racing to fill the same key both compute the same value — a last-write-wins `SET` is always safe.
+**CI/CD** — `ci.yml` runs `build` / `test` / `test-redis` / `build-musl` / `clippy -D warnings` / `fmt` / `dashboard` on every push and PR to `master`; `docker-publish.yml` builds and pushes the image after CI passes on a genuine push (not on fork PRs).
 
-`GET /health` / `GET /ready` are wired for standard liveness/readiness probes; `GET /metrics` is Prometheus text format with `provider`/`content_type` labels — scrape every pod and aggregate with `sum()` for a fleet-wide hit rate.
-
-### CI/CD pipeline
-
-Two GitHub Actions workflows, both under [`.github/workflows/`](./.github/workflows/):
-
-- **[`ci.yml`](./.github/workflows/ci.yml)** — on every push and pull request to `master`: `cargo build --workspace`, `cargo test --workspace`, the real-Redis integration suite (`cargo test -p zerocache-adapters-redis -- --ignored`, using the runner's built-in Docker), `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` — five independent, individually-required jobs.
-- **[`docker-publish.yml`](./.github/workflows/docker-publish.yml)** — after `ci.yml` succeeds on a genuine push to `master` (explicitly not on pull requests, closing off a fork-PR path to an unreviewed publish), builds and pushes the image to `ghcr.io/shramanb113/zerocache`, tagged with both `latest` and the commit SHA.
+---
 
 ## Observability
 
-- **`GET /health`** — zero-I/O liveness. `200` means only "the process and router are up."
-- **`GET /ready`** — real readiness: calls the configured store's `get()` against a reserved sentinel key. `200` on a miss (healthy — the key was never written), `503` on a genuine store-level error.
-- **`GET /metrics`** — Prometheus counters, labeled by `provider` and `content_type` (`text`/`image`): `zerocache_cache_hits_total`, `zerocache_cache_misses_total`, `zerocache_provider_prompt_tokens_total`. Deliberately no owner/tenant label — that would leak tenant identity into a monitoring system and create unbounded cardinality.
-- **OpenTelemetry tracing** — set `OTEL_EXPORTER_OTLP_ENDPOINT` to enable OTLP/gRPC export; unset means console-only logging, no collector required to run locally. Every HTTP request gets its own span, with `store_lookup`/`provider_call`/`store_write_back` nested underneath and `hits`/`misses`/`claimed`/`piggybacked` recorded as fields.
+- **`GET /metrics`** — Prometheus text, labeled by `provider` and `content_type`. `zerocache_cache_hits_total` / `_misses_total` / `zerocache_provider_prompt_tokens_total` for embeddings; `zerocache_completion_cache_hits_total` / `_misses_total` / `_prompt_tokens_saved_total` / `_completion_tokens_saved_total` for chat. No tenant label — that would leak identity into monitoring and blow up cardinality.
+- **`GET /health`** — zero-I/O liveness.
+- **`GET /ready`** — calls the store's `get()` on a reserved sentinel key; `503` on a store-level error.
+- **OpenTelemetry** — set `OTEL_EXPORTER_OTLP_ENDPOINT` for OTLP/gRPC export. Every request gets a span with `store_lookup` / `provider_call` / `store_write_back` children and `hits` / `misses` / `claimed` / `piggybacked` fields.
+
+---
+
+## Roadmap
+
+The completion cache above is **exact-match**. The features that make it a general LLM gateway are next, roughly in order:
+
+1. **Semantic completion cache** — a local ONNX embedder generates a prompt vector; a hit is a cosine match above a conservative threshold, not a byte match. Turns a near-zero hit rate on real chatbot/agent traffic into a useful one. The threshold, not the embedder, is what bounds false positives.
+2. **Streaming** — `stream: true`: buffer the SSE on a miss, replay it on a hit.
+3. **Anthropic `/v1/messages`** — a native adapter for Claude's wire shape, so Claude-based agents are cacheable.
+4. **Budgets & rate limits** — per-key monthly spend caps (`429` when exceeded) and per-key RPS limits, with a cost-by-team view in the dashboard.
+5. **Multi-provider failover** — retry a failed request on a second configured provider (the adapters already exist; only the routing policy is missing).
+6. **Request log + replay** (opt-in) — persist request/response pairs, browse them, replay one, diff the result.
+7. **One-click deploy** — `fly.toml` / a Deploy button, and a hosted free tier.
+
+---
+
+## What Zerocache is *not* (yet)
+
+- **Not a semantic LLM cache yet** — chat caching is exact-match on a canonicalized body. Semantic matching is item 1 on the roadmap.
+- **No streaming, no Anthropic `/v1/messages`** — roadmap items 2–3. Non-streaming OpenAI-wire only, today.
+- **No budgets, rate limiting, or failover** — roadmap items 4–5.
+- **No fuzzy similarity on embedding vectors** — and it never will do that: finding a near neighbour requires computing the very embedding you're trying to avoid. Text canonicalization (casing/punctuation fold) is the only near-match on the embedding path.
+- **No quantization / eviction** — deferred until a real hit-rate number justifies the work.
+- **No Zerocache SDK** — if a consumer has to install a package, the "drop-in" promise has failed.
+- **Cloud adapters (Azure / Bedrock / Vertex AI) are mock-tested only** — every wire shape was verified against each vendor's live docs, but none has had a live-key smoke test in this environment. Run one against your own credentials before production.
+
+---
 
 ## Testing
 
-Ordered so cheap, deterministic layers run first:
+279 tests across 13 crates + 7 `#[ignore]`d real-Redis integration tests (ephemeral container via `testcontainers`), zero `clippy -D warnings` findings.
 
-1. **Core** — pure unit tests, no I/O (key derivation, owner/provider/cache-scope isolation, image domain-separation).
-2. **Application** — orchestration logic against mock ports (hit/miss splitting, ordering, coalescing, within-batch dedup, failure propagation).
-3. **Adapters** — `sled` against a real embedded store; every provider adapter against a stubbed HTTP server (`httpmock`); Redis against a genuine ephemeral container via `testcontainers` (`#[ignore]`d by default so the documented `cargo test --workspace` needs no external services — run explicitly with `-- --ignored`).
-4. **End-to-end, real consumers** — not synthetic examples: a TypeScript/Mastra RAG pipeline (including an *agentic* battle-test driving Zerocache through `Agent` tool calls, not a direct embedding client), a second independent TypeScript project on LangChain, and a Python/LlamaIndex pipeline against a different provider (Gemini) — proving the "any framework, any language" neutrality claim rather than just asserting it.
+1. **Core** — pure unit tests: key derivation, owner/provider/scope isolation, image domain-separation, the completion canonicalizer + determinism gate.
+2. **Application** — orchestration against mock ports: hit/miss splitting, ordering, coalescing (text, image, completion), within-batch dedup, cache-scope isolation, failure propagation.
+3. **Adapters** — `sled` against a real store; every provider adapter against `httpmock`; Redis against a real container.
+4. **End-to-end, real consumers** — a TS/Mastra RAG pipeline (including an *agentic* battle-test driving Zerocache through `Agent` tool calls), a second independent TS project on LangChain, a Python/LlamaIndex pipeline against Gemini, and a real ReAct tool-calling agent against the completion cache — the "any framework, any language" claim proven, not asserted.
 
-At the time of writing: **196 tests passing + 7 real-Redis integration tests**, zero `cargo clippy -- -D warnings` findings, across 13 crates.
+Live smoke-tested against Gemini's OpenAI-compatible endpoint for both the completion cache and the embedding path.
 
-The three cloud provider adapters (Azure, Bedrock, Vertex AI) ship **mock-only** — none has had a live-key smoke test, since real credentials for those three clouds aren't available in this project's development environment. Every wire shape was verified directly against each vendor's own current documentation at implementation time, with a follow-up re-verification pass that caught and fixed a real stale-docs defect (a wrong Vertex AI endpoint-host derivation for `global`/`us`/`eu` locations). Treat this caveat as real: if you deploy one of these three, a first live smoke test against your own credentials before production traffic is a reasonable precaution.
+---
 
-## Project status
+## Further reading
 
-**Phase 1 complete.** Validated against three independently-built, real consumers across two languages (see [Testing](#testing) above). Production-trust basics are in place: provider timeouts, graceful shutdown (`SIGTERM`-aware), `/health` + `/ready`, request coalescing, retry/backoff with exponential backoff, OpenTelemetry tracing. All seven provider adapters (OpenAI, Mistral, Gemini, HuggingFace, Azure, Bedrock, Vertex AI) are implemented and registered. Docker image and CI/CD pipeline are live.
+- **[`CLAUDE.md`](./CLAUDE.md)** — full architecture and a dated log of every deviation from the original spec, with rationale.
+- **[`decisions.md`](./decisions.md)** — the reasoning behind the multi-tenant, multi-provider, BYOK design.
+- **[`PRD.md`](./PRD.md)** — the original product spec and phasing.
 
-See [`PRD.md`](./PRD.md) for the full product spec and success criteria, [`CLAUDE.md`](./CLAUDE.md) for the complete architecture and decision log (every deviation from the original spec, with rationale), and [`decisions.md`](./decisions.md) for the reasoning behind the multi-tenant, multi-provider, BYOK design.
-
-## Non-goals (v1)
-
-- Live/conversational query embedding caching.
-- Semantic/fuzzy similarity matching — exact-match only.
-- Vector quantization/compression, eviction.
-- Multi-provider *failover* (automatic fallback to a second provider if the first fails) — multi-provider *support* itself is fully implemented; failover is a different, separate feature.
-- Per-tenant rate limiting or quota enforcement.
-- Any Zerocache-specific SDK or client package — if a consumer needs to install one, the neutrality goal has failed.
-
-See [`PRD.md`](./PRD.md) §4 for the full rationale.
-
-## Contributing / further reading
-
-- [`CLAUDE.md`](./CLAUDE.md) — architecture notes and a full, dated log of every deviation from the original spec, aimed at any future contributor (human or AI) who needs to understand *why* the code looks the way it does before changing it.
-- [`decisions.md`](./decisions.md) — the reasoning behind major design calls (multi-tenancy, BYOK, storage backend choice, the cloud-adapter strategy pattern).
-- [`PRD.md`](./PRD.md) — the original product spec and phasing.
-
-Development loop:
+Development loop (exactly what CI runs):
 
 ```sh
 cargo build --workspace
@@ -402,8 +354,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-All four are exactly what CI runs on every push and pull request — a green local run is a strong (though not complete, since the real-Redis job also needs Docker) predictor of a green CI run.
+---
 
 ## License
 
-No license file exists in this repository yet — until one is added, treat the code as all-rights-reserved rather than assuming permissive reuse.
+No license file exists yet — until one is added, treat the code as all-rights-reserved.
