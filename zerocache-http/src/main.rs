@@ -200,6 +200,9 @@ async fn main() {
     let (semantic, semantic_poll_cursor) = match completion_vector_store {
         Some(vs) => match semantic::build_semantic_state(&config, vs) {
             Some(st) => {
+                // rebuild_index runs a blocking paged XRANGE inline; intentional here —
+                // this is before axum::serve, nothing else is scheduled on the runtime yet.
+                // Do not move it after the server starts without wrapping it in spawn_blocking.
                 let cursor = semantic::rebuild_index(&st, &config);
                 (Some(st), cursor)
             }

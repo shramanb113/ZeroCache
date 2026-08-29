@@ -316,7 +316,7 @@ The features that make the completion cache a general LLM gateway, roughly in or
 
 ## What Zerocache is *not* (yet)
 
-- **Semantic chat caching is opt-in** — a `--features semantic` build plus `ZEROCACHE_SEMANTIC=1` adds a local-embedder near-match tier on the sled backend; the default build is still exact-match on a canonicalized body. On the redis backend it propagates across replicas via a Redis Stream change-feed (~2 s lag); the RediSearch-native KNN path and push propagation are still deferred.
+- **Semantic chat caching is opt-in** — a `--features semantic` build plus `ZEROCACHE_SEMANTIC=1` adds a local-embedder near-match tier; the default build is still exact-match on a canonicalized body. On the redis backend it propagates across replicas via a Redis Stream change-feed (~2 s lag); the RediSearch-native KNN path and push propagation are still deferred.
 - **No streaming, no Anthropic `/v1/messages`** — roadmap items 2–3. Non-streaming OpenAI-wire only, today.
 - **No budgets, rate limiting, or failover** — roadmap items 4–5.
 - **No fuzzy similarity on embedding vectors** — and it never will do that: finding a near neighbour requires computing the very embedding you're trying to avoid. Text canonicalization (casing/punctuation fold) is the only near-match on the embedding path.

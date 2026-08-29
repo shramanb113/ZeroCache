@@ -139,8 +139,8 @@ impl RedisStore {
         }
 
         if malformed > 0 {
-            eprintln!(
-                "warning: semantic index stream: skipped {malformed} malformed/unknown entr{} in one changes_since call",
+            tracing::warn!(
+                "semantic index stream: skipped {malformed} malformed/unknown entr{} in one changes_since call",
                 if malformed == 1 { "y" } else { "ies" }
             );
         }

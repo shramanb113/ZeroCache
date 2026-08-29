@@ -8,7 +8,7 @@ use zerocache_core::MatchUnit;
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
 pub const DEFAULT_SEMANTIC_THRESHOLD: f32 = 0.97;
 const SEMANTIC_THRESHOLD_FLOOR: f32 = 0.5;
-pub const DEFAULT_SEMANTIC_INDEX_MAXLEN: usize = 100_000;
+pub use zerocache_adapters_redis::DEFAULT_SEMANTIC_INDEX_MAXLEN;
 pub const DEFAULT_SEMANTIC_POLL_MS: u64 = 2000;
 const SEMANTIC_POLL_MS_MIN: u64 = 250;
 const SEMANTIC_POLL_MS_MAX: u64 = 60_000;

@@ -5350,6 +5350,7 @@ dependencies = [
  "r2d2",
  "redis",
  "testcontainers-modules",
+ "tracing",
  "zerocache-core",
  "zerocache-ports",
 ]

@@ -182,7 +182,6 @@ pub fn rebuild_index(sem: &SemanticState, config: &Config) -> Option<String> {
 
 /// Apply one batch of change-feed events to the local index. Extracted from
 /// the poll loop so it is testable without a tokio runtime or an `AppState`.
-#[cfg(feature = "semantic")]
 fn apply_vector_changes(
     index: &SemanticIndex,
     metrics: &Metrics,
@@ -238,11 +237,16 @@ pub async fn run_semantic_poll_task(
                 consecutive_errors += 1;
                 if consecutive_errors == 1 || consecutive_errors.is_multiple_of(30) {
                     warn!(
-                        "semantic index poll failed ({consecutive_errors}x), keeping cursor {cursor}: {e}"
+                        "semantic index poll failed ({consecutive_errors}x), keeping cursor {cursor}: {e} (the redis semantic index needs Redis >= 6.2 for exclusive XRANGE / XTRIM MINID)"
                     );
                 }
             }
-            Err(join) => warn!("semantic index poll task join error: {join}"),
+            Err(join) => {
+                consecutive_errors += 1;
+                if consecutive_errors == 1 || consecutive_errors.is_multiple_of(30) {
+                    warn!("semantic index poll task join error ({consecutive_errors}x): {join}");
+                }
+            }
         }
     }
 }
