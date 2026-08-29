@@ -1,4 +1,5 @@
 mod app;
+mod coalesce;
 mod completion;
 mod config;
 mod dashboard;
