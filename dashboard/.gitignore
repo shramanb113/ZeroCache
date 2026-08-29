@@ -1,0 +1,13 @@
+# dependencies
+node_modules/
+
+# astro build cache
+.astro/
+
+# NOT ignored: dist/ is committed so `cargo build -p zerocache-http` can embed it
+# without a Node toolchain present. Rebuild with `npm run build` after changing
+# anything under src/.
+
+# misc
+.DS_Store
+npm-debug.log*

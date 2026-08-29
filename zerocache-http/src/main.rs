@@ -1,6 +1,7 @@
 mod app;
 mod completion;
 mod config;
+mod dashboard;
 mod image;
 mod otel;
 mod wire;
@@ -194,6 +195,9 @@ async fn main() {
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
+        .route("/dashboard", get(dashboard::index))
+        .route("/dashboard/", get(dashboard::index))
+        .route("/dashboard/*path", get(dashboard::asset))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -201,6 +205,7 @@ async fn main() {
         .await
         .expect("failed to bind port");
     tracing::info!(port, "zerocache-http listening");
+    tracing::info!("savings dashboard at http://localhost:{port}/dashboard");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
