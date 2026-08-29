@@ -156,6 +156,8 @@ pub struct Metrics {
     completion_semantic_hits: IntCounterVec,
     completion_prompt_tokens_saved: IntCounterVec,
     completion_completion_tokens_saved: IntCounterVec,
+    #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
+    semantic_index_events_applied: IntCounterVec,
 }
 
 impl Metrics {
@@ -228,6 +230,15 @@ impl Metrics {
         )
         .expect("metric name/help/labels are hardcoded and valid");
 
+        let semantic_index_events_applied = IntCounterVec::new(
+            Opts::new(
+                "zerocache_semantic_index_events_applied_total",
+                "Semantic-index change-feed events applied to this replica's in-memory index",
+            ),
+            &["op"],
+        )
+        .expect("metric name/help/labels are hardcoded and valid");
+
         for collector in [
             &hits,
             &misses,
@@ -237,6 +248,7 @@ impl Metrics {
             &completion_semantic_hits,
             &completion_prompt_tokens_saved,
             &completion_completion_tokens_saved,
+            &semantic_index_events_applied,
         ] {
             registry
                 .register(Box::new(collector.clone()))
@@ -253,6 +265,7 @@ impl Metrics {
             completion_semantic_hits,
             completion_prompt_tokens_saved,
             completion_completion_tokens_saved,
+            semantic_index_events_applied,
         }
     }
 
@@ -295,6 +308,22 @@ impl Metrics {
         self.completion_semantic_hits
             .with_label_values(&[provider])
             .inc();
+    }
+
+    /// Change-feed events (`upsert` / `delete`) the poll task applied to the
+    /// local in-memory semantic index this tick.
+    #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
+    pub(crate) fn record_semantic_index_events_applied(&self, upserts: u64, deletes: u64) {
+        if upserts > 0 {
+            self.semantic_index_events_applied
+                .with_label_values(&["upsert"])
+                .inc_by(upserts);
+        }
+        if deletes > 0 {
+            self.semantic_index_events_applied
+                .with_label_values(&["delete"])
+                .inc_by(deletes);
+        }
     }
 
     /// Renders all registered metrics in Prometheus text exposition format.
@@ -1030,6 +1059,22 @@ mod tests {
         );
         assert!(
             !dump.contains("zerocache_completion_cache_hits_total{provider=\"openai\"} 2"),
+            "{dump}"
+        );
+    }
+
+    #[test]
+    fn record_semantic_index_events_applied_labels_by_op_and_skips_zeroes() {
+        let m = Metrics::new();
+        m.record_semantic_index_events_applied(3, 1);
+        m.record_semantic_index_events_applied(2, 0);
+        let dump = m.encode();
+        assert!(
+            dump.contains("zerocache_semantic_index_events_applied_total{op=\"upsert\"} 5"),
+            "{dump}"
+        );
+        assert!(
+            dump.contains("zerocache_semantic_index_events_applied_total{op=\"delete\"} 1"),
             "{dump}"
         );
     }
