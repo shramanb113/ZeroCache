@@ -44,6 +44,13 @@ use zerocache_ports::{CompletionStore, EmbeddingProvider, EmbeddingStore, ImageE
 
 #[tokio::main]
 async fn main() {
+    // `zerocache-http --health-check` probes the local /health endpoint and
+    // exits 0/1. This is the container HEALTHCHECK -- the `FROM scratch` image
+    // has no curl/wget/shell, so the binary is its own probe.
+    if std::env::args().any(|a| a == "--health-check") {
+        std::process::exit(health_check_probe());
+    }
+
     let tracer_provider = otel::init();
     let config = Config::from_env();
     log_overridden_base_urls(&config);
@@ -774,6 +781,42 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
 
 async fn health_handler() -> StatusCode {
     StatusCode::OK
+}
+
+/// Blocking one-shot HTTP/1.0 GET to the local `/health` endpoint. Returns a
+/// process exit code: 0 if the server answered `200`, 1 otherwise. Uses only
+/// `std::net` so it adds no dependency and works in the dependency-free
+/// `FROM scratch` image.
+fn health_check_probe() -> i32 {
+    use std::io::{Read, Write};
+
+    let port: u16 = std::env::var("ZEROCACHE_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8080);
+    let timeout = std::time::Duration::from_secs(3);
+
+    let mut stream = match std::net::TcpStream::connect(("127.0.0.1", port)) {
+        Ok(s) => s,
+        Err(_) => return 1,
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    if stream
+        .write_all(b"GET /health HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return 1;
+    }
+
+    let mut buf = String::new();
+    if stream.read_to_string(&mut buf).is_err() {
+        return 1;
+    }
+
+    let ok = buf.starts_with("HTTP/1.0 200") || buf.starts_with("HTTP/1.1 200");
+    i32::from(!ok)
 }
 
 async fn ready_handler(State(state): State<Arc<AppState>>) -> StatusCode {

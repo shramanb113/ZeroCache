@@ -499,10 +499,7 @@ mod tests {
             !out_b.hit,
             "a different cache_scope must not reuse another endpoint's stored completion"
         );
-        assert_eq!(
-            out_b.response.body["choices"][0]["message"]["content"],
-            "B"
-        );
+        assert_eq!(out_b.response.body["choices"][0]["message"]["content"], "B");
     }
 
     #[tokio::test]

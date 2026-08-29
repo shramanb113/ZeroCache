@@ -19,3 +19,13 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+
+# Optimized for a small, self-contained release binary -- the Docker image is
+# `FROM scratch` plus this binary, so its size is the image's size. `strip` drops
+# symbols/debuginfo; thin LTO + one codegen unit trims dead code across crates.
+# Deliberately NOT `panic = "abort"`: the app relies on catching panics from
+# `spawn_blocking` store calls and propagating them (see app.rs).
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

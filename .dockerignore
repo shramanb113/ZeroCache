@@ -7,8 +7,17 @@ docs/
 *.md
 .claude/
 .superpowers/
+.agents/
 .env
 .env.*
 *.pem
 *.key
 credentials*.json
+
+# node dependency trees and build caches -- huge, never needed in the image.
+# dashboard/dist stays (embedded into zerocache-http via include_dir!).
+**/node_modules/
+**/.astro/
+
+# the GitHub Pages marketing site builds and deploys separately (pages-deploy.yml)
+site/

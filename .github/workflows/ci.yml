@@ -37,6 +37,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p zerocache-adapters-redis -- --ignored
 
+  build-musl:
+    # The Docker image ships a static x86_64-unknown-linux-musl binary. The
+    # other jobs only exercise the native glibc target, so build the musl
+    # target here to catch a musl-only break before docker-publish does.
+    runs-on: ubuntu-latest
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target x86_64-unknown-linux-musl -p zerocache-http
+
   clippy:
     runs-on: ubuntu-latest
     steps:
@@ -55,3 +71,29 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --check
+
+  dashboard:
+    # The dashboard SPA is built ahead of time and its output (dashboard/dist)
+    # is committed so `cargo build` can embed it without Node. This job type
+    # checks it, rebuilds it, and fails if the committed dist is stale.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+        working-directory: dashboard
+      - run: npm run check
+        working-directory: dashboard
+      - run: npm run build
+        working-directory: dashboard
+      - name: committed dashboard/dist is up to date
+        run: |
+          if ! git diff --quiet -- dashboard/dist; then
+            echo "::error::dashboard/dist is stale -- run 'npm run build' in dashboard/ and commit the result"
+            git diff --stat -- dashboard/dist
+            exit 1
+          fi

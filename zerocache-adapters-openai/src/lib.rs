@@ -550,8 +550,7 @@ mod tests {
             })
             .await;
 
-        let provider =
-            OpenAiWireChatProvider::new(format!("{}/v1beta/openai", server.base_url()));
+        let provider = OpenAiWireChatProvider::new(format!("{}/v1beta/openai", server.base_url()));
         let resp = provider
             .chat_completion(
                 "sk-caller",
@@ -567,9 +566,8 @@ mod tests {
     #[test]
     fn chat_completion_cache_scope_is_the_configured_url_prefix() {
         let a = OpenAiWireChatProvider::new("https://api.openai.com/v1");
-        let b = OpenAiWireChatProvider::new(
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-        );
+        let b =
+            OpenAiWireChatProvider::new("https://generativelanguage.googleapis.com/v1beta/openai");
         assert_eq!(
             a.cache_scope("gpt-4o").unwrap(),
             "https://api.openai.com/v1"
