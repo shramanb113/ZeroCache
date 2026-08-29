@@ -476,7 +476,10 @@ mod tests {
     fn fuzzy_returns_none_when_there_is_no_user_message() {
         let req = json!({"messages":[{"role":"system","content":"hi"}]});
         assert_eq!(completion_fuzzy_text(&req, MatchUnit::LastUser), None);
-        assert_eq!(completion_fuzzy_text(&req, MatchUnit::SystemAndLastUser), None);
+        assert_eq!(
+            completion_fuzzy_text(&req, MatchUnit::SystemAndLastUser),
+            None
+        );
     }
 
     #[test]

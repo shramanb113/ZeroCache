@@ -113,7 +113,10 @@ impl CompletionVectorStore for SledStore {
     fn insert(&self, record: VectorRecord) -> Result<(), StoreError> {
         let expires_at = self.ttl.map(|ttl| SystemTime::now() + ttl);
         self.completion_vectors
-            .insert(record.exact_key.as_bytes(), encode_vector(expires_at, &record))
+            .insert(
+                record.exact_key.as_bytes(),
+                encode_vector(expires_at, &record),
+            )
             .map_err(|e| StoreError(e.to_string()))?;
         Ok(())
     }
@@ -192,7 +195,13 @@ fn decode_vector(bytes: &[u8]) -> Option<(Option<SystemTime>, [u8; 32], [u8; 32]
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    Some((expires_at, scope_hash, coarse_key_hash, index_version, vector))
+    Some((
+        expires_at,
+        scope_hash,
+        coarse_key_hash,
+        index_version,
+        vector,
+    ))
 }
 
 // Stored value format: [8 bytes: expires_at as unix seconds, LE, 0 = never][fp32 vector bytes].

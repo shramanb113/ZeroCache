@@ -11,7 +11,8 @@ const MODEL_F16: &[u8] = include_bytes!(concat!(
 ));
 const TOKENIZER_JSON: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/model/tokenizer.json"));
-const CONFIG_JSON: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/model/config.json"));
+const CONFIG_JSON: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/model/config.json"));
 
 const MAX_TOKENS: usize = 256;
 
@@ -83,7 +84,11 @@ impl TextEmbedder {
         let counts = mask_f.sum(1)?.clamp(1e-9, f32::INFINITY)?; // (1, 1)
         let mean = summed.broadcast_div(&counts)?;
 
-        let norm = mean.sqr()?.sum_keepdim(1)?.sqrt()?.clamp(1e-12, f32::INFINITY)?;
+        let norm = mean
+            .sqr()?
+            .sum_keepdim(1)?
+            .sqrt()?
+            .clamp(1e-12, f32::INFINITY)?;
         mean.broadcast_div(&norm)?.squeeze(0)?.to_vec1::<f32>()
     }
 }
@@ -126,6 +131,10 @@ mod tests {
         let para = e.embed("how can i reset my password").unwrap();
         let unrelated = e.embed("what is the capital of France").unwrap();
         assert!(dot(&q, &para) > 0.85, "paraphrase {}", dot(&q, &para));
-        assert!(dot(&q, &unrelated) < 0.6, "unrelated {}", dot(&q, &unrelated));
+        assert!(
+            dot(&q, &unrelated) < 0.6,
+            "unrelated {}",
+            dot(&q, &unrelated)
+        );
     }
 }

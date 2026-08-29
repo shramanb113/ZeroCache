@@ -70,9 +70,7 @@ async fn main() {
     // same sled DB / redis pool -- opening a second handle to the same sled
     // directory would fail its exclusive lock.
     #[cfg(feature = "semantic")]
-    let mut completion_vector_store: Option<
-        Arc<dyn zerocache_ports::CompletionVectorStore>,
-    > = None;
+    let mut completion_vector_store: Option<Arc<dyn zerocache_ports::CompletionVectorStore>> = None;
     let (store, completion_store): (Arc<dyn EmbeddingStore>, Arc<dyn CompletionStore>) =
         match config.storage_backend {
             StorageBackend::Sled => {
@@ -82,9 +80,8 @@ async fn main() {
                 );
                 #[cfg(feature = "semantic")]
                 {
-                    completion_vector_store = Some(
-                        Arc::clone(&sled) as Arc<dyn zerocache_ports::CompletionVectorStore>
-                    );
+                    completion_vector_store =
+                        Some(Arc::clone(&sled) as Arc<dyn zerocache_ports::CompletionVectorStore>);
                 }
                 (
                     Arc::clone(&sled) as Arc<dyn EmbeddingStore>,

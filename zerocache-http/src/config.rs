@@ -207,10 +207,14 @@ impl Config {
                 std::env::var("ZEROCACHE_SEMANTIC").ok().as_deref(),
             ),
             semantic_threshold: parse_semantic_threshold(
-                std::env::var("ZEROCACHE_SEMANTIC_THRESHOLD").ok().as_deref(),
+                std::env::var("ZEROCACHE_SEMANTIC_THRESHOLD")
+                    .ok()
+                    .as_deref(),
             ),
             semantic_match_unit: parse_semantic_match_unit(
-                std::env::var("ZEROCACHE_SEMANTIC_MATCH_UNIT").ok().as_deref(),
+                std::env::var("ZEROCACHE_SEMANTIC_MATCH_UNIT")
+                    .ok()
+                    .as_deref(),
             ),
         }
     }
@@ -672,19 +676,34 @@ mod tests {
     #[test]
     fn semantic_threshold_defaults_and_validates() {
         assert_eq!(parse_semantic_threshold(None), DEFAULT_SEMANTIC_THRESHOLD);
-        assert_eq!(parse_semantic_threshold(Some("")), DEFAULT_SEMANTIC_THRESHOLD);
+        assert_eq!(
+            parse_semantic_threshold(Some("")),
+            DEFAULT_SEMANTIC_THRESHOLD
+        );
         assert_eq!(parse_semantic_threshold(Some("0.9")), 0.9);
         assert_eq!(parse_semantic_threshold(Some("1.0")), 1.0);
-        assert_eq!(parse_semantic_threshold(Some("0.2")), DEFAULT_SEMANTIC_THRESHOLD);
-        assert_eq!(parse_semantic_threshold(Some("1.5")), DEFAULT_SEMANTIC_THRESHOLD);
-        assert_eq!(parse_semantic_threshold(Some("abc")), DEFAULT_SEMANTIC_THRESHOLD);
+        assert_eq!(
+            parse_semantic_threshold(Some("0.2")),
+            DEFAULT_SEMANTIC_THRESHOLD
+        );
+        assert_eq!(
+            parse_semantic_threshold(Some("1.5")),
+            DEFAULT_SEMANTIC_THRESHOLD
+        );
+        assert_eq!(
+            parse_semantic_threshold(Some("abc")),
+            DEFAULT_SEMANTIC_THRESHOLD
+        );
     }
 
     #[test]
     fn semantic_match_unit_parses_each_name_and_defaults_on_unknown() {
         assert_eq!(parse_semantic_match_unit(None), MatchUnit::LastUser);
         assert_eq!(parse_semantic_match_unit(Some("")), MatchUnit::LastUser);
-        assert_eq!(parse_semantic_match_unit(Some("last-user")), MatchUnit::LastUser);
+        assert_eq!(
+            parse_semantic_match_unit(Some("last-user")),
+            MatchUnit::LastUser
+        );
         assert_eq!(
             parse_semantic_match_unit(Some("system-and-last-user")),
             MatchUnit::SystemAndLastUser
@@ -693,7 +712,10 @@ mod tests {
             parse_semantic_match_unit(Some("full-conversation")),
             MatchUnit::FullConversation
         );
-        assert_eq!(parse_semantic_match_unit(Some("nonsense")), MatchUnit::LastUser);
+        assert_eq!(
+            parse_semantic_match_unit(Some("nonsense")),
+            MatchUnit::LastUser
+        );
     }
 
     #[test]

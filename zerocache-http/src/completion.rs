@@ -840,17 +840,24 @@ mod tests {
             let st = state_semantic(MockCompletionStore::empty(), emb, 0.97);
 
             let first = body("how do I reset my password?", 256);
-            let o1 = complete(&st, sreq(&provider, OWNER_A, &first)).await.unwrap();
+            let o1 = complete(&st, sreq(&provider, OWNER_A, &first))
+                .await
+                .unwrap();
             assert!(!o1.hit);
             assert_eq!(provider.call_count(), 1);
 
             let second = body("how can i reset the password", 256);
-            let o2 = complete(&st, sreq(&provider, OWNER_A, &second)).await.unwrap();
+            let o2 = complete(&st, sreq(&provider, OWNER_A, &second))
+                .await
+                .unwrap();
             assert!(o2.hit, "a paraphrase must be a semantic hit");
             assert_eq!(o2.hit_kind, Some(HitKind::Semantic));
             assert!(o2.semantic_score.unwrap() > 0.99);
             assert_eq!(provider.call_count(), 1);
-            assert_eq!(o2.response.body, json!({"choices":[{"message":{"content":"A"}}]}));
+            assert_eq!(
+                o2.response.body,
+                json!({"choices":[{"message":{"content":"A"}}]})
+            );
 
             let dump = st.metrics.encode();
             assert!(

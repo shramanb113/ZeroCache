@@ -45,7 +45,10 @@ pub fn scope_key(owner_id: &[u8; 32], provider: &str, cache_scope: &str, model: 
 
 /// The fuzzy text to embed and the coarse-key hash to gate on, or `None` when
 /// the request has no embeddable span.
-pub fn semantic_inputs(match_unit: MatchUnit, body: &serde_json::Value) -> Option<(String, [u8; 32])> {
+pub fn semantic_inputs(
+    match_unit: MatchUnit,
+    body: &serde_json::Value,
+) -> Option<(String, [u8; 32])> {
     let text = completion_fuzzy_text(body, match_unit)?;
     Some((text, coarse_key_hash(body, match_unit)))
 }
