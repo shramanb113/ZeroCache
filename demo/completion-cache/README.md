@@ -55,8 +55,34 @@ starts cold for its own keys every time (the completion cache has no
 
 ## What it does not cover
 
-Exact-match only — no semantic-similarity tier, no streaming, no real
-tool execution. Those are deferred (see Deviations item 21).
+`battle-test.mjs` / `agent.mjs` are exact-match only — no streaming, no real
+tool execution (deferred, Deviations item 21). The semantic tier has its own
+script below.
+
+---
+
+# paraphrase.mjs — the opt-in semantic tier
+
+Proves Deviations item 24: the same deterministic question, reworded five
+ways, is served from cache on repeat; a materially different question is not.
+Needs a Zerocache built with `--features semantic` and run with
+`ZEROCACHE_SEMANTIC=1` on the sled backend, plus a real key.
+
+```sh
+ZEROCACHE_SEMANTIC=1 \
+  ZEROCACHE_CHAT_PROVIDERS="gemini=https://generativelanguage.googleapis.com/v1beta/openai" \
+  cargo run -p zerocache-http --features semantic
+
+OPENAI_API_KEY=<gemini key> MODEL=gemini-3.5-flash-lite ZEROCACHE_CHAT_PROVIDER=gemini \
+  node demo/completion-cache/paraphrase.mjs
+```
+
+Asserts: base question is a cold miss, ≥ 4/5 paraphrases return
+`X-Zerocache-Completion-Hit-Kind: semantic` with a byte-identical body, the
+different question does not hit, and the `zerocache_completion_semantic_hits_total`
+delta is ≥ 4 while misses rose by exactly 2. If fewer than 4/5 hit at the
+default `0.97`, lower `ZEROCACHE_SEMANTIC_THRESHOLD` for the run (not the code
+default) or tighten the paraphrases.
 
 ---
 
