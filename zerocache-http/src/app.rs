@@ -128,6 +128,11 @@ pub struct AppState {
     // domain-separated keys can't collide, and independent locks keep one
     // path's traffic from contending another's.
     pub completion_in_flight: Mutex<HashMap<CacheKey, SharedCompletion>>,
+    // Cross-replica single-flight (see crate::coalesce). NoopCoordinator
+    // unless ZEROCACHE_CROSS_REPLICA_COALESCING=1 on the redis backend.
+    // Read by fetch_coalesced / fetch_completion_coalesced (next tasks).
+    #[allow(dead_code)]
+    pub coordinator: Arc<dyn zerocache_ports::CoalescingCoordinator>,
     // Semantic completion tier; None when disabled or on the redis backend.
     #[cfg(feature = "semantic")]
     pub semantic: Option<crate::semantic::SemanticState>,
@@ -1233,6 +1238,7 @@ mod tests {
             completion_store: Arc::new(NoopCompletionStore),
             completion_providers: StdHashMap::new(),
             completion_in_flight: Mutex::new(StdHashMap::new()),
+            coordinator: Arc::new(crate::coalesce::NoopCoordinator),
             #[cfg(feature = "semantic")]
             semantic: None,
         }

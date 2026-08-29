@@ -220,6 +220,7 @@ async fn main() {
         completion_store,
         completion_providers,
         completion_in_flight: std::sync::Mutex::new(HashMap::new()),
+        coordinator: Arc::new(coalesce::NoopCoordinator),
         #[cfg(feature = "semantic")]
         semantic,
     });

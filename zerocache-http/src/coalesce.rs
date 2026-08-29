@@ -38,9 +38,7 @@ impl CoalesceTiming {
 }
 
 /// In-process-only coordinator: always leads, so `coalesce_cross_replica`
-/// collapses to `fetch()` plus a no-op lock pair. Wired into `main.rs` /
-/// `AppState` in the next task; allow drops then.
-#[allow(dead_code)]
+/// collapses to `fetch()` plus a no-op lock pair.
 pub(crate) struct NoopCoordinator;
 
 impl CoalescingCoordinator for NoopCoordinator {

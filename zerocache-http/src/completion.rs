@@ -450,6 +450,7 @@ mod tests {
             completion_store: Arc::new(store),
             completion_providers: HashMap::new(),
             completion_in_flight: Mutex::new(HashMap::new()),
+            coordinator: Arc::new(crate::coalesce::NoopCoordinator),
             #[cfg(feature = "semantic")]
             semantic: None,
         }
@@ -794,6 +795,7 @@ mod tests {
                 completion_store: Arc::new(store),
                 completion_providers: HashMap::new(),
                 completion_in_flight: Mutex::new(HashMap::new()),
+                coordinator: Arc::new(crate::coalesce::NoopCoordinator),
                 semantic: Some(SemanticState {
                     embedder,
                     index: Arc::new(SemanticIndex::new()),
