@@ -51,6 +51,32 @@ pub trait CompletionStore: Send + Sync {
     fn delete(&self, key: &CacheKey) -> Result<(), StoreError>;
 }
 
+/// One persisted semantic-index entry: an L2-normalized embedding of a
+/// request's fuzzy span plus the coordinates needed to rebuild the in-memory
+/// HNSW index at startup and to look the full completion back up. The
+/// `vector` is `EMBEDDING_DIM` f32s (384); `index_version` lets a reader skip
+/// records written under an older coarse-canonical format.
+#[derive(Debug, Clone)]
+pub struct VectorRecord {
+    pub exact_key: CacheKey,
+    pub scope_hash: [u8; 32],
+    pub coarse_key_hash: [u8; 32],
+    pub index_version: u8,
+    pub vector: Vec<f32>,
+}
+
+/// Persistence for `VectorRecord`s. Separate from `CompletionStore` because
+/// it is the one store surface that must *enumerate* (`load_all`) to
+/// reconstruct an in-memory index on boot — a property the key-addressed
+/// store traits deliberately keep out. Implemented on the sled adapter only
+/// in v1; the redis adapter does not implement it and the semantic tier is
+/// unavailable on that backend.
+pub trait CompletionVectorStore: Send + Sync {
+    fn insert(&self, record: VectorRecord) -> Result<(), StoreError>;
+    fn delete(&self, exact_key: &CacheKey) -> Result<(), StoreError>;
+    fn load_all(&self) -> Result<Vec<VectorRecord>, StoreError>;
+}
+
 /// Token counts from a chat-completion response, used only for the
 /// tokens-saved metric on a cache hit. All zero when the provider omits a
 /// usage block or the upstream call returned a non-2xx.
@@ -200,4 +226,43 @@ pub trait ImageEmbeddingProvider: Send + Sync {
     /// Fallible because a cloud adapter derives it by parsing `model`, which
     /// the caller can get wrong.
     fn cache_scope(&self, model: &str) -> Result<String, ProviderError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Mem(std::sync::Mutex<Vec<VectorRecord>>);
+
+    impl CompletionVectorStore for Mem {
+        fn insert(&self, record: VectorRecord) -> Result<(), StoreError> {
+            self.0.lock().unwrap().push(record);
+            Ok(())
+        }
+        fn delete(&self, exact_key: &CacheKey) -> Result<(), StoreError> {
+            self.0.lock().unwrap().retain(|r| &r.exact_key != exact_key);
+            Ok(())
+        }
+        fn load_all(&self) -> Result<Vec<VectorRecord>, StoreError> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+    }
+
+    #[test]
+    fn completion_vector_store_is_object_safe_and_round_trips() {
+        let store: Box<dyn CompletionVectorStore> = Box::new(Mem(Default::default()));
+        let key = CacheKey::from_bytes([7u8; 32]);
+        store
+            .insert(VectorRecord {
+                exact_key: key,
+                scope_hash: [1u8; 32],
+                coarse_key_hash: [2u8; 32],
+                index_version: 1,
+                vector: vec![0.1, 0.2, 0.3],
+            })
+            .unwrap();
+        assert_eq!(store.load_all().unwrap().len(), 1);
+        store.delete(&key).unwrap();
+        assert!(store.load_all().unwrap().is_empty());
+    }
 }
