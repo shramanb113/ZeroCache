@@ -8,6 +8,13 @@ export function usd(n: number): string {
   return "$" + n.toLocaleString(undefined, { maximumSignificantDigits: 2 });
 }
 
+/** Headline money: always two decimals with grouping, never sig-digit mode.
+ *  For the hero figure and session-delta, where a stable width matters more
+ *  than sub-cent precision. */
+export function usd2(n: number): string {
+  return "$" + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
 export function int(n: number): string {
   return Math.round(n).toLocaleString();
 }

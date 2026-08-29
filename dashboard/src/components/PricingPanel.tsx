@@ -33,7 +33,10 @@ export default function PricingPanel({
 
   function edit(provider: string, field: Field, raw: string) {
     const n = Number(raw);
-    const next: PriceOverrides = { ...overrides, [provider]: { ...overrides[provider] } };
+    const next: PriceOverrides = {
+      ...overrides,
+      [provider]: { ...overrides[provider] },
+    };
     if (Number.isFinite(n) && n >= 0) next[provider][field] = n;
     else delete next[provider][field];
     if (Object.keys(next[provider]).length === 0) delete next[provider];
@@ -49,18 +52,18 @@ export default function PricingPanel({
   }
 
   return (
-    <details className="assump">
+    <details className="assump panel">
       <summary>Pricing assumptions</summary>
       <div className="a-body">
         <p className="note">
-          Illustrative list prices, USD per 1M tokens — edit for your model and tier.
-          Completion savings are exact (the stored response carries the token counts the
-          provider did not bill). Embedding savings are estimated as hits × average tokens
-          per observed miss, or × the assumed size below when no miss has been seen yet.
-          Saved in this browser only.
+          Illustrative list prices, USD per 1M tokens — edit for your model and tier. Completion
+          savings are exact (the stored response carries the token counts the provider did not
+          bill). Embedding savings are estimated as hits × average tokens per observed miss, or ×
+          the assumed size below when no miss has been seen yet. Saved in this browser only.
         </p>
         <div className="tablewrap">
           <table className="grid" style={{ minWidth: 520 }}>
+            <caption className="sr-only">Per-provider list prices, USD per million tokens</caption>
             <thead>
               <tr>
                 <th className="name">Provider</th>

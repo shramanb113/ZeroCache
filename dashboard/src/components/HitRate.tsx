@@ -5,9 +5,10 @@ interface MeterProps {
   rate: number | null;
   hits: number;
   total: number;
+  soft?: boolean;
 }
 
-function Meter({ label, rate, hits, total }: MeterProps) {
+function Meter({ label, rate, hits, total, soft }: MeterProps) {
   const value = rate === null ? undefined : Math.round(rate * 1000) / 10;
   return (
     <div
@@ -23,7 +24,11 @@ function Meter({ label, rate, hits, total }: MeterProps) {
         <b>{pct(rate)}</b>
       </div>
       <div className="m-track">
-        <div className="m-fill" style={{ width: `${(rate ?? 0) * 100}%` }} />
+        <div
+          className="m-fill"
+          data-soft={soft ? "true" : undefined}
+          style={{ transform: `scaleX(${rate ?? 0})` }}
+        />
       </div>
       <div className="m-sub">
         {total > 0 ? `${int(hits)} of ${int(total)} requests` : "no requests yet"}
@@ -50,11 +55,11 @@ export default function HitRate({
   eTotal,
 }: Props) {
   return (
-    <div className="card">
-      <h2>Hit rate</h2>
-      <div className="h2sub">share of requests served without a provider call</div>
+    <div className="panel card">
+      <div className="eyebrow">Hit rate</div>
+      <div className="sub">share of requests served without a provider call</div>
       <Meter label="Completions" rate={completionHitRate} hits={cHits} total={cTotal} />
-      <Meter label="Embeddings" rate={embeddingHitRate} hits={eHits} total={eTotal} />
+      <Meter label="Embeddings" rate={embeddingHitRate} hits={eHits} total={eTotal} soft />
     </div>
   );
 }

@@ -11,13 +11,14 @@ function Num({ value, format }: { value: number; format: (n: number) => string }
 
 export default function ProviderTable({ rows }: Props) {
   return (
-    <div className="card">
-      <h2>By provider</h2>
-      <div className="h2sub">
-        cumulative counters from <code>/metrics</code>
+    <div className="panel card">
+      <div className="eyebrow">
+        By provider
+        <span className="trailing">/metrics</span>
       </div>
       <div className="tablewrap">
         <table className="grid">
+          <caption className="sr-only">Cumulative cache counters per provider</caption>
           <thead>
             <tr>
               <th className="name">Provider</th>
