@@ -101,6 +101,12 @@ impl CacheKey {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Reconstructs a key from the 32 raw bytes `as_bytes` returned — e.g. a
+    /// store iterating its keyspace to rebuild an in-memory index.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 #[cfg(test)]
@@ -381,6 +387,12 @@ mod tests {
         let completion_key =
             CacheKey::derive_completion(OWNER_A, "openai", SCOPE_A, "gpt-4o", "v1", "hello");
         assert_ne!(image_key, completion_key);
+    }
+
+    #[test]
+    fn from_bytes_is_the_inverse_of_as_bytes() {
+        let k = CacheKey::derive_completion(OWNER_A, "openai", SCOPE_A, "gpt-4o", "v1", "x");
+        assert_eq!(CacheKey::from_bytes(*k.as_bytes()), k);
     }
 
     #[test]

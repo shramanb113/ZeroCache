@@ -166,6 +166,61 @@ pub fn completion_fuzzy_text(request: &Value, unit: MatchUnit) -> Option<String>
     }
 }
 
+/// The exact-match canonical form with the fuzzy span (per `unit`) blanked:
+/// used to derive `coarse_key_hash`, the hard gate that a semantic candidate
+/// must still match exactly outside the embedded span.
+pub fn canonicalize_completion_request_coarse(request: &Value, unit: MatchUnit) -> String {
+    let mut root = request.clone();
+    if let Value::Object(map) = &mut root {
+        for field in KEY_IRRELEVANT_FIELDS {
+            map.remove(*field);
+        }
+    }
+
+    match unit {
+        MatchUnit::LastUser | MatchUnit::SystemAndLastUser => {
+            if let Some(Value::Array(msgs)) = root.get_mut("messages") {
+                if let Some(last_user) = msgs
+                    .iter_mut()
+                    .rev()
+                    .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                {
+                    if let Value::Object(m) = last_user {
+                        m.insert("content".to_string(), Value::String(String::new()));
+                    }
+                }
+                if unit == MatchUnit::SystemAndLastUser {
+                    for m in msgs.iter_mut() {
+                        if m.get("role").and_then(Value::as_str) == Some("system") {
+                            if let Value::Object(obj) = m {
+                                obj.insert("content".to_string(), Value::String(String::new()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        MatchUnit::FullConversation => {
+            if let Value::Object(map) = &mut root {
+                map.remove("messages");
+            }
+        }
+    }
+
+    serde_json::to_string(&canonical_value(&root)).unwrap_or_default()
+}
+
+/// blake3 of the coarse canonical form, with the `unit` discriminant folded
+/// in so a deployment that changes `ZEROCACHE_SEMANTIC_MATCH_UNIT` can never
+/// get a cross-unit false match.
+pub fn coarse_key_hash(request: &Value, unit: MatchUnit) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&[unit as u8]);
+    hasher.update(b"\0");
+    hasher.update(canonicalize_completion_request_coarse(request, unit).as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 /// Recursively rewrites a JSON value into canonical form: object keys sorted,
 /// numbers normalized so `0` and `0.0` compare equal, arrays left in order.
 fn canonical_value(value: &Value) -> Value {
@@ -458,6 +513,106 @@ mod tests {
         assert_eq!(
             completion_fuzzy_text(&req, MatchUnit::FullConversation).as_deref(),
             Some("system: s\nuser: u1\nassistant: a1\nuser: u2")
+        );
+    }
+
+    // ---- canonicalize_completion_request_coarse / coarse_key_hash ----
+
+    fn base_chat() -> serde_json::Value {
+        json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role":"system","content":"you are a support bot"},
+                {"role":"user","content":"how do I reset my password?"}
+            ],
+            "temperature": 0,
+            "max_tokens": 256
+        })
+    }
+
+    #[test]
+    fn coarse_hash_ignores_a_change_to_only_the_last_user_message() {
+        let a = base_chat();
+        let mut b = base_chat();
+        b["messages"][1]["content"] = json!("how can I reset my password??");
+        assert_eq!(
+            coarse_key_hash(&a, MatchUnit::LastUser),
+            coarse_key_hash(&b, MatchUnit::LastUser),
+        );
+    }
+
+    #[test]
+    fn coarse_hash_changes_when_the_system_prompt_changes_under_last_user() {
+        let a = base_chat();
+        let mut b = base_chat();
+        b["messages"][0]["content"] = json!("you are a TERSE support bot");
+        assert_ne!(
+            coarse_key_hash(&a, MatchUnit::LastUser),
+            coarse_key_hash(&b, MatchUnit::LastUser),
+        );
+    }
+
+    #[test]
+    fn coarse_hash_changes_when_a_generation_param_changes() {
+        let a = base_chat();
+        let mut b = base_chat();
+        b["max_tokens"] = json!(512);
+        assert_ne!(
+            coarse_key_hash(&a, MatchUnit::LastUser),
+            coarse_key_hash(&b, MatchUnit::LastUser),
+        );
+    }
+
+    #[test]
+    fn coarse_hash_ignores_key_irrelevant_fields() {
+        let a = base_chat();
+        let mut b = base_chat();
+        b["user"] = json!("alice");
+        b["stream"] = json!(true);
+        assert_eq!(
+            coarse_key_hash(&a, MatchUnit::LastUser),
+            coarse_key_hash(&b, MatchUnit::LastUser),
+        );
+    }
+
+    #[test]
+    fn system_and_last_user_also_blanks_the_system_prompt() {
+        let a = base_chat();
+        let mut b = base_chat();
+        b["messages"][0]["content"] = json!("a completely different persona");
+        assert_eq!(
+            coarse_key_hash(&a, MatchUnit::SystemAndLastUser),
+            coarse_key_hash(&b, MatchUnit::SystemAndLastUser),
+        );
+        assert_ne!(
+            coarse_key_hash(&a, MatchUnit::LastUser),
+            coarse_key_hash(&b, MatchUnit::LastUser),
+        );
+    }
+
+    #[test]
+    fn full_conversation_drops_messages_but_keeps_params_and_tools() {
+        let a = base_chat();
+        let mut b = base_chat();
+        b["messages"] = json!([{"role":"user","content":"totally different history"}]);
+        assert_eq!(
+            coarse_key_hash(&a, MatchUnit::FullConversation),
+            coarse_key_hash(&b, MatchUnit::FullConversation),
+        );
+        let mut c = base_chat();
+        c["tools"] = json!([{"type":"function","function":{"name":"x"}}]);
+        assert_ne!(
+            coarse_key_hash(&a, MatchUnit::FullConversation),
+            coarse_key_hash(&c, MatchUnit::FullConversation),
+        );
+    }
+
+    #[test]
+    fn the_match_unit_discriminant_is_part_of_the_coarse_hash() {
+        let a = base_chat();
+        assert_ne!(
+            coarse_key_hash(&a, MatchUnit::LastUser),
+            coarse_key_hash(&a, MatchUnit::FullConversation),
         );
     }
 }
