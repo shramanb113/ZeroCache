@@ -168,6 +168,21 @@ impl Config {
     }
 }
 
+/// Normalizes a chat-provider URL to the prefix the chat adapter appends
+/// `/chat/completions` to. Deliberately forgiving: a deployer can supply
+/// the bare prefix, the prefix with a trailing slash, or the full
+/// completions URL pasted straight from the provider's docs -- all three
+/// collapse to the same value. Not validated as a URL here (same posture
+/// as the ZEROCACHE_*_BASE_URL values): a bad value fails loudly on the
+/// first request and is echoed in the startup log.
+fn normalize_chat_url(raw: &str) -> String {
+    let mut s: &str = raw.trim().trim_end_matches('/');
+    if let Some(stripped) = s.strip_suffix("/chat/completions") {
+        s = stripped.trim_end_matches('/');
+    }
+    s.to_string()
+}
+
 /// Parses the raw `ZEROCACHE_TTL_SECONDS` value into an optional TTL.
 ///
 /// `0` is treated as "unset" rather than "expire immediately"/"reject writes",
@@ -353,5 +368,51 @@ mod tests {
             env_or_default(Some("europe-west4"), DEFAULT_VERTEX_LOCATION),
             "europe-west4"
         );
+    }
+
+    #[test]
+    fn normalize_chat_url_leaves_a_bare_prefix_untouched() {
+        assert_eq!(
+            normalize_chat_url("https://api.groq.com/openai/v1"),
+            "https://api.groq.com/openai/v1"
+        );
+    }
+
+    #[test]
+    fn normalize_chat_url_strips_a_trailing_slash() {
+        assert_eq!(
+            normalize_chat_url("https://api.groq.com/openai/v1/"),
+            "https://api.groq.com/openai/v1"
+        );
+    }
+
+    #[test]
+    fn normalize_chat_url_strips_a_trailing_chat_completions_segment() {
+        assert_eq!(
+            normalize_chat_url("https://api.groq.com/openai/v1/chat/completions"),
+            "https://api.groq.com/openai/v1"
+        );
+    }
+
+    #[test]
+    fn normalize_chat_url_strips_both_a_completions_suffix_and_slashes() {
+        assert_eq!(
+            normalize_chat_url("https://x.example/v1/chat/completions/"),
+            "https://x.example/v1"
+        );
+    }
+
+    #[test]
+    fn normalize_chat_url_trims_surrounding_whitespace() {
+        assert_eq!(
+            normalize_chat_url("  https://x.example/v1  "),
+            "https://x.example/v1"
+        );
+    }
+
+    #[test]
+    fn normalize_chat_url_is_idempotent() {
+        let once = normalize_chat_url("https://x.example/v1/chat/completions/");
+        assert_eq!(normalize_chat_url(&once), once);
     }
 }
