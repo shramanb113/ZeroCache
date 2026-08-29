@@ -1,0 +1,28 @@
+---
+import "../styles/global.css";
+import Dashboard from "../components/Dashboard.tsx";
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>Zerocache savings</title>
+    <script is:inline>
+      // stamp the theme before first paint to avoid a flash
+      try {
+        var t = localStorage.getItem("zc-dash-theme-v1");
+        if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div class="wrap">
+      <Dashboard client:only="react">
+        <p slot="fallback" style="color:var(--muted);font-size:13px;">Loading dashboard…</p>
+      </Dashboard>
+    </div>
+  </body>
+</html>
