@@ -31,13 +31,24 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ---- builder: cook deps (cached), then build the static binary ----
 FROM chef AS builder
 COPY --from=planner /build/recipe.json recipe.json
+# zerocache-semantic is an optional path dep of zerocache-http, so it appears in
+# the chef recipe and `cook` must be able to read its manifest even though the
+# default build never compiles candle.
+COPY zerocache-semantic ./zerocache-semantic
 RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
 COPY . .
 # zerocache-http/src/dashboard.rs embeds dashboard/dist via include_dir!.
 # Overwrite the committed copy with the freshly-built one so the image's
 # dashboard always matches dashboard/src regardless of what's checked in.
 COPY --from=dashboard /dashboard/dist ./dashboard/dist
-RUN cargo build --release --target x86_64-unknown-linux-musl -p zerocache-http
+# FEATURES="" -> the default image (byte-identical to before). FEATURES=semantic
+# -> the opt-in tier; candle compiles uncached here (the chef recipe above does
+# not include the optional zerocache-semantic dep). If candle/gemm ever fails
+# against musl, give the :semantic image its own glibc builder+runtime in a
+# separate Dockerfile.semantic; :latest stays FROM scratch + musl.
+ARG FEATURES=""
+RUN cargo build --release --target x86_64-unknown-linux-musl -p zerocache-http \
+        ${FEATURES:+--features "$FEATURES"}
 # an empty, correctly-owned data dir to hand to the scratch stage (scratch has
 # no shell to `mkdir`)
 RUN install -d -o 10001 -g 10001 /out/data

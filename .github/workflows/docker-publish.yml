@@ -42,3 +42,19 @@ jobs:
           tags: |
             ghcr.io/shramanb113/zerocache:latest
             ghcr.io/shramanb113/zerocache:${{ github.event.workflow_run.head_sha }}
+
+      - name: Build and push the semantic image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          build-args: |
+            FEATURES=semantic
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ghcr.io/shramanb113/zerocache:semantic
+            ghcr.io/shramanb113/zerocache:semantic-${{ github.event.workflow_run.head_sha }}
