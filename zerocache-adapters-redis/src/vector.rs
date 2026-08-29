@@ -314,7 +314,10 @@ mod live_redis_tests {
         store.delete(&r.exact_key, &r.scope_hash).unwrap();
 
         let out = store.changes_since(None).unwrap();
-        assert!(out.upserts.is_empty(), "a put-then-del must not appear as an upsert");
+        assert!(
+            out.upserts.is_empty(),
+            "a put-then-del must not appear as an upsert"
+        );
         assert_eq!(out.deletes, vec![(r.exact_key, r.scope_hash)]);
     }
 
@@ -335,12 +338,17 @@ mod live_redis_tests {
     #[ignore]
     fn maxlen_caps_the_stream() {
         let (_c, url) = start_redis();
-        let store = RedisStore::connect(&url, None).unwrap().with_semantic_index_maxlen(100);
+        let store = RedisStore::connect(&url, None)
+            .unwrap()
+            .with_semantic_index_maxlen(100);
         for i in 0..400u16 {
             store.insert(rec(i as u8, 1)).unwrap();
         }
         let mut conn = store.pool.get().unwrap();
-        let len: usize = redis::cmd("XLEN").arg(SEMANTIC_STREAM_KEY).query(&mut *conn).unwrap();
+        let len: usize = redis::cmd("XLEN")
+            .arg(SEMANTIC_STREAM_KEY)
+            .query(&mut *conn)
+            .unwrap();
         assert!(len < 400, "MAXLEN ~ should have trimmed; got {len}");
     }
 

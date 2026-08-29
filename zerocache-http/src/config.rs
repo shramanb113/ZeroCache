@@ -225,7 +225,9 @@ impl Config {
                     .as_deref(),
             ),
             semantic_index_maxlen: parse_semantic_index_maxlen(
-                std::env::var("ZEROCACHE_SEMANTIC_INDEX_MAXLEN").ok().as_deref(),
+                std::env::var("ZEROCACHE_SEMANTIC_INDEX_MAXLEN")
+                    .ok()
+                    .as_deref(),
             ),
             semantic_poll_ms: parse_semantic_poll_ms(
                 std::env::var("ZEROCACHE_SEMANTIC_POLL_MS").ok().as_deref(),
@@ -788,12 +790,27 @@ mod tests {
 
     #[test]
     fn semantic_index_maxlen_defaults_and_validates() {
-        assert_eq!(parse_semantic_index_maxlen(None), DEFAULT_SEMANTIC_INDEX_MAXLEN);
-        assert_eq!(parse_semantic_index_maxlen(Some("")), DEFAULT_SEMANTIC_INDEX_MAXLEN);
+        assert_eq!(
+            parse_semantic_index_maxlen(None),
+            DEFAULT_SEMANTIC_INDEX_MAXLEN
+        );
+        assert_eq!(
+            parse_semantic_index_maxlen(Some("")),
+            DEFAULT_SEMANTIC_INDEX_MAXLEN
+        );
         assert_eq!(parse_semantic_index_maxlen(Some("250000")), 250_000);
-        assert_eq!(parse_semantic_index_maxlen(Some("0")), DEFAULT_SEMANTIC_INDEX_MAXLEN);
-        assert_eq!(parse_semantic_index_maxlen(Some("-5")), DEFAULT_SEMANTIC_INDEX_MAXLEN);
-        assert_eq!(parse_semantic_index_maxlen(Some("abc")), DEFAULT_SEMANTIC_INDEX_MAXLEN);
+        assert_eq!(
+            parse_semantic_index_maxlen(Some("0")),
+            DEFAULT_SEMANTIC_INDEX_MAXLEN
+        );
+        assert_eq!(
+            parse_semantic_index_maxlen(Some("-5")),
+            DEFAULT_SEMANTIC_INDEX_MAXLEN
+        );
+        assert_eq!(
+            parse_semantic_index_maxlen(Some("abc")),
+            DEFAULT_SEMANTIC_INDEX_MAXLEN
+        );
     }
 
     #[test]
@@ -803,6 +820,9 @@ mod tests {
         assert_eq!(parse_semantic_poll_ms(Some("1000")), 1000);
         assert_eq!(parse_semantic_poll_ms(Some("50")), 250);
         assert_eq!(parse_semantic_poll_ms(Some("120000")), 60_000);
-        assert_eq!(parse_semantic_poll_ms(Some("abc")), DEFAULT_SEMANTIC_POLL_MS);
+        assert_eq!(
+            parse_semantic_poll_ms(Some("abc")),
+            DEFAULT_SEMANTIC_POLL_MS
+        );
     }
 }
