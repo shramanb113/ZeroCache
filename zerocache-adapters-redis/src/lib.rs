@@ -4,6 +4,13 @@ use redis::Commands;
 use zerocache_core::CacheKey;
 use zerocache_ports::{CompletionStore, EmbeddingStore, StoreError};
 
+mod vector;
+
+/// Approximate `XADD MAXLEN ~` cap on the semantic-index event stream. A
+/// safety ceiling, not the expected size -- when ZEROCACHE_TTL_SECONDS is
+/// set the time-based MINID trim keeps the stream far below this.
+pub const DEFAULT_SEMANTIC_INDEX_MAXLEN: usize = 100_000;
+
 // redis-rs sets no socket timeout by default, so a stale or half-dead TCP
 // connection (the Redis process died without a clean FIN, or a network
 // partition silently drops packets) can otherwise block a synchronous call
@@ -23,6 +30,7 @@ const STORE_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct RedisStore {
     pool: r2d2::Pool<redis::Client>,
     ttl: Option<Duration>,
+    semantic_index_maxlen: usize,
 }
 
 impl RedisStore {
@@ -31,7 +39,17 @@ impl RedisStore {
         let pool = r2d2::Pool::builder()
             .build(client)
             .map_err(|e| StoreError(e.to_string()))?;
-        Ok(Self { pool, ttl })
+        Ok(Self {
+            pool,
+            ttl,
+            semantic_index_maxlen: DEFAULT_SEMANTIC_INDEX_MAXLEN,
+        })
+    }
+
+    /// Overrides the `XADD MAXLEN ~` cap on the semantic-index stream.
+    pub fn with_semantic_index_maxlen(mut self, maxlen: usize) -> Self {
+        self.semantic_index_maxlen = maxlen;
+        self
     }
 }
 

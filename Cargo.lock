@@ -5346,6 +5346,7 @@ dependencies = [
 name = "zerocache-adapters-redis"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "r2d2",
  "redis",
  "testcontainers-modules",
