@@ -30,6 +30,11 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "trace"] }
 tower-http = { version = "0.7.0", features = ["trace"] }
 include_dir = "0.7"
+zerocache-semantic = { path = "../zerocache-semantic", optional = true }
+blake3 = { version = "1", optional = true }
+
+[features]
+semantic = ["dep:zerocache-semantic", "dep:blake3"]
 
 [dev-dependencies]
 serde_json = "1.0.151"

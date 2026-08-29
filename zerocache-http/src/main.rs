@@ -4,6 +4,8 @@ mod config;
 mod dashboard;
 mod image;
 mod otel;
+#[cfg(feature = "semantic")]
+mod semantic;
 mod wire;
 
 use std::collections::HashMap;
