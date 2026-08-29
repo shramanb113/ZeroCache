@@ -161,6 +161,9 @@ pub struct Metrics {
     completion_semantic_hits: IntCounterVec,
     completion_prompt_tokens_saved: IntCounterVec,
     completion_completion_tokens_saved: IntCounterVec,
+    // A request served from a peer replica's fill without this replica's own
+    // provider call (crate::coalesce). `kind` = "embedding" | "completion".
+    cross_replica_coalesced: IntCounterVec,
 }
 
 impl Metrics {
@@ -232,6 +235,14 @@ impl Metrics {
             &["provider"],
         )
         .expect("metric name/help/labels are hardcoded and valid");
+        let cross_replica_coalesced = IntCounterVec::new(
+            Opts::new(
+                "zerocache_cross_replica_coalesced_total",
+                "Requests served from a peer replica's fill without this replica's own provider call",
+            ),
+            &["provider", "kind"],
+        )
+        .expect("metric name/help/labels are hardcoded and valid");
 
         for collector in [
             &hits,
@@ -242,6 +253,7 @@ impl Metrics {
             &completion_semantic_hits,
             &completion_prompt_tokens_saved,
             &completion_completion_tokens_saved,
+            &cross_replica_coalesced,
         ] {
             registry
                 .register(Box::new(collector.clone()))
@@ -258,6 +270,7 @@ impl Metrics {
             completion_semantic_hits,
             completion_prompt_tokens_saved,
             completion_completion_tokens_saved,
+            cross_replica_coalesced,
         }
     }
 
@@ -300,6 +313,24 @@ impl Metrics {
         self.completion_semantic_hits
             .with_label_values(&[provider])
             .inc();
+    }
+
+    /// A request that avoided its own provider call because a peer replica
+    /// filled the entry first (crate::coalesce). `kind` = "embedding" |
+    /// "completion". Consumed by completion.rs (Task 5); allow drops then.
+    #[allow(dead_code)]
+    pub(crate) fn record_cross_replica_coalesced(&self, provider: &str, kind: &str) {
+        self.cross_replica_coalesced
+            .with_label_values(&[provider, kind])
+            .inc();
+    }
+
+    /// A cheap clone of the counter vec, for incrementing from inside a
+    /// 'static coalesced future that cannot borrow `&Metrics`. Consumed by
+    /// fetch_coalesced (Task 6); allow drops then.
+    #[allow(dead_code)]
+    pub(crate) fn cross_replica_coalesced_counter(&self) -> IntCounterVec {
+        self.cross_replica_coalesced.clone()
     }
 
     /// Renders all registered metrics in Prometheus text exposition format.
@@ -1022,6 +1053,27 @@ mod tests {
     use zerocache_ports::ProviderUsage;
 
     use super::*;
+
+    #[test]
+    fn record_cross_replica_coalesced_labels_by_provider_and_kind() {
+        let m = Metrics::new();
+        m.record_cross_replica_coalesced("openai", "completion");
+        m.record_cross_replica_coalesced("openai", "completion");
+        m.record_cross_replica_coalesced("gemini", "embedding");
+        let dump = m.encode();
+        assert!(
+            dump.contains(
+                "zerocache_cross_replica_coalesced_total{kind=\"completion\",provider=\"openai\"} 2"
+            ),
+            "{dump}"
+        );
+        assert!(
+            dump.contains(
+                "zerocache_cross_replica_coalesced_total{kind=\"embedding\",provider=\"gemini\"} 1"
+            ),
+            "{dump}"
+        );
+    }
 
     #[test]
     fn record_completion_semantic_hit_increments_only_the_semantic_counter() {

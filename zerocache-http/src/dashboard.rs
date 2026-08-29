@@ -94,6 +94,7 @@ mod tests {
             "zerocache_cache_hits_total",
             "zerocache_cache_misses_total",
             "zerocache_provider_prompt_tokens_total",
+            "zerocache_cross_replica_coalesced_total",
         ] {
             assert!(
                 js.contains(name),

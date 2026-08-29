@@ -64,6 +64,8 @@ export interface Snapshot {
   completionTokensSaved: number;
   embeddingTokensSaved: number;
   completionSemanticHits: number;
+  /** requests a peer replica filled for us (cross-replica coalescing) */
+  crossReplicaCoalesced: number;
 }
 
 const M = {
@@ -75,6 +77,7 @@ const M = {
   eHit: "zerocache_cache_hits_total",
   eMiss: "zerocache_cache_misses_total",
   eBilled: "zerocache_provider_prompt_tokens_total",
+  crossReplicaCoalesced: "zerocache_cross_replica_coalesced_total",
 } as const;
 
 /** The metric family names this dashboard depends on, exported so the Rust side
@@ -96,6 +99,7 @@ export function shape(
   let embeddingUsd = 0;
   let cHit = 0;
   let cSemantic = 0;
+  let crossReplicaCoalesced = 0;
   let cMiss = 0;
   let eHit = 0;
   let eMiss = 0;
@@ -139,6 +143,7 @@ export function shape(
     embeddingUsd += embUsd;
     cHit += pcHit;
     cSemantic += pcSemantic;
+    crossReplicaCoalesced += sumByProvider(raw[M.crossReplicaCoalesced], p);
     cMiss += pcMiss;
     eHit += peHit;
     eMiss += peMiss;
@@ -162,5 +167,6 @@ export function shape(
     completionTokensSaved: promptTokensSaved + completionTokensSaved,
     embeddingTokensSaved,
     completionSemanticHits: cSemantic,
+    crossReplicaCoalesced,
   };
 }
