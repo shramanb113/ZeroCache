@@ -1,7 +1,9 @@
 use std::time::{Duration, SystemTime};
 
 use zerocache_core::CacheKey;
-use zerocache_ports::{CompletionStore, EmbeddingStore, StoreError};
+use zerocache_ports::{
+    CompletionStore, CompletionVectorStore, EmbeddingStore, StoreError, VectorRecord,
+};
 
 pub struct SledStore {
     db: sled::Db,
@@ -12,6 +14,10 @@ pub struct SledStore {
     // already domain-separated from `derive`, so this is tidiness, not a
     // correctness requirement.
     completions: sled::Tree,
+    // Semantic-index vector records (see CompletionVectorStore). A third
+    // tree, iterable on its own so the in-memory HNSW index can be rebuilt
+    // at startup without scanning the completion blobs.
+    completion_vectors: sled::Tree,
     ttl: Option<Duration>,
 }
 
@@ -19,9 +25,11 @@ impl SledStore {
     pub fn open(path: impl AsRef<std::path::Path>, ttl: Option<Duration>) -> sled::Result<Self> {
         let db = sled::open(path)?;
         let completions = db.open_tree("completions")?;
+        let completion_vectors = db.open_tree("completion_vectors")?;
         Ok(Self {
             db,
             completions,
+            completion_vectors,
             ttl,
         })
     }
@@ -100,6 +108,94 @@ impl CompletionStore for SledStore {
             .map_err(|e| StoreError(e.to_string()))?;
         Ok(())
     }
+}
+
+impl CompletionVectorStore for SledStore {
+    fn insert(&self, record: VectorRecord) -> Result<(), StoreError> {
+        let expires_at = self.ttl.map(|ttl| SystemTime::now() + ttl);
+        self.completion_vectors
+            .insert(record.exact_key.as_bytes(), encode_vector(expires_at, &record))
+            .map_err(|e| StoreError(e.to_string()))?;
+        Ok(())
+    }
+
+    fn delete(&self, exact_key: &CacheKey) -> Result<(), StoreError> {
+        self.completion_vectors
+            .remove(exact_key.as_bytes())
+            .map_err(|e| StoreError(e.to_string()))?;
+        Ok(())
+    }
+
+    fn load_all(&self) -> Result<Vec<VectorRecord>, StoreError> {
+        let now = SystemTime::now();
+        let mut out = Vec::new();
+        for item in self.completion_vectors.iter() {
+            let (k, v) = item.map_err(|e| StoreError(e.to_string()))?;
+            let key_bytes: [u8; 32] = k
+                .as_ref()
+                .try_into()
+                .map_err(|_| StoreError("vector key is not 32 bytes".into()))?;
+            let Some((expires_at, scope_hash, coarse_key_hash, index_version, vector)) =
+                decode_vector(&v)
+            else {
+                // A malformed row is skipped, not fatal -- same posture as a
+                // completion blob that no longer deserializes.
+                continue;
+            };
+            if let Some(expires_at) = expires_at {
+                if now > expires_at {
+                    let _ = self.completion_vectors.remove(&k);
+                    continue;
+                }
+            }
+            out.push(VectorRecord {
+                exact_key: CacheKey::from_bytes(key_bytes),
+                scope_hash,
+                coarse_key_hash,
+                index_version,
+                vector,
+            });
+        }
+        Ok(out)
+    }
+}
+
+fn encode_vector(expires_at: Option<SystemTime>, record: &VectorRecord) -> Vec<u8> {
+    let expires_at_secs: u64 = expires_at
+        .map(|t| {
+            t.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        })
+        .unwrap_or(0);
+    let mut out = Vec::with_capacity(8 + 32 + 32 + 1 + record.vector.len() * 4);
+    out.extend_from_slice(&expires_at_secs.to_le_bytes());
+    out.extend_from_slice(&record.scope_hash);
+    out.extend_from_slice(&record.coarse_key_hash);
+    out.push(record.index_version);
+    out.extend(record.vector.iter().flat_map(|f| f.to_le_bytes()));
+    out
+}
+
+#[allow(clippy::type_complexity)]
+fn decode_vector(bytes: &[u8]) -> Option<(Option<SystemTime>, [u8; 32], [u8; 32], u8, Vec<f32>)> {
+    if bytes.len() < 8 + 32 + 32 + 1 {
+        return None;
+    }
+    let expires_at_secs = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+    let expires_at = if expires_at_secs == 0 {
+        None
+    } else {
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(expires_at_secs))
+    };
+    let scope_hash: [u8; 32] = bytes[8..40].try_into().ok()?;
+    let coarse_key_hash: [u8; 32] = bytes[40..72].try_into().ok()?;
+    let index_version = bytes[72];
+    let vector = bytes[73..]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    Some((expires_at, scope_hash, coarse_key_hash, index_version, vector))
 }
 
 // Stored value format: [8 bytes: expires_at as unix seconds, LE, 0 = never][fp32 vector bytes].
@@ -431,6 +527,94 @@ mod tests {
             Some(b"completion-blob".to_vec())
         );
 
+        drop(store);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn sample_record(text: &str, version: u8) -> VectorRecord {
+        VectorRecord {
+            exact_key: completion_key(text),
+            scope_hash: [9u8; 32],
+            coarse_key_hash: [4u8; 32],
+            index_version: version,
+            vector: (0..384).map(|i| i as f32 * 0.01).collect(),
+        }
+    }
+
+    #[test]
+    fn vector_insert_then_load_all_round_trips_every_field() {
+        let dir = temp_dir();
+        let store = SledStore::open(&dir, None).unwrap();
+        let rec = sample_record("req-1", 1);
+        CompletionVectorStore::insert(&store, rec.clone()).unwrap();
+
+        let loaded = CompletionVectorStore::load_all(&store).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].exact_key, rec.exact_key);
+        assert_eq!(loaded[0].scope_hash, rec.scope_hash);
+        assert_eq!(loaded[0].coarse_key_hash, rec.coarse_key_hash);
+        assert_eq!(loaded[0].index_version, 1);
+        assert_eq!(loaded[0].vector, rec.vector);
+
+        drop(store);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn vector_delete_removes_it_from_load_all() {
+        let dir = temp_dir();
+        let store = SledStore::open(&dir, None).unwrap();
+        let rec = sample_record("req-2", 1);
+        CompletionVectorStore::insert(&store, rec.clone()).unwrap();
+        CompletionVectorStore::delete(&store, &rec.exact_key).unwrap();
+        assert!(CompletionVectorStore::load_all(&store).unwrap().is_empty());
+        drop(store);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn vector_records_past_their_ttl_are_absent_from_load_all() {
+        let dir = temp_dir();
+        let store = SledStore::open(&dir, Some(Duration::from_secs(0))).unwrap();
+        CompletionVectorStore::insert(&store, sample_record("req-3", 1)).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(CompletionVectorStore::load_all(&store).unwrap().is_empty());
+        drop(store);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn vector_load_all_returns_mixed_index_versions_verbatim() {
+        let dir = temp_dir();
+        let store = SledStore::open(&dir, None).unwrap();
+        CompletionVectorStore::insert(&store, sample_record("v1", 1)).unwrap();
+        CompletionVectorStore::insert(&store, sample_record("v2", 2)).unwrap();
+        let mut versions: Vec<u8> = CompletionVectorStore::load_all(&store)
+            .unwrap()
+            .iter()
+            .map(|r| r.index_version)
+            .collect();
+        versions.sort();
+        assert_eq!(versions, vec![1, 2]);
+        drop(store);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn vector_tree_does_not_interfere_with_the_completion_or_embedding_trees() {
+        let dir = temp_dir();
+        let store = SledStore::open(&dir, None).unwrap();
+        let key = completion_key("shared");
+        EmbeddingStore::put(&store, key, vec![1.0]).unwrap();
+        CompletionStore::put(&store, key, b"blob".to_vec()).unwrap();
+        CompletionVectorStore::insert(&store, sample_record("shared", 1)).unwrap();
+
+        assert_eq!(EmbeddingStore::get(&store, &key).unwrap(), Some(vec![1.0]));
+        assert_eq!(
+            CompletionStore::get(&store, &key).unwrap(),
+            Some(b"blob".to_vec())
+        );
+        assert_eq!(CompletionVectorStore::load_all(&store).unwrap().len(), 1);
         drop(store);
         std::fs::remove_dir_all(dir).ok();
     }
