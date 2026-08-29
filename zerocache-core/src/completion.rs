@@ -76,6 +76,96 @@ pub fn completion_request_is_cacheable(request: &Value) -> bool {
     temperature_is_zero || seed_is_set
 }
 
+/// Which part of a chat-completion request the semantic tier embeds and
+/// treats as "fuzzy" (a near match is acceptable). Everything outside this
+/// span is still matched exactly. `LastUser` is the tightest and the
+/// default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MatchUnit {
+    LastUser = 0,
+    SystemAndLastUser = 1,
+    FullConversation = 2,
+}
+
+/// Pulls one message's `content` into a plain string: a JSON string is
+/// returned as-is; an array of parts is the `text` of every `{"type":"text",
+/// ...}` part joined with '\n' (non-text parts ignored); anything else is
+/// `None`.
+fn message_text(message: &Value) -> Option<String> {
+    match message.get("content") {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Array(parts)) => {
+            let joined = parts
+                .iter()
+                .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn messages(request: &Value) -> &[Value] {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn last_user_text(request: &Value) -> Option<String> {
+    messages(request)
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(message_text)
+}
+
+/// The text handed to the embedder for `unit`. `None` => the span is absent
+/// or blank => the caller skips the semantic tier for this request and
+/// behaves exactly as the exact-match-only path does.
+pub fn completion_fuzzy_text(request: &Value, unit: MatchUnit) -> Option<String> {
+    let text = match unit {
+        MatchUnit::LastUser => last_user_text(request)?,
+        MatchUnit::SystemAndLastUser => {
+            let user = last_user_text(request)?;
+            let mut parts: Vec<String> = messages(request)
+                .iter()
+                .filter(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+                .filter_map(message_text)
+                .collect();
+            parts.push(user);
+            parts.join("\n")
+        }
+        MatchUnit::FullConversation => {
+            let lines: Vec<String> = messages(request)
+                .iter()
+                .filter_map(|m| {
+                    let role = m.get("role").and_then(Value::as_str)?;
+                    let text = message_text(m)?;
+                    Some(format!("{role}: {text}"))
+                })
+                .collect();
+            if lines.is_empty() {
+                return None;
+            }
+            lines.join("\n")
+        }
+    };
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 /// Recursively rewrites a JSON value into canonical form: object keys sorted,
 /// numbers normalized so `0` and `0.0` compare equal, arrays left in order.
 fn canonical_value(value: &Value) -> Value {
@@ -298,5 +388,76 @@ mod tests {
         assert!(completion_request_is_cacheable(&json!({
             "messages":[{"role":"user","content":"hi"}],"temperature":0,"stream":true
         })));
+    }
+
+    // ---- completion_fuzzy_text ----
+
+    #[test]
+    fn fuzzy_last_user_returns_the_final_user_message_string() {
+        let req = json!({"messages":[
+            {"role":"system","content":"be terse"},
+            {"role":"user","content":"first"},
+            {"role":"assistant","content":"ok"},
+            {"role":"user","content":"how do I reset my password?"}
+        ]});
+        assert_eq!(
+            completion_fuzzy_text(&req, MatchUnit::LastUser).as_deref(),
+            Some("how do I reset my password?")
+        );
+    }
+
+    #[test]
+    fn fuzzy_last_user_flattens_array_of_text_parts() {
+        let req = json!({"messages":[
+            {"role":"user","content":[
+                {"type":"text","text":"line one"},
+                {"type":"text","text":"line two"},
+                {"type":"image_url","image_url":{"url":"data:x"}}
+            ]}
+        ]});
+        assert_eq!(
+            completion_fuzzy_text(&req, MatchUnit::LastUser).as_deref(),
+            Some("line one\nline two")
+        );
+    }
+
+    #[test]
+    fn fuzzy_returns_none_when_there_is_no_user_message() {
+        let req = json!({"messages":[{"role":"system","content":"hi"}]});
+        assert_eq!(completion_fuzzy_text(&req, MatchUnit::LastUser), None);
+        assert_eq!(completion_fuzzy_text(&req, MatchUnit::SystemAndLastUser), None);
+    }
+
+    #[test]
+    fn fuzzy_returns_none_for_a_whitespace_only_user_message() {
+        let req = json!({"messages":[{"role":"user","content":"   \n"}]});
+        assert_eq!(completion_fuzzy_text(&req, MatchUnit::LastUser), None);
+    }
+
+    #[test]
+    fn fuzzy_system_and_last_user_joins_system_then_user() {
+        let req = json!({"messages":[
+            {"role":"system","content":"persona A"},
+            {"role":"system","content":"persona B"},
+            {"role":"user","content":"the question"}
+        ]});
+        assert_eq!(
+            completion_fuzzy_text(&req, MatchUnit::SystemAndLastUser).as_deref(),
+            Some("persona A\npersona B\nthe question")
+        );
+    }
+
+    #[test]
+    fn fuzzy_full_conversation_joins_every_message_with_role_labels() {
+        let req = json!({"messages":[
+            {"role":"system","content":"s"},
+            {"role":"user","content":"u1"},
+            {"role":"assistant","content":"a1"},
+            {"role":"user","content":"u2"}
+        ]});
+        assert_eq!(
+            completion_fuzzy_text(&req, MatchUnit::FullConversation).as_deref(),
+            Some("system: s\nuser: u1\nassistant: a1\nuser: u2")
+        );
     }
 }

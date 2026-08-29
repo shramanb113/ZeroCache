@@ -7,7 +7,10 @@ mod reconcile;
 
 pub use cache_key::CacheKey;
 pub use canonicalize::canonicalize_text;
-pub use completion::{canonicalize_completion_request, completion_request_is_cacheable};
+pub use completion::{
+    canonicalize_completion_request, completion_fuzzy_text, completion_request_is_cacheable,
+    MatchUnit,
+};
 pub use normalize::normalize_text;
 pub use owner_id::derive_owner_id;
 pub use reconcile::{reconcile, Reconciled};
