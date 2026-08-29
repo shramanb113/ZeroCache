@@ -70,7 +70,7 @@ async fn main() {
     // same sled DB / redis pool -- opening a second handle to the same sled
     // directory would fail its exclusive lock.
     #[cfg(feature = "semantic")]
-    let mut completion_vector_store: Option<Arc<dyn zerocache_ports::CompletionVectorStore>> = None;
+    let completion_vector_store: Option<Arc<dyn zerocache_ports::CompletionVectorStore>>;
     let (store, completion_store): (Arc<dyn EmbeddingStore>, Arc<dyn CompletionStore>) =
         match config.storage_backend {
             StorageBackend::Sled => {
@@ -89,10 +89,16 @@ async fn main() {
                 )
             }
             StorageBackend::Redis => {
-                let redis = Arc::new(
-                    RedisStore::connect(&config.redis_url, config.ttl)
-                        .expect("failed to connect to redis"),
-                );
+                let redis = RedisStore::connect(&config.redis_url, config.ttl)
+                    .expect("failed to connect to redis");
+                #[cfg(feature = "semantic")]
+                let redis = redis.with_semantic_index_maxlen(config.semantic_index_maxlen);
+                let redis = Arc::new(redis);
+                #[cfg(feature = "semantic")]
+                {
+                    completion_vector_store =
+                        Some(Arc::clone(&redis) as Arc<dyn zerocache_ports::CompletionVectorStore>);
+                }
                 (
                     Arc::clone(&redis) as Arc<dyn EmbeddingStore>,
                     redis as Arc<dyn CompletionStore>,
@@ -191,22 +197,15 @@ async fn main() {
     }
 
     #[cfg(feature = "semantic")]
-    let semantic = match completion_vector_store {
-        Some(vs) => {
-            let s = semantic::build_semantic_state(&config, vs);
-            if let Some(ref st) = s {
-                semantic::rebuild_index(st);
+    let (semantic, semantic_poll_cursor) = match completion_vector_store {
+        Some(vs) => match semantic::build_semantic_state(&config, vs) {
+            Some(st) => {
+                let cursor = semantic::rebuild_index(&st, &config);
+                (Some(st), cursor)
             }
-            s
-        }
-        None => {
-            if config.semantic_enabled {
-                tracing::warn!(
-                    "ZEROCACHE_SEMANTIC is enabled but the storage backend is redis -- the semantic completion tier is unavailable in v1; running exact-match only"
-                );
-            }
-            None
-        }
+            None => (None, None),
+        },
+        None => (None, None),
     };
 
     let state = Arc::new(AppState {
@@ -222,6 +221,15 @@ async fn main() {
         #[cfg(feature = "semantic")]
         semantic,
     });
+
+    #[cfg(feature = "semantic")]
+    if let Some(cursor) = semantic_poll_cursor {
+        tokio::spawn(semantic::run_semantic_poll_task(
+            Arc::clone(&state),
+            cursor,
+            std::time::Duration::from_millis(config.semantic_poll_ms),
+        ));
+    }
 
     let app = Router::new()
         .route(
