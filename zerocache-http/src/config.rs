@@ -3,8 +3,11 @@ use std::time::Duration;
 use zerocache_adapters_azure::{AzureAuthMode, DEFAULT_AZURE_FOUNDRY_API_VERSION};
 use zerocache_adapters_bedrock::{DEFAULT_BEDROCK_ENDPOINT_TEMPLATE, DEFAULT_BEDROCK_REGION};
 use zerocache_adapters_vertexai::{DEFAULT_VERTEX_ENDPOINT_TEMPLATE, DEFAULT_VERTEX_LOCATION};
+use zerocache_core::MatchUnit;
 
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
+pub const DEFAULT_SEMANTIC_THRESHOLD: f32 = 0.97;
+const SEMANTIC_THRESHOLD_FLOOR: f32 = 0.5;
 pub const DEFAULT_MISTRAL_BASE_URL: &str = "https://api.mistral.ai";
 pub const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 pub const DEFAULT_HUGGINGFACE_BASE_URL: &str = "https://router.huggingface.co/hf-inference";
@@ -69,6 +72,12 @@ pub struct Config {
     pub vertex_project: Option<String>,
     pub vertex_location: String,
     pub vertex_endpoint_template: String,
+    /// Semantic completion tier. Only consulted in a `--features semantic` build.
+    pub semantic_enabled: bool,
+    #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
+    pub semantic_threshold: f32,
+    #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
+    pub semantic_match_unit: MatchUnit,
 }
 
 /// Resolves an optional env-var override to a string value, falling back to
@@ -194,6 +203,48 @@ impl Config {
                     .as_deref(),
                 DEFAULT_VERTEX_ENDPOINT_TEMPLATE,
             ),
+            semantic_enabled: parse_semantic_enabled(
+                std::env::var("ZEROCACHE_SEMANTIC").ok().as_deref(),
+            ),
+            semantic_threshold: parse_semantic_threshold(
+                std::env::var("ZEROCACHE_SEMANTIC_THRESHOLD").ok().as_deref(),
+            ),
+            semantic_match_unit: parse_semantic_match_unit(
+                std::env::var("ZEROCACHE_SEMANTIC_MATCH_UNIT").ok().as_deref(),
+            ),
+        }
+    }
+}
+
+fn parse_semantic_enabled(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1") | Some("true") | Some("yes"))
+}
+
+fn parse_semantic_threshold(raw: Option<&str>) -> f32 {
+    match raw {
+        None | Some("") => DEFAULT_SEMANTIC_THRESHOLD,
+        Some(v) => match v.parse::<f32>() {
+            Ok(f) if (SEMANTIC_THRESHOLD_FLOOR..=1.0).contains(&f) => f,
+            _ => {
+                eprintln!(
+                    "warning: ZEROCACHE_SEMANTIC_THRESHOLD='{v}' is not a number in [{SEMANTIC_THRESHOLD_FLOOR}, 1.0] -- using {DEFAULT_SEMANTIC_THRESHOLD}"
+                );
+                DEFAULT_SEMANTIC_THRESHOLD
+            }
+        },
+    }
+}
+
+fn parse_semantic_match_unit(raw: Option<&str>) -> MatchUnit {
+    match raw {
+        None | Some("") | Some("last-user") => MatchUnit::LastUser,
+        Some("system-and-last-user") => MatchUnit::SystemAndLastUser,
+        Some("full-conversation") => MatchUnit::FullConversation,
+        Some(other) => {
+            eprintln!(
+                "warning: ZEROCACHE_SEMANTIC_MATCH_UNIT='{other}' is not recognized (expected last-user | system-and-last-user | full-conversation) -- using 'last-user'"
+            );
+            MatchUnit::LastUser
         }
     }
 }
@@ -606,6 +657,43 @@ mod tests {
     fn chat_providers_preserves_an_equals_sign_inside_a_url() {
         let list = parse_chat_providers(Some("ollama=http://x/v1?token=abc"));
         assert_eq!(find(&list, "ollama"), Some("http://x/v1?token=abc"));
+    }
+
+    #[test]
+    fn semantic_enabled_only_for_truthy_values() {
+        assert!(parse_semantic_enabled(Some("1")));
+        assert!(parse_semantic_enabled(Some("true")));
+        assert!(parse_semantic_enabled(Some("yes")));
+        assert!(!parse_semantic_enabled(Some("0")));
+        assert!(!parse_semantic_enabled(Some("")));
+        assert!(!parse_semantic_enabled(None));
+    }
+
+    #[test]
+    fn semantic_threshold_defaults_and_validates() {
+        assert_eq!(parse_semantic_threshold(None), DEFAULT_SEMANTIC_THRESHOLD);
+        assert_eq!(parse_semantic_threshold(Some("")), DEFAULT_SEMANTIC_THRESHOLD);
+        assert_eq!(parse_semantic_threshold(Some("0.9")), 0.9);
+        assert_eq!(parse_semantic_threshold(Some("1.0")), 1.0);
+        assert_eq!(parse_semantic_threshold(Some("0.2")), DEFAULT_SEMANTIC_THRESHOLD);
+        assert_eq!(parse_semantic_threshold(Some("1.5")), DEFAULT_SEMANTIC_THRESHOLD);
+        assert_eq!(parse_semantic_threshold(Some("abc")), DEFAULT_SEMANTIC_THRESHOLD);
+    }
+
+    #[test]
+    fn semantic_match_unit_parses_each_name_and_defaults_on_unknown() {
+        assert_eq!(parse_semantic_match_unit(None), MatchUnit::LastUser);
+        assert_eq!(parse_semantic_match_unit(Some("")), MatchUnit::LastUser);
+        assert_eq!(parse_semantic_match_unit(Some("last-user")), MatchUnit::LastUser);
+        assert_eq!(
+            parse_semantic_match_unit(Some("system-and-last-user")),
+            MatchUnit::SystemAndLastUser
+        );
+        assert_eq!(
+            parse_semantic_match_unit(Some("full-conversation")),
+            MatchUnit::FullConversation
+        );
+        assert_eq!(parse_semantic_match_unit(Some("nonsense")), MatchUnit::LastUser);
     }
 
     #[test]

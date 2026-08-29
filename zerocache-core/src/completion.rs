@@ -174,22 +174,19 @@ pub fn canonicalize_completion_request_coarse(request: &Value, unit: MatchUnit) 
     match unit {
         MatchUnit::LastUser | MatchUnit::SystemAndLastUser => {
             if let Some(Value::Array(msgs)) = root.get_mut("messages") {
-                if let Some(last_user) = msgs
+                if let Some(m) = msgs
                     .iter_mut()
                     .rev()
                     .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
                 {
-                    if let Value::Object(m) = last_user {
-                        m.insert("content".to_string(), Value::String(String::new()));
-                    }
+                    blank_content(m);
                 }
                 if unit == MatchUnit::SystemAndLastUser {
-                    for m in msgs.iter_mut() {
-                        if m.get("role").and_then(Value::as_str) == Some("system") {
-                            if let Value::Object(obj) = m {
-                                obj.insert("content".to_string(), Value::String(String::new()));
-                            }
-                        }
+                    for m in msgs
+                        .iter_mut()
+                        .filter(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+                    {
+                        blank_content(m);
                     }
                 }
             }
@@ -202,6 +199,12 @@ pub fn canonicalize_completion_request_coarse(request: &Value, unit: MatchUnit) 
     }
 
     serde_json::to_string(&canonical_value(&root)).unwrap_or_default()
+}
+
+fn blank_content(msg: &mut Value) {
+    if let Value::Object(obj) = msg {
+        obj.insert("content".to_string(), Value::String(String::new()));
+    }
 }
 
 /// blake3 of the coarse canonical form, `unit` discriminant folded in so
