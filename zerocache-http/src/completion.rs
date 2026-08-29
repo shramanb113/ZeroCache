@@ -275,6 +275,7 @@ mod tests {
         body: serde_json::Value,
         usage: CompletionUsage,
         delay: Option<Duration>,
+        scope: String,
     }
 
     impl MockChatProvider {
@@ -285,6 +286,7 @@ mod tests {
                 body,
                 usage,
                 delay: None,
+                scope: "mock-scope".to_string(),
             }
         }
         fn with_status(status: u16) -> Self {
@@ -294,6 +296,7 @@ mod tests {
                 body: json!({"error": "upstream"}),
                 usage: CompletionUsage::default(),
                 delay: None,
+                scope: "mock-scope".to_string(),
             }
         }
         fn slow(body: serde_json::Value, delay: Duration) -> Self {
@@ -303,7 +306,12 @@ mod tests {
                 body,
                 usage: CompletionUsage::default(),
                 delay: Some(delay),
+                scope: "mock-scope".to_string(),
             }
+        }
+        fn with_scope(mut self, scope: &str) -> Self {
+            self.scope = scope.to_string();
+            self
         }
         fn call_count(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
@@ -331,7 +339,7 @@ mod tests {
             "mock-chat-v1"
         }
         fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
-            Ok("mock-scope".to_string())
+            Ok(self.scope.clone())
         }
     }
 
@@ -460,6 +468,40 @@ mod tests {
             provider.call_count(),
             2,
             "a different caller must not hit another caller's cached completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_providers_with_different_cache_scopes_do_not_share_stored_completions() {
+        let st = state(MockCompletionStore::empty());
+        let body = eligible_body();
+
+        let p_a = Arc::new(
+            MockChatProvider::ok(
+                json!({"choices": [{"message": {"role": "assistant", "content": "A"}}]}),
+                CompletionUsage::default(),
+            )
+            .with_scope("https://api.openai.com/v1"),
+        );
+        let p_b = Arc::new(
+            MockChatProvider::ok(
+                json!({"choices": [{"message": {"role": "assistant", "content": "B"}}]}),
+                CompletionUsage::default(),
+            )
+            .with_scope("https://generativelanguage.googleapis.com/v1beta/openai"),
+        );
+
+        let out_a = complete(&st, req(&p_a, OWNER_A, &body)).await.unwrap();
+        assert!(!out_a.hit, "first call is a miss");
+
+        let out_b = complete(&st, req(&p_b, OWNER_A, &body)).await.unwrap();
+        assert!(
+            !out_b.hit,
+            "a different cache_scope must not reuse another endpoint's stored completion"
+        );
+        assert_eq!(
+            out_b.response.body["choices"][0]["message"]["content"],
+            "B"
         );
     }
 

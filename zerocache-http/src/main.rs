@@ -34,7 +34,7 @@ use zerocache_adapters_bedrock::new_provider as new_bedrock_provider;
 use zerocache_adapters_gemini::GeminiProvider;
 use zerocache_adapters_huggingface::HuggingFaceProvider;
 use zerocache_adapters_mistral::MistralProvider;
-use zerocache_adapters_openai::OpenAiProvider;
+use zerocache_adapters_openai::{OpenAiProvider, OpenAiWireChatProvider};
 use zerocache_adapters_redis::RedisStore;
 use zerocache_adapters_sled::SledStore;
 use zerocache_adapters_vertexai::new_provider as new_vertexai_provider;
@@ -46,6 +46,7 @@ async fn main() {
     let tracer_provider = otel::init();
     let config = Config::from_env();
     log_overridden_base_urls(&config);
+    log_chat_providers(&config);
 
     // One concrete store instance, exposed as two trait objects: the
     // embedding path and the completion path (crate::completion) share the
@@ -150,20 +151,20 @@ async fn main() {
 
     let port = config.port;
 
-    // Chat-completion providers, keyed by `{provider}` path segment. v1
-    // registers only the OpenAI-shaped adapter -- which also covers any
-    // OpenAI-wire-compatible self-hosted endpoint via
-    // ZEROCACHE_OPENAI_BASE_URL, exactly like the embedding path. Other
-    // providers (mistral, the cloud adapters, Anthropic's /v1/messages
-    // shape) are follow-ups; until then they 404 out of a missing key.
+    // Chat-completion providers, keyed by `{provider}` path segment: one
+    // OpenAiWireChatProvider per entry in the merged chat-provider registry
+    // (BUILTIN_CHAT_PROVIDERS + ZEROCACHE_CHAT_PROVIDERS). An unregistered
+    // name 404s out of the missing key.
     let mut completion_providers: HashMap<
         String,
         Arc<dyn zerocache_ports::ChatCompletionProvider>,
     > = HashMap::new();
-    completion_providers.insert(
-        "openai".to_string(),
-        Arc::new(OpenAiProvider::new(config.openai_base_url.clone())),
-    );
+    for (name, url) in &config.chat_providers {
+        completion_providers.insert(
+            name.clone(),
+            Arc::new(OpenAiWireChatProvider::new(url.clone())),
+        );
+    }
 
     let state = Arc::new(AppState {
         store,
@@ -256,6 +257,15 @@ fn log_overridden_base_urls(config: &Config) {
                 "{env_var_name} is overridden to '{actual}' -- cache entries are keyed by endpoint, so requests against this endpoint start from a cold cache rather than reusing anything cached under the default endpoint"
             );
         }
+    }
+}
+
+/// Logs the resolved chat-provider registry so a typo in
+/// ZEROCACHE_CHAT_PROVIDERS shows up at boot, not on first request. Chat
+/// provider URLs carry no secrets (BYOK: the key is per-request).
+fn log_chat_providers(config: &Config) {
+    for (name, url) in &config.chat_providers {
+        tracing::info!("chat provider '{name}' -> {url}/chat/completions");
     }
 }
 
