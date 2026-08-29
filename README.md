@@ -45,7 +45,7 @@ Zerocache is one process that sits between your app and every LLM / embedding pr
 
 | Surface | What gets cached | Status |
 | --- | --- | --- |
-| **`POST /{provider}/v1/chat/completions`** | Whole chat completions, keyed by a canonicalized request body. A hit is 100 % off input **and** output tokens and returns in ~1 ms. | **Live** — exact-match, 9 built-in OpenAI-wire providers, non-streaming, deterministic requests only (`temperature: 0` or an explicit `seed`). |
+| **`POST /{provider}/v1/chat/completions`** | Whole chat completions, keyed by a canonicalized request body. A hit is 100 % off input **and** output tokens and returns in ~1 ms. | **Live** — exact-match, 9 built-in OpenAI-wire providers, non-streaming, deterministic requests only (`temperature: 0` or an explicit `seed`). Optional local-embedder semantic near-match tier (`--features semantic` + `ZEROCACHE_SEMANTIC=1`, sled only). |
 | **`POST /{provider}/v1/embeddings`** | Embedding vectors, keyed by content + model + tenant. Identical text stops costing a second call. | **Live** — 7 providers, text + image, light text canonicalization (casing / Unicode / punctuation fold to one entry). |
 | **`GET /dashboard`** | — | **Live** — a browser dashboard that polls `/metrics` and shows hit rate, tokens not billed, and an estimated dollar figure, live, per provider. |
 
@@ -302,9 +302,9 @@ docker pull ghcr.io/shramanb113/zerocache:<commit-sha>
 
 ## Roadmap
 
-The completion cache above is **exact-match**. The features that make it a general LLM gateway are next, roughly in order:
+The features that make the completion cache a general LLM gateway, roughly in order:
 
-1. **Semantic completion cache** — a local ONNX embedder generates a prompt vector; a hit is a cosine match above a conservative threshold, not a byte match. Turns a near-zero hit rate on real chatbot/agent traffic into a useful one. The threshold, not the embedder, is what bounds false positives.
+1. **Semantic completion cache** — ✅ **Live (opt-in, single-instance).** A local candle embedder (all-MiniLM-L6-v2, compiled in) generates a prompt vector; on an exact-match miss a hit is a cosine match above a conservative threshold *and* a byte-for-byte match of the rest of the request. Turns a near-zero hit rate on paraphrased chatbot/agent traffic into a useful one. Build with `--features semantic`, enable with `ZEROCACHE_SEMANTIC=1` (sled backend only; the multi-replica index is a later item). The threshold, not the embedder, bounds false positives.
 2. **Streaming** — `stream: true`: buffer the SSE on a miss, replay it on a hit.
 3. **Anthropic `/v1/messages`** — a native adapter for Claude's wire shape, so Claude-based agents are cacheable.
 4. **Budgets & rate limits** — per-key monthly spend caps (`429` when exceeded) and per-key RPS limits, with a cost-by-team view in the dashboard.
@@ -316,7 +316,7 @@ The completion cache above is **exact-match**. The features that make it a gener
 
 ## What Zerocache is *not* (yet)
 
-- **Not a semantic LLM cache yet** — chat caching is exact-match on a canonicalized body. Semantic matching is item 1 on the roadmap.
+- **Semantic chat caching is opt-in and single-instance** — a `--features semantic` build plus `ZEROCACHE_SEMANTIC=1` adds a local-embedder near-match tier on the sled backend; the default build is still exact-match on a canonicalized body. A redis-backed multi-replica semantic index is still on the roadmap.
 - **No streaming, no Anthropic `/v1/messages`** — roadmap items 2–3. Non-streaming OpenAI-wire only, today.
 - **No budgets, rate limiting, or failover** — roadmap items 4–5.
 - **No fuzzy similarity on embedding vectors** — and it never will do that: finding a near neighbour requires computing the very embedding you're trying to avoid. Text canonicalization (casing/punctuation fold) is the only near-match on the embedding path.

@@ -38,7 +38,10 @@ and `/ready`.
 
 - **Completions** are exact: the stored response carries the `usage` block, so a
   hit knows precisely which prompt/completion tokens were not billed. Dollars =
-  `tokens_saved / 1e6 × your price`.
+  `tokens_saved / 1e6 × your price`. When the opt-in semantic tier is enabled the
+  hero caption also breaks out how many completion hits came from a semantic
+  near-match (`zerocache_completion_semantic_hits_total`, a subset of
+  `zerocache_completion_cache_hits_total`).
 - **Embeddings** are an estimate — the metrics only expose tokens *billed* on
   misses, not a per-hit token count. The dashboard uses
   `hits × (average tokens per observed miss)`, or `hits × the assumed size` in
