@@ -1,41 +1,49 @@
 # syntax=docker/dockerfile:1
 
-# ---- Planner: compute cargo-chef's dependency recipe ----
+# Static musl build -> the runtime image is `FROM scratch` plus one binary.
+# reqwest is rustls-only (no OpenSSL) and rustls ships webpki roots, so the
+# image needs no libssl, no ca-certificates, no shell -- nothing but the binary.
+
+# ---- chef: toolchain with the musl target + cargo-chef ----
 FROM rust:1.97.1-slim-bookworm AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-RUN cargo install cargo-chef --locked
+        musl-tools musl-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add x86_64-unknown-linux-musl \
+    && cargo install cargo-chef --locked
 WORKDIR /build
+ENV CC_x86_64_unknown_linux_musl=musl-gcc
 
+# ---- planner: distil the dependency graph ----
 FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-# ---- Builder: cook (cache) dependencies, then build the real binary ----
+# ---- builder: cook deps (cached), then build the static binary ----
 FROM chef AS builder
 COPY --from=planner /build/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
+# `COPY . .` brings in dashboard/dist (committed, not .dockerignore'd), which
+# zerocache-http/src/dashboard.rs embeds via include_dir! -- no Node needed
+# here. CI's `dashboard` job guarantees the committed dist is current.
 COPY . .
-RUN cargo build --release -p zerocache-http
+RUN cargo build --release --target x86_64-unknown-linux-musl -p zerocache-http
+# an empty, correctly-owned data dir to hand to the scratch stage (scratch has
+# no shell to `mkdir`)
+RUN install -d -o 10001 -g 10001 /out/data
 
-# ---- Runtime: minimal image with just the compiled binary ----
-FROM debian:bookworm-slim AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin zerocache
-
-COPY --from=builder /build/target/release/zerocache-http /usr/local/bin/zerocache-http
+# ---- runtime: nothing but the binary ----
+FROM scratch AS runtime
+COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/zerocache-http /usr/local/bin/zerocache-http
+COPY --from=builder --chown=10001:10001 /out/data /data
 
 ENV ZEROCACHE_STORAGE_PATH=/data
-RUN mkdir -p /data && chown zerocache:zerocache /data
 VOLUME ["/data"]
-
-USER zerocache
+USER 10001:10001
 EXPOSE 8080
 
+# The binary is its own probe -- the scratch image has no curl.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -fs "http://127.0.0.1:${ZEROCACHE_PORT:-8080}/health" || exit 1
+    CMD ["/usr/local/bin/zerocache-http", "--health-check"]
 
 ENTRYPOINT ["/usr/local/bin/zerocache-http"]

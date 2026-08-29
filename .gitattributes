@@ -1,0 +1,6 @@
+# The dashboard build output is a generated artifact checked in so `cargo build`
+# can embed it without a Node toolchain. Store it byte-for-byte as the build
+# emits it (LF, no CRLF conversion) so a fresh `npm run build` on any platform
+# reproduces the committed bytes exactly -- CI diffs the two to catch a stale
+# dist.
+dashboard/dist/** -text
