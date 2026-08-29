@@ -1,44 +1,3 @@
-// End-to-end battle test for the Mastra RAG demo -- the culminating exercise of this
-// plan, driving Tasks 9-11's real exports (not mocks) against a real running Zerocache
-// instance and real OPENAI_API_KEY/GEMINI_API_KEY. Following this session's established
-// battle-test pattern (see demo/langchain-ts/src/battle-test.ts and
-// demo/llamaindex-python/src/battle_test.py for the style this mirrors).
-//
-// Three parts:
-//   Part A -- the cache-benefit story: cold ingest (all misses), an identical rebuild
-//             (all hits, free), and a realistic 1-edit-1-new-file rebuild (exactly 2
-//             misses, 7 hits). ingestSampleData() (Task 10) does not itself return
-//             hit/miss counts, so this script derives them the only way an outside
-//             caller can: diffing zerocache_cache_hits_total/zerocache_cache_misses_total
-//             on /metrics before and after each run.
-//   Part B -- proves this is agentic RAG, not a fixed retrieve-then-answer pipeline, by
-//             asserting on the agent's actual tool-call trace (Agent.generate()'s
-//             toolCalls/toolResults arrays -- see node_modules/@mastra/core's own
-//             embedded docs, reference-agents-generate.md, "Response structure": tool
-//             data is wrapped in `payload`, e.g. `toolCall.payload.toolName`), not just
-//             the final answer text.
-//   Part C -- delete, HTTP-level: the only end-to-end exercise of either delete route
-//             (Task 5's delete_batch/delete_image_batch otherwise only have Rust unit
-//             tests).
-//
-// Requires a real running Zerocache instance (ZEROCACHE_BASE_URL, default
-// http://localhost:8080) and real OPENAI_API_KEY/GEMINI_API_KEY -- this makes real,
-// billed provider calls. Run with: npx tsx battle-test.ts
-//
-// Safe to re-run: main() primes a cold cache first (see primeColdCache below) by
-// deleting every entry Parts A-C's ingestion could have created, so Check 1/2's exact hit/miss
-// counts hold on every invocation against a persistent store, not just the first
-// one ever made. Priming uses only DELETE calls (pure cache-key computation, no
-// provider call, no billing), so re-running does re-bill the real embed/generate
-// calls Parts A-C make, but not an extra ingestion's worth on top of that.
-//
-// Note: importing ingestSampleData (Task 10) pulls in src/mastra/rag/ingest.ts, which
-// itself calls requireEnv("OPENAI_API_KEY")/requireEnv("GEMINI_API_KEY") at module load
-// time (deliberately, per that file's own comments) -- so a missing key surfaces as an
-// import-time crash before main() even runs, not a graceful SKIP like the langchain-ts/
-// llamaindex-python scripts' key-independent sections. That's consistent with this
-// task's premise: Part A-C all require real keys, there is no key-independent subset.
-
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 
@@ -57,9 +16,6 @@ import type { SearchImagesRequestContext } from "./src/mastra/tools/search-image
 const OPENAI_API_KEY = requireEnv("OPENAI_API_KEY");
 const GEMINI_API_KEY = requireEnv("GEMINI_API_KEY");
 
-// Must match src/mastra/rag/ingest.ts and the searchDocuments/searchImages tools --
-// Part C reconstructs the exact same (provider, model, input) so its delete calls
-// target the exact cache entries Run 1/2/3 populated.
 const TEXT_MODEL = "text-embedding-3-small";
 const IMAGE_MODEL = "gemini-embedding-2";
 
@@ -90,11 +46,7 @@ async function fetchMetricsText(): Promise<string> {
   return res.text();
 }
 
-// Sums every line for a given metric family whose label set contains all of `filters`
-// (substring match on `key="value"` inside the {...} block) -- robust to label order
-// (zerocache-http/src/app.rs emits content_type before provider) and to label
-// combinations that don't exist yet on a fresh /metrics scrape (sums to 0, the correct
-// "nothing recorded yet" default).
+// Sums every line for a given metric family whose label set contains all of `filters`.
 function sumMetric(
   metricsText: string,
   family: string,
@@ -222,11 +174,6 @@ interface SearchImagesResult {
   results: { id: string; score: number; file?: string }[];
 }
 
-// Structurally typed against whatever Agent.generate() actually returns (FullOutput<T>
-// from @mastra/core/dist/stream/base/output.d.ts) rather than importing that internal
-// type by name -- avoids coupling this script to Mastra's internal type export paths,
-// and Awaited<ReturnType<typeof ragAgent.generate>> is structurally assignable to this
-// regardless of which overload TS's ReturnType<T> resolves against.
 interface AgentTrace {
   text: string;
   toolCalls: { payload: { toolName: string } }[];
@@ -244,16 +191,15 @@ function toolResultPayloads<T>(trace: AgentTrace, toolName: string): T[] {
 }
 
 // Builds the (prompt, requestContext) pair for an image query. The image bytes travel
-// via requestContext, NOT as base64 text embedded in the prompt -- see
-// src/mastra/tools/search-images.ts's comment for why: this battle test's first version
-// asked the model to retype a base64 blob verbatim as a tool argument, and gpt-4o-mini
-// reproducibly corrupted it (624 -> 600 chars, mismatch) on every run, a real bug this
-// task's Step 2 live run caught and Task 11's searchImagesTool was fixed for.
+// via requestContext, not as base64 text in the prompt.
 async function buildImageQuery(
   sampleDataDir: string,
   file: string,
   mimeType: string,
-): Promise<{ prompt: string; requestContext: RequestContext<SearchImagesRequestContext> }> {
+): Promise<{
+  prompt: string;
+  requestContext: RequestContext<SearchImagesRequestContext>;
+}> {
   const bytes = await readFile(path.join(sampleDataDir, file));
   const base64 = bytes.toString("base64");
   const requestContext = new RequestContext<SearchImagesRequestContext>();
@@ -268,20 +214,14 @@ async function buildImageQuery(
 
 // ---------- cold-cache priming (run before Part A) ----------
 
-// Checks 1-2 assert exact hit/miss counts against a *persistent* sled store, so
-// without this step Run 1 is only genuinely cold on the very first invocation ever
-// made against a given Zerocache instance -- any second run would see Run 1 as all
-// hits and both checks would fail, not because anything broke but because the store
-// already had the entries. DELETE is pure cache-key computation (no provider call,
-// no billing -- see CLAUDE.md's API contract), and idempotent (deleting an
-// already-absent key still succeeds), so wiping every item Parts A-C's ingestion
-// could have created, from both v1 and v2 (they overlap on 7 of 8 items but differ on
-// pricing.md, and v2 adds bulk-export-feature.md), makes the script safely
-// re-runnable against a store in any prior state, not just a freshly wiped one.
+// Deletes every cache entry Parts A-C's ingestion could create (v1 + v2, text +
+// images) so Checks 1-2's exact cold hit/miss counts hold on every re-run.
 async function primeColdCache(): Promise<void> {
   for (const dir of [SAMPLE_V1, SAMPLE_V2]) {
     const files = await readdir(dir);
-    const textFiles = files.filter((f) => f.endsWith(".txt") || f.endsWith(".md"));
+    const textFiles = files.filter(
+      (f) => f.endsWith(".txt") || f.endsWith(".md"),
+    );
     const imageFiles = files.filter(
       (f) => f.endsWith(".png") || f.endsWith(".jpg") || f.endsWith(".jpeg"),
     );
@@ -353,9 +293,6 @@ async function partA(): Promise<void> {
     );
   });
 
-  // Check 4: summary table for the human reader -- not itself an assertion (Items/
-  // Hits/Misses are already asserted exactly above; Tokens billed/Duration vary by
-  // real API response and are printed as evidence, not checked against a fixed value).
   printSummaryTable(rows);
 }
 
@@ -414,7 +351,9 @@ async function partB(): Promise<void> {
       "architecture-diagram.png",
       "image/png",
     );
-    const trace: AgentTrace = await ragAgent.generate(prompt, { requestContext });
+    const trace: AgentTrace = await ragAgent.generate(prompt, {
+      requestContext,
+    });
 
     const tools = calledTools(trace);
     const calledImages = tools.includes("searchImages");
@@ -501,11 +440,6 @@ async function partB(): Promise<void> {
       `tools called=${tools.join(",") || "(none)"}`,
     );
 
-    // Checking for the literal phrase "knowledge base" here would false-positive on the
-    // correct, desired decline response ("That question is outside the scope of this
-    // knowledge base") -- saying that phrase while declining is not hallucinated
-    // grounding. What actually matters is whether the agent fabricated Aurora-specific
-    // facts it could not have known without a tool call it never made.
     const lower = trace.text.toLowerCase();
     const fabricatedFacts = [
       "$9",
@@ -536,9 +470,6 @@ async function partC(): Promise<void> {
   );
 
   await run("check-9-10-delete-then-reembed-text", async () => {
-    // v1 and v2's getting-started.md are byte-identical (Task 10) -- reading from
-    // either path derives the same CacheKey; v2 is used since it's the current/final
-    // ingested state after Run 3.
     const textContent = await readFile(
       path.join(SAMPLE_V2, "getting-started.md"),
       "utf-8",
@@ -602,22 +533,14 @@ async function partC(): Promise<void> {
       `hits=${reembed.hits} misses=${reembed.misses}`,
     );
   });
-
-  // Check 12: restore state. No separate action needed -- checks 10 and 11's re-embed
-  // calls above already repopulate the cache for getting-started.md and
-  // architecture-diagram.png as a side effect of proving the miss, so the KB is back
-  // to its post-Run-3 state. Part C is deliberately run after Parts A and B (not
-  // interleaved) specifically so a failure here can never invalidate the agent-query
-  // assertions in checks 5-8, which already ran and had their results recorded above.
 }
 
 async function main() {
-  // Throwaway request so the process's very first HTTP connection isn't the one
-  // measured for Run 1's duration -- matches the warm-up pattern in
-  // demo/langchain-ts/src/battle-test.ts and demo/llamaindex-python/src/battle_test.py.
   await fetch(`${ZEROCACHE_BASE_URL}/health`).catch(() => {});
 
-  console.log("Priming a cold cache (deleting any pre-existing v1/v2 entries)...");
+  console.log(
+    "Priming a cold cache (deleting any pre-existing v1/v2 entries)...",
+  );
   await primeColdCache();
 
   await partA();
