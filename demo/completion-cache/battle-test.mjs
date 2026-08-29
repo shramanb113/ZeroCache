@@ -16,6 +16,13 @@
 //
 //   OPENAI_API_KEY=sk-... node demo/completion-cache/battle-test.mjs
 //
+// Any built-in chat provider works with no server config; set
+// ZEROCACHE_CHAT_PROVIDER to pick which one this script calls. To run it
+// against Gemini's OpenAI-compat endpoint:
+//
+//   ZEROCACHE_CHAT_PROVIDERS="gemini=https://generativelanguage.googleapis.com/v1beta/openai" cargo run -p zerocache-http
+//   OPENAI_API_KEY=<gemini key> MODEL=gemini-3.5-flash-lite ZEROCACHE_CHAT_PROVIDER=gemini node demo/completion-cache/battle-test.mjs
+//
 // Safe to re-run: every invocation folds a fresh random runId into the system
 // prompt, so each run starts from a cold cache for its own keys without
 // needing a DELETE route (the completion cache has none in v1). Re-running
@@ -31,6 +38,7 @@
 const BASE_URL = (process.env.ZEROCACHE_BASE_URL || "http://localhost:8080").replace(/\/$/, "");
 const API_KEY = process.env.OPENAI_API_KEY;
 const MODEL = process.env.MODEL || "gpt-4o-mini";
+const PROVIDER = process.env.ZEROCACHE_CHAT_PROVIDER || "openai";
 
 // Illustrative list prices, USD per 1M tokens. Not authoritative -- override
 // for your model/tier. Used only to turn the tokens-saved counters into a
@@ -83,7 +91,7 @@ function delta(before, after) {
 }
 
 async function chat(messages) {
-  const res = await fetch(`${BASE_URL}/openai/v1/chat/completions`, {
+  const res = await fetch(`${BASE_URL}/${PROVIDER}/v1/chat/completions`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${API_KEY}` },
     body: JSON.stringify({ model: MODEL, messages, temperature: 0 }),

@@ -16,15 +16,16 @@
 // cache -- 100% off input AND output tokens, including all the intermediate
 // tool-call turns -- until a prompt, a tool definition, or the model changes.
 //
-//   # terminal 1
-//   ZEROCACHE_OPENAI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai \
+//   # terminal 1 -- register Gemini as a chat provider (no doubled /v1)
+//   ZEROCACHE_CHAT_PROVIDERS="gemini=https://generativelanguage.googleapis.com/v1beta/openai" \
 //     cargo run -p zerocache-http
 //
 //   # terminal 2
-//   OPENAI_API_KEY=<key> MODEL=gemini-2.5-flash node demo/completion-cache/agent.mjs
+//   OPENAI_API_KEY=<key> MODEL=gemini-3.5-flash-lite ZEROCACHE_CHAT_PROVIDER=gemini \
+//     node demo/completion-cache/agent.mjs
 //
-// With no MODEL set it defaults to gpt-4o-mini and expects a real OpenAI
-// key with the server left on its default (OpenAI) base URL.
+// With no MODEL set it defaults to gpt-4o-mini and ZEROCACHE_CHAT_PROVIDER to
+// openai, expecting a real OpenAI key. Any built-in chat provider works.
 //
 // Dependency-free: global fetch + a hand-rolled assert. Safe to re-run --
 // each invocation folds a fresh runId into the system prompt, so it starts
@@ -34,6 +35,7 @@
 const BASE_URL = (process.env.ZEROCACHE_BASE_URL || "http://localhost:8080").replace(/\/$/, "");
 const API_KEY = process.env.OPENAI_API_KEY;
 const MODEL = process.env.MODEL || "gpt-4o-mini";
+const PROVIDER = process.env.ZEROCACHE_CHAT_PROVIDER || "openai";
 const MAX_STEPS = 6;
 
 // Illustrative list prices, USD per 1M tokens. Override for your model/tier.
@@ -162,7 +164,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function chat(messages) {
   const payload = JSON.stringify({ model: MODEL, messages, tools: TOOLS, temperature: 0 });
   for (let attempt = 0; ; attempt += 1) {
-    const res = await fetch(`${BASE_URL}/openai/v1/chat/completions`, {
+    const res = await fetch(`${BASE_URL}/${PROVIDER}/v1/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${API_KEY}` },
       body: payload,

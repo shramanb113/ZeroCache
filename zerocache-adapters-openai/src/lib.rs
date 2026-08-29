@@ -136,22 +136,47 @@ impl EmbeddingProvider for OpenAiProvider {
     }
 }
 
+/// A generic OpenAI-wire chat-completions proxy. Takes an explicit URL
+/// prefix and appends only `/chat/completions`, so it serves any endpoint
+/// speaking OpenAI's chat wire shape under any path (OpenAI, Gemini's
+/// `/v1beta/openai` compat surface, Groq, self-hosted vLLM). Distinct from
+/// `OpenAiProvider`, which is the embeddings adapter and hardcodes `/v1/`.
+pub struct OpenAiWireChatProvider {
+    client: reqwest_middleware::ClientWithMiddleware,
+    url_prefix: String,
+}
+
+impl OpenAiWireChatProvider {
+    /// `url_prefix` is the endpoint up to but not including
+    /// `/chat/completions`, already run through `normalize_chat_url`.
+    pub fn new(url_prefix: impl Into<String>) -> Self {
+        let inner = reqwest::Client::builder()
+            .timeout(PROVIDER_TIMEOUT)
+            .build()
+            .expect("reqwest client with a timeout is always constructible");
+        let retry_policy = ExponentialBackoff::builder().build_with_max_retries(MAX_RETRIES);
+        Self {
+            client: ClientBuilder::new(inner)
+                .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+                .build(),
+            url_prefix: url_prefix.into(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
-impl ChatCompletionProvider for OpenAiProvider {
+impl ChatCompletionProvider for OpenAiWireChatProvider {
     async fn chat_completion(
         &self,
         api_key: &str,
         request: &serde_json::Value,
     ) -> Result<ChatCompletionResponse, ProviderError> {
-        // A thin proxy: forward the caller's body as-is (the chat shape is
-        // the contract on both sides), swap in the caller's key, return the
-        // response untouched. `Err` is only for a transport failure -- a
-        // non-2xx *response* is a real response and is forwarded with its
+        // Forward the body verbatim, swap in the caller's key. `Err` means a
+        // transport failure; a non-2xx response is returned as `Ok` with its
         // real status so the caller sees exactly what the provider said.
-        // The retry middleware still retries transient 5xx/429 first.
         let response = self
             .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
+            .post(format!("{}/chat/completions", self.url_prefix))
             .bearer_auth(api_key)
             .json(request)
             .send()
@@ -163,9 +188,8 @@ impl ChatCompletionProvider for OpenAiProvider {
             .text()
             .await
             .map_err(|e| ProviderError(e.to_string()))?;
-        // A 2xx chat response is always JSON; a non-2xx body might not be
-        // (a gateway's plain-text 503), so fall back to wrapping it rather
-        // than turning a forwardable error response into a transport Err.
+        // A non-2xx body may not be JSON (a gateway's plain-text 503); wrap
+        // it rather than fail a forwardable error response.
         let body: serde_json::Value =
             serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({ "error": text }));
 
@@ -187,7 +211,7 @@ impl ChatCompletionProvider for OpenAiProvider {
     }
 
     fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
-        Ok(self.base_url.clone())
+        Ok(self.url_prefix.clone())
     }
 }
 
@@ -385,26 +409,14 @@ mod tests {
     fn cache_scope_is_the_configured_base_url_so_repointing_invalidates_the_cache() {
         let a = OpenAiProvider::new("https://api.openai.com");
         let b = OpenAiProvider::new("http://localhost:8000");
-        // Disambiguated: OpenAiProvider now implements both EmbeddingProvider
-        // and ChatCompletionProvider, and both declare `cache_scope`. They
-        // return the same value (the base URL) by construction.
         assert_eq!(
-            EmbeddingProvider::cache_scope(&a, "text-embedding-3-small").unwrap(),
+            a.cache_scope("text-embedding-3-small").unwrap(),
             "https://api.openai.com"
         );
         assert_ne!(
-            EmbeddingProvider::cache_scope(&a, "text-embedding-3-small").unwrap(),
-            EmbeddingProvider::cache_scope(&b, "text-embedding-3-small").unwrap(),
+            a.cache_scope("text-embedding-3-small").unwrap(),
+            b.cache_scope("text-embedding-3-small").unwrap(),
             "a self-hosted endpoint must not inherit vectors cached from the real provider"
-        );
-    }
-
-    #[test]
-    fn chat_completion_cache_scope_matches_the_embedding_one() {
-        let p = OpenAiProvider::new("https://api.openai.com");
-        assert_eq!(
-            ChatCompletionProvider::cache_scope(&p, "gpt-4o").unwrap(),
-            EmbeddingProvider::cache_scope(&p, "gpt-4o").unwrap()
         );
     }
 
@@ -419,7 +431,7 @@ mod tests {
         let mock = server
             .mock_async(|when, then| {
                 when.method(POST)
-                    .path("/v1/chat/completions")
+                    .path("/chat/completions")
                     .header("authorization", "Bearer sk-caller")
                     .json_body(json!({
                         "model": "gpt-4o",
@@ -434,7 +446,7 @@ mod tests {
             })
             .await;
 
-        let provider = OpenAiProvider::new(server.base_url());
+        let provider = OpenAiWireChatProvider::new(server.base_url());
         let resp = provider
             .chat_completion("sk-caller", &request_body)
             .await
@@ -453,14 +465,14 @@ mod tests {
         let server = MockServer::start_async().await;
         server
             .mock_async(|when, then| {
-                when.method(POST).path("/v1/chat/completions");
+                when.method(POST).path("/chat/completions");
                 then.status(429).json_body(
                     json!({"error": {"message": "rate limited", "type": "rate_limit_error"}}),
                 );
             })
             .await;
 
-        let provider = OpenAiProvider::new(server.base_url());
+        let provider = OpenAiWireChatProvider::new(server.base_url());
         let resp = provider
             .chat_completion("sk-caller", &json!({"model": "gpt-4o", "messages": []}))
             .await
@@ -476,7 +488,7 @@ mod tests {
         let server = MockServer::start_async().await;
         server
             .mock_async(|when, then| {
-                when.method(POST).path("/v1/chat/completions");
+                when.method(POST).path("/chat/completions");
                 then.status(200).json_body(json!({
                     "id": "chatcmpl-2",
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": "x"}}]
@@ -484,7 +496,7 @@ mod tests {
             })
             .await;
 
-        let provider = OpenAiProvider::new(server.base_url());
+        let provider = OpenAiWireChatProvider::new(server.base_url());
         let resp = provider
             .chat_completion("sk-caller", &json!({"model": "gpt-4o", "messages": []}))
             .await
@@ -501,12 +513,12 @@ mod tests {
         let server = MockServer::start_async().await;
         let mock = server
             .mock_async(|when, then| {
-                when.method(POST).path("/v1/chat/completions");
+                when.method(POST).path("/chat/completions");
                 then.status(503).body("service unavailable");
             })
             .await;
 
-        let provider = OpenAiProvider::new(server.base_url());
+        let provider = OpenAiWireChatProvider::new(server.base_url());
         let resp = provider
             .chat_completion("sk-caller", &json!({"model": "gpt-4o", "messages": []}))
             .await
@@ -520,6 +532,52 @@ mod tests {
             mock.hits_async().await,
             (MAX_RETRIES + 1) as usize,
             "1 initial attempt + MAX_RETRIES retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_appends_only_chat_completions_to_a_prefixed_url() {
+        // A prefix that already carries a version segment (/v1beta/openai)
+        // must not get a second /v1.
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1beta/openai/chat/completions");
+                then.status(200).json_body(json!({
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }));
+            })
+            .await;
+
+        let provider =
+            OpenAiWireChatProvider::new(format!("{}/v1beta/openai", server.base_url()));
+        let resp = provider
+            .chat_completion(
+                "sk-caller",
+                &json!({"model": "gemini-3.5-flash-lite", "messages": []}),
+            )
+            .await
+            .unwrap();
+
+        mock.assert_async().await; // fails if the request hit a doubled-/v1 path
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn chat_completion_cache_scope_is_the_configured_url_prefix() {
+        let a = OpenAiWireChatProvider::new("https://api.openai.com/v1");
+        let b = OpenAiWireChatProvider::new(
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        );
+        assert_eq!(
+            a.cache_scope("gpt-4o").unwrap(),
+            "https://api.openai.com/v1"
+        );
+        assert_ne!(
+            a.cache_scope("gpt-4o").unwrap(),
+            b.cache_scope("gpt-4o").unwrap(),
+            "real OpenAI and a Gemini-compat endpoint must not share completion-cache entries"
         );
     }
 }
