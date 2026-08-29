@@ -51,11 +51,9 @@ pub trait CompletionStore: Send + Sync {
     fn delete(&self, key: &CacheKey) -> Result<(), StoreError>;
 }
 
-/// One persisted semantic-index entry: an L2-normalized embedding of a
-/// request's fuzzy span plus the coordinates needed to rebuild the in-memory
-/// HNSW index at startup and to look the full completion back up. The
-/// `vector` is `EMBEDDING_DIM` f32s (384); `index_version` lets a reader skip
-/// records written under an older coarse-canonical format.
+/// A persisted semantic-index entry: an L2-normalized embedding of a request's
+/// fuzzy span plus what's needed to rebuild the in-memory index and find the
+/// completion. `index_version` lets a reader skip records from an older format.
 #[derive(Debug, Clone)]
 pub struct VectorRecord {
     pub exact_key: CacheKey,
@@ -65,12 +63,8 @@ pub struct VectorRecord {
     pub vector: Vec<f32>,
 }
 
-/// Persistence for `VectorRecord`s. Separate from `CompletionStore` because
-/// it is the one store surface that must *enumerate* (`load_all`) to
-/// reconstruct an in-memory index on boot — a property the key-addressed
-/// store traits deliberately keep out. Implemented on the sled adapter only
-/// in v1; the redis adapter does not implement it and the semantic tier is
-/// unavailable on that backend.
+/// Persistence for `VectorRecord`s. Separate from `CompletionStore` because it
+/// must enumerate (`load_all`) to rebuild the index at boot. sled only in v1.
 pub trait CompletionVectorStore: Send + Sync {
     fn insert(&self, record: VectorRecord) -> Result<(), StoreError>;
     fn delete(&self, exact_key: &CacheKey) -> Result<(), StoreError>;

@@ -1,0 +1,18 @@
+[package]
+name = "zerocache-semantic"
+version = "0.1.0"
+edition = "2021"
+
+# NOT a workspace member (see the workspace Cargo.toml `exclude`). Pulled in
+# only by `zerocache-http --features semantic`. Keeping it out of the default
+# workspace build means `cargo build --workspace` never compiles candle.
+
+[dependencies]
+zerocache-core = { path = "../zerocache-core" }
+blake3 = "1"
+hnsw_rs = "0.3"
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+serde_json = "1"

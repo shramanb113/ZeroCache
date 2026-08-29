@@ -76,10 +76,8 @@ pub fn completion_request_is_cacheable(request: &Value) -> bool {
     temperature_is_zero || seed_is_set
 }
 
-/// Which part of a chat-completion request the semantic tier embeds and
-/// treats as "fuzzy" (a near match is acceptable). Everything outside this
-/// span is still matched exactly. `LastUser` is the tightest and the
-/// default.
+/// Which span of a chat request the semantic tier embeds as "fuzzy"; everything
+/// outside it is still matched exactly. `LastUser` is the tightest, and default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MatchUnit {
@@ -88,10 +86,8 @@ pub enum MatchUnit {
     FullConversation = 2,
 }
 
-/// Pulls one message's `content` into a plain string: a JSON string is
-/// returned as-is; an array of parts is the `text` of every `{"type":"text",
-/// ...}` part joined with '\n' (non-text parts ignored); anything else is
-/// `None`.
+/// A message's `content` as text: a bare string, or the `text` parts of an
+/// array joined with '\n'. Non-text parts and other shapes yield `None`.
 fn message_text(message: &Value) -> Option<String> {
     match message.get("content") {
         Some(Value::String(s)) => Some(s.clone()),
@@ -128,9 +124,8 @@ fn last_user_text(request: &Value) -> Option<String> {
         .and_then(message_text)
 }
 
-/// The text handed to the embedder for `unit`. `None` => the span is absent
-/// or blank => the caller skips the semantic tier for this request and
-/// behaves exactly as the exact-match-only path does.
+/// The text to embed for `unit`, or `None` when the span is absent/blank (the
+/// caller then skips the semantic tier for this request).
 pub fn completion_fuzzy_text(request: &Value, unit: MatchUnit) -> Option<String> {
     let text = match unit {
         MatchUnit::LastUser => last_user_text(request)?,
@@ -166,9 +161,8 @@ pub fn completion_fuzzy_text(request: &Value, unit: MatchUnit) -> Option<String>
     }
 }
 
-/// The exact-match canonical form with the fuzzy span (per `unit`) blanked:
-/// used to derive `coarse_key_hash`, the hard gate that a semantic candidate
-/// must still match exactly outside the embedded span.
+/// The canonical form with the fuzzy span (per `unit`) blanked. Feeds
+/// `coarse_key_hash` — the gate a semantic candidate must still match exactly.
 pub fn canonicalize_completion_request_coarse(request: &Value, unit: MatchUnit) -> String {
     let mut root = request.clone();
     if let Value::Object(map) = &mut root {
@@ -210,9 +204,8 @@ pub fn canonicalize_completion_request_coarse(request: &Value, unit: MatchUnit) 
     serde_json::to_string(&canonical_value(&root)).unwrap_or_default()
 }
 
-/// blake3 of the coarse canonical form, with the `unit` discriminant folded
-/// in so a deployment that changes `ZEROCACHE_SEMANTIC_MATCH_UNIT` can never
-/// get a cross-unit false match.
+/// blake3 of the coarse canonical form, `unit` discriminant folded in so
+/// changing `ZEROCACHE_SEMANTIC_MATCH_UNIT` can't produce a cross-unit match.
 pub fn coarse_key_hash(request: &Value, unit: MatchUnit) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&[unit as u8]);

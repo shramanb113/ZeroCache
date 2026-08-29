@@ -15,6 +15,14 @@ members = [
     "zerocache-adapters-vertexai",
     "zerocache-http",
 ]
+# Deliberately NOT a member: the opt-in semantic tier (candle + a bundled
+# model). Keeping it out of `members` means `cargo build --workspace` /
+# `cargo test --workspace` never compile candle. It is pulled in only by
+# `zerocache-http --features semantic`; build/test it directly with
+# `--manifest-path zerocache-semantic/Cargo.toml`.
+exclude = [
+    "zerocache-semantic",
+]
 
 [workspace.package]
 version = "0.1.0"

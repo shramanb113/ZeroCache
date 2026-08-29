@@ -14,9 +14,8 @@ pub struct SledStore {
     // already domain-separated from `derive`, so this is tidiness, not a
     // correctness requirement.
     completions: sled::Tree,
-    // Semantic-index vector records (see CompletionVectorStore). A third
-    // tree, iterable on its own so the in-memory HNSW index can be rebuilt
-    // at startup without scanning the completion blobs.
+    // Semantic-index vector records, iterable on their own to rebuild the
+    // in-memory index at startup.
     completion_vectors: sled::Tree,
     ttl: Option<Duration>,
 }
@@ -138,9 +137,7 @@ impl CompletionVectorStore for SledStore {
             let Some((expires_at, scope_hash, coarse_key_hash, index_version, vector)) =
                 decode_vector(&v)
             else {
-                // A malformed row is skipped, not fatal -- same posture as a
-                // completion blob that no longer deserializes.
-                continue;
+                continue; // skip a malformed row, don't fail the rebuild
             };
             if let Some(expires_at) = expires_at {
                 if now > expires_at {

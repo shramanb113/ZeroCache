@@ -102,8 +102,7 @@ impl CacheKey {
         &self.0
     }
 
-    /// Reconstructs a key from the 32 raw bytes `as_bytes` returned — e.g. a
-    /// store iterating its keyspace to rebuild an in-memory index.
+    /// Inverse of `as_bytes` — reconstruct a key from a store's raw key bytes.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
