@@ -20,7 +20,10 @@ pub const DEFAULT_HUGGINGFACE_BASE_URL: &str = "https://router.huggingface.co/hf
 const BUILTIN_CHAT_PROVIDERS: &[(&str, &str)] = &[
     ("openai", "https://api.openai.com/v1"),
     ("mistral", "https://api.mistral.ai/v1"),
-    ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai"),
+    (
+        "gemini",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+    ),
     ("groq", "https://api.groq.com/openai/v1"),
     ("deepseek", "https://api.deepseek.com/v1"),
     ("together", "https://api.together.ai/v1"),
@@ -508,7 +511,9 @@ mod tests {
     }
 
     fn find<'a>(list: &'a [(String, String)], name: &str) -> Option<&'a str> {
-        list.iter().find(|(n, _)| n == name).map(|(_, u)| u.as_str())
+        list.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, u)| u.as_str())
     }
 
     #[test]
@@ -571,9 +576,8 @@ mod tests {
 
     #[test]
     fn chat_providers_normalizes_a_pasted_completions_url() {
-        let list = parse_chat_providers(Some(
-            "groq=https://api.groq.com/openai/v1/chat/completions",
-        ));
+        let list =
+            parse_chat_providers(Some("groq=https://api.groq.com/openai/v1/chat/completions"));
         assert_eq!(find(&list, "groq"), Some("https://api.groq.com/openai/v1"));
     }
 

@@ -94,14 +94,20 @@ mod tests {
             "zerocache_cache_misses_total",
             "zerocache_provider_prompt_tokens_total",
         ] {
-            assert!(js.contains(name), "dashboard bundle no longer references {name}");
+            assert!(
+                js.contains(name),
+                "dashboard bundle no longer references {name}"
+            );
         }
     }
 
     #[test]
     fn assets_are_served_with_a_sensible_content_type() {
         assert_eq!(content_type("index.html"), "text/html; charset=utf-8");
-        assert_eq!(content_type("_astro/x.js"), "text/javascript; charset=utf-8");
+        assert_eq!(
+            content_type("_astro/x.js"),
+            "text/javascript; charset=utf-8"
+        );
         assert_eq!(content_type("weird"), "application/octet-stream");
     }
 }
