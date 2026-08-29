@@ -8,6 +8,10 @@ use zerocache_core::MatchUnit;
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
 pub const DEFAULT_SEMANTIC_THRESHOLD: f32 = 0.97;
 const SEMANTIC_THRESHOLD_FLOOR: f32 = 0.5;
+pub const DEFAULT_SEMANTIC_INDEX_MAXLEN: usize = 100_000;
+pub const DEFAULT_SEMANTIC_POLL_MS: u64 = 2000;
+const SEMANTIC_POLL_MS_MIN: u64 = 250;
+const SEMANTIC_POLL_MS_MAX: u64 = 60_000;
 pub const DEFAULT_MISTRAL_BASE_URL: &str = "https://api.mistral.ai";
 pub const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 pub const DEFAULT_HUGGINGFACE_BASE_URL: &str = "https://router.huggingface.co/hf-inference";
@@ -78,6 +82,10 @@ pub struct Config {
     pub semantic_threshold: f32,
     #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
     pub semantic_match_unit: MatchUnit,
+    #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
+    pub semantic_index_maxlen: usize,
+    #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
+    pub semantic_poll_ms: u64,
 }
 
 /// Resolves an optional env-var override to a string value, falling back to
@@ -216,6 +224,12 @@ impl Config {
                     .ok()
                     .as_deref(),
             ),
+            semantic_index_maxlen: parse_semantic_index_maxlen(
+                std::env::var("ZEROCACHE_SEMANTIC_INDEX_MAXLEN").ok().as_deref(),
+            ),
+            semantic_poll_ms: parse_semantic_poll_ms(
+                std::env::var("ZEROCACHE_SEMANTIC_POLL_MS").ok().as_deref(),
+            ),
         }
     }
 }
@@ -250,6 +264,43 @@ fn parse_semantic_match_unit(raw: Option<&str>) -> MatchUnit {
             );
             MatchUnit::LastUser
         }
+    }
+}
+
+fn parse_semantic_index_maxlen(raw: Option<&str>) -> usize {
+    match raw {
+        None | Some("") => DEFAULT_SEMANTIC_INDEX_MAXLEN,
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                eprintln!(
+                    "warning: ZEROCACHE_SEMANTIC_INDEX_MAXLEN='{v}' is not a positive integer -- using {DEFAULT_SEMANTIC_INDEX_MAXLEN}"
+                );
+                DEFAULT_SEMANTIC_INDEX_MAXLEN
+            }
+        },
+    }
+}
+
+fn parse_semantic_poll_ms(raw: Option<&str>) -> u64 {
+    match raw {
+        None | Some("") => DEFAULT_SEMANTIC_POLL_MS,
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) if (SEMANTIC_POLL_MS_MIN..=SEMANTIC_POLL_MS_MAX).contains(&n) => n,
+            Ok(n) => {
+                let c = n.clamp(SEMANTIC_POLL_MS_MIN, SEMANTIC_POLL_MS_MAX);
+                eprintln!(
+                    "warning: ZEROCACHE_SEMANTIC_POLL_MS={v} is outside [{SEMANTIC_POLL_MS_MIN}, {SEMANTIC_POLL_MS_MAX}] -- using {c}"
+                );
+                c
+            }
+            Err(_) => {
+                eprintln!(
+                    "warning: ZEROCACHE_SEMANTIC_POLL_MS='{v}' is not a positive integer -- using {DEFAULT_SEMANTIC_POLL_MS}"
+                );
+                DEFAULT_SEMANTIC_POLL_MS
+            }
+        },
     }
 }
 
@@ -733,5 +784,25 @@ mod tests {
                 "{name} URL includes the /chat/completions suffix"
             );
         }
+    }
+
+    #[test]
+    fn semantic_index_maxlen_defaults_and_validates() {
+        assert_eq!(parse_semantic_index_maxlen(None), DEFAULT_SEMANTIC_INDEX_MAXLEN);
+        assert_eq!(parse_semantic_index_maxlen(Some("")), DEFAULT_SEMANTIC_INDEX_MAXLEN);
+        assert_eq!(parse_semantic_index_maxlen(Some("250000")), 250_000);
+        assert_eq!(parse_semantic_index_maxlen(Some("0")), DEFAULT_SEMANTIC_INDEX_MAXLEN);
+        assert_eq!(parse_semantic_index_maxlen(Some("-5")), DEFAULT_SEMANTIC_INDEX_MAXLEN);
+        assert_eq!(parse_semantic_index_maxlen(Some("abc")), DEFAULT_SEMANTIC_INDEX_MAXLEN);
+    }
+
+    #[test]
+    fn semantic_poll_ms_defaults_and_clamps() {
+        assert_eq!(parse_semantic_poll_ms(None), DEFAULT_SEMANTIC_POLL_MS);
+        assert_eq!(parse_semantic_poll_ms(Some("")), DEFAULT_SEMANTIC_POLL_MS);
+        assert_eq!(parse_semantic_poll_ms(Some("1000")), 1000);
+        assert_eq!(parse_semantic_poll_ms(Some("50")), 250);
+        assert_eq!(parse_semantic_poll_ms(Some("120000")), 60_000);
+        assert_eq!(parse_semantic_poll_ms(Some("abc")), DEFAULT_SEMANTIC_POLL_MS);
     }
 }
