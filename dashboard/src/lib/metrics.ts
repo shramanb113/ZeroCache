@@ -37,6 +37,7 @@ export interface ProviderRow {
   provider: string;
   /** completion cache */
   cHit: number;
+  cSemanticHit: number;
   cMiss: number;
   promptTokensSaved: number;
   completionTokensSaved: number;
@@ -62,11 +63,13 @@ export interface Snapshot {
   embeddingHitRate: number | null;
   completionTokensSaved: number;
   embeddingTokensSaved: number;
+  completionSemanticHits: number;
 }
 
 const M = {
   cHit: "zerocache_completion_cache_hits_total",
   cMiss: "zerocache_completion_cache_misses_total",
+  cSemantic: "zerocache_completion_semantic_hits_total",
   cPromptSaved: "zerocache_completion_prompt_tokens_saved_total",
   cComplSaved: "zerocache_completion_completion_tokens_saved_total",
   eHit: "zerocache_cache_hits_total",
@@ -92,6 +95,7 @@ export function shape(
   let completionUsd = 0;
   let embeddingUsd = 0;
   let cHit = 0;
+  let cSemantic = 0;
   let cMiss = 0;
   let eHit = 0;
   let eMiss = 0;
@@ -101,6 +105,7 @@ export function shape(
 
   for (const p of [...providers].sort()) {
     const pcHit = sumByProvider(raw[M.cHit], p);
+    const pcSemantic = sumByProvider(raw[M.cSemantic], p);
     const pcMiss = sumByProvider(raw[M.cMiss], p);
     const pPromptSaved = sumByProvider(raw[M.cPromptSaved], p);
     const pComplSaved = sumByProvider(raw[M.cComplSaved], p);
@@ -117,6 +122,7 @@ export function shape(
     rows.push({
       provider: p,
       cHit: pcHit,
+      cSemanticHit: pcSemantic,
       cMiss: pcMiss,
       promptTokensSaved: pPromptSaved,
       completionTokensSaved: pComplSaved,
@@ -132,6 +138,7 @@ export function shape(
     completionUsd += compUsd;
     embeddingUsd += embUsd;
     cHit += pcHit;
+    cSemantic += pcSemantic;
     cMiss += pcMiss;
     eHit += peHit;
     eMiss += peMiss;
@@ -154,5 +161,6 @@ export function shape(
     embeddingHitRate: eHit + eMiss > 0 ? eHit / (eHit + eMiss) : null,
     completionTokensSaved: promptTokensSaved + completionTokensSaved,
     embeddingTokensSaved,
+    completionSemanticHits: cSemantic,
   };
 }

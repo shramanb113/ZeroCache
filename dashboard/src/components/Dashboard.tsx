@@ -91,8 +91,11 @@ export default function Dashboard() {
             {m.history.length >= 2 ? `+${usd(since)} since this page loaded` : "collecting…"}
           </div>
           <div className="caption">
-            {usd(s?.completionUsd ?? 0)} completions (measured) · {usd(s?.embeddingUsd ?? 0)} embeddings
-            (estimated)
+            {usd(s?.completionUsd ?? 0)} completions (measured
+            {s && s.completionSemanticHits > 0
+              ? `, ${compact(s.completionSemanticHits)} via semantic match`
+              : ""}
+            ) · {usd(s?.embeddingUsd ?? 0)} embeddings (estimated)
           </div>
         </section>
 

@@ -88,6 +88,7 @@ mod tests {
         for name in [
             "zerocache_completion_cache_hits_total",
             "zerocache_completion_cache_misses_total",
+            "zerocache_completion_semantic_hits_total",
             "zerocache_completion_prompt_tokens_saved_total",
             "zerocache_completion_completion_tokens_saved_total",
             "zerocache_cache_hits_total",
