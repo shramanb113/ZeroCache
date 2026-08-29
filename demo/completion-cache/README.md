@@ -15,7 +15,21 @@ OPENAI_API_KEY=sk-... node demo/completion-cache/battle-test.mjs
 
 No `npm install` — the script uses only global `fetch`. Override
 `ZEROCACHE_BASE_URL` (default `http://localhost:8080`) or `MODEL` (default
-`gpt-4o-mini`) as needed.
+`gpt-4o-mini`) as needed. Any of the built-in chat providers (`openai`,
+`mistral`, `gemini`, `groq`, `deepseek`, `together`, `openrouter`, `xai`,
+`fireworks`) works with no server config; set `ZEROCACHE_CHAT_PROVIDER` to
+pick which one the script calls. To run against Gemini's OpenAI-compat
+endpoint:
+
+```sh
+# terminal 1
+ZEROCACHE_CHAT_PROVIDERS="gemini=https://generativelanguage.googleapis.com/v1beta/openai" \
+  cargo run -p zerocache-http
+
+# terminal 2
+OPENAI_API_KEY=<gemini key> MODEL=gemini-3.5-flash-lite ZEROCACHE_CHAT_PROVIDER=gemini \
+  node demo/completion-cache/battle-test.mjs
+```
 
 ## What it proves
 
@@ -58,19 +72,19 @@ Scenario: a support-triage agent with three tools over in-script data
 (`search_kb`, `get_order`, `resolve_ticket`) resolving a 3-ticket suite.
 
 ```sh
-# terminal 1 — point Zerocache at any OpenAI-wire-compatible endpoint
-ZEROCACHE_OPENAI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai \
+# terminal 1 — register Gemini as a chat provider (no doubled /v1)
+ZEROCACHE_CHAT_PROVIDERS="gemini=https://generativelanguage.googleapis.com/v1beta/openai" \
   cargo run -p zerocache-http
 
 # terminal 2
-OPENAI_API_KEY=<key> MODEL=gemini-3.5-flash-lite PACE_MS=5000 \
+OPENAI_API_KEY=<key> MODEL=gemini-3.5-flash-lite PACE_MS=5000 ZEROCACHE_CHAT_PROVIDER=gemini \
   node demo/completion-cache/agent.mjs
 ```
 
-`MODEL` defaults to `gpt-4o-mini` (expects a real OpenAI key + default
-base URL). `PACE_MS` (default 7000) spaces out **cold-run** calls so a
-provider free-tier per-minute quota doesn't trip; the repeat run is all
-cache hits and never waits.
+`MODEL` defaults to `gpt-4o-mini` and `ZEROCACHE_CHAT_PROVIDER` to `openai`
+(expects a real OpenAI key). `PACE_MS` (default 7000) spaces out
+**cold-run** calls so a provider free-tier per-minute quota doesn't trip;
+the repeat run is all cache hits and never waits.
 
 ## The money case it demonstrates
 
