@@ -17,9 +17,12 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use zerocache_core::{canonicalize_completion_request, completion_request_is_cacheable, CacheKey};
-use zerocache_ports::{ChatCompletionProvider, ChatCompletionResponse, CompletionUsage};
+use zerocache_ports::{
+    ChatCompletionProvider, ChatCompletionResponse, CompletionUsage, ProviderError,
+};
 
 use crate::app::{run_store_task, AppError, AppState, SharedCompletion, SharedCompletionOutput};
+use crate::coalesce::{coalesce_cross_replica, CoalesceTiming, Coalesced, CrossReplica};
 
 /// The stored form of a cached completion: the upstream response body plus
 /// the token counts it reported, so a later hit can both replay the body and
@@ -214,7 +217,25 @@ pub async fn complete(
         }
     }
 
-    let response = fetch_completion_coalesced(state, &request, key).await?;
+    let (response, coalesced) = fetch_completion_coalesced(state, &request, key).await?;
+
+    if let Coalesced::FromPeer = coalesced {
+        // A peer replica filled this entry while we waited: a genuine cache
+        // hit, just very fresh. Record tokens saved; do not re-store.
+        state
+            .metrics
+            .record_completion_hit(request.provider_name, &response.usage);
+        state
+            .metrics
+            .record_cross_replica_coalesced(request.provider_name, "completion");
+        tracing::Span::current().record("hit", true);
+        return Ok(CompletionOutcome {
+            response,
+            hit: true,
+            hit_kind: Some(HitKind::Exact),
+            semantic_score: None,
+        });
+    }
 
     if (200..300).contains(&response.status) {
         let record = CachedCompletion {
@@ -247,17 +268,19 @@ pub async fn complete(
     })
 }
 
-/// Fetches one completion from the provider, coalescing with any identical
-/// concurrent in-flight fetch (`AppState.completion_in_flight`, keyed by the
-/// completion `CacheKey`) so N concurrent requests missing on the same key
-/// trigger one upstream call, not N. In-process only, exactly like
-/// `crate::app::fetch_coalesced` for embeddings -- see its doc comment for
-/// the full rationale.
+/// Fetches one completion, coalescing with any identical concurrent in-flight
+/// fetch on this replica (`AppState.completion_in_flight`) and -- for the
+/// claiming request, inside the shared future so in-process piggybackers
+/// benefit too -- across replicas via `state.coordinator`
+/// (`crate::coalesce::coalesce_cross_replica`). Returns the response plus a
+/// `Coalesced` marker: `FromPeer` only when this replica read the value back
+/// from the store after a peer filled it. An in-process piggybacker is always
+/// `Local` (it counts as a miss, item 21).
 async fn fetch_completion_coalesced(
     state: &AppState,
     request: &CompletionRequest<'_>,
     key: CacheKey,
-) -> Result<ChatCompletionResponse, AppError> {
+) -> Result<(ChatCompletionResponse, Coalesced), AppError> {
     enum Claim {
         Owned(SharedCompletion),
         Piggyback(SharedCompletion),
@@ -275,10 +298,57 @@ async fn fetch_completion_coalesced(
             let provider = Arc::clone(&request.provider);
             let api_key = request.api_key.to_string();
             let body = request.body.clone();
+            let coordinator = Arc::clone(&state.coordinator);
+            let completion_store = Arc::clone(&state.completion_store);
+
             let fut: Pin<Box<dyn Future<Output = SharedCompletionOutput> + Send>> = Box::pin(
                 async move {
-                    let response = provider.chat_completion(&api_key, &body).await?;
-                    Ok(Arc::new(response))
+                    let outcome = coalesce_cross_replica::<ChatCompletionResponse, _, _>(
+                        &coordinator,
+                        key,
+                        CoalesceTiming::PROD,
+                        || {
+                            let store = Arc::clone(&completion_store);
+                            async move {
+                                let bytes = run_store_task(move || {
+                                    store.get(&key).map_err(AppError::Store)
+                                })
+                                .await
+                                .unwrap_or(None);
+                                Ok(bytes
+                                    .and_then(|b| {
+                                        serde_json::from_slice::<CachedCompletion>(&b).ok()
+                                    })
+                                    .map(|rec| ChatCompletionResponse {
+                                        status: 200,
+                                        body: rec.body,
+                                        usage: CompletionUsage {
+                                            prompt_tokens: rec.prompt_tokens,
+                                            completion_tokens: rec.completion_tokens,
+                                            total_tokens: rec.total_tokens,
+                                        },
+                                    }))
+                            }
+                        },
+                        || async move {
+                            provider
+                                .chat_completion(&api_key, &body)
+                                .await
+                                .map_err(AppError::Provider)
+                        },
+                    )
+                    .await;
+
+                    match outcome {
+                        Ok(CrossReplica::Led(resp)) => Ok((Arc::new(resp), Coalesced::Local)),
+                        Ok(CrossReplica::Followed(resp)) => {
+                            Ok((Arc::new(resp), Coalesced::FromPeer))
+                        }
+                        Err(AppError::Provider(e)) => Err(e),
+                        Err(AppError::Store(e)) => Err(ProviderError(format!(
+                            "store error during coalesced completion fetch: {e}"
+                        ))),
+                    }
                 }
                 .instrument(tracing::info_span!("provider_call")),
             );
@@ -298,12 +368,14 @@ async fn fetch_completion_coalesced(
                 .lock()
                 .expect("completion_in_flight mutex poisoned")
                 .remove(&key);
-            let response = result.map_err(AppError::Provider)?;
-            Ok((*response).clone())
+            let (response, coalesced) = result.map_err(AppError::Provider)?;
+            Ok(((*response).clone(), coalesced))
         }
         Claim::Piggyback(fut) => {
-            let response = fut.await.map_err(AppError::Provider)?;
-            Ok((*response).clone())
+            // An in-process piggybacker counts as a miss (item 21) regardless
+            // of how the claim itself resolved.
+            let (response, _) = fut.await.map_err(AppError::Provider)?;
+            Ok(((*response).clone(), Coalesced::Local))
         }
     }
 }
@@ -440,6 +512,13 @@ mod tests {
     const OWNER_B: [u8; 32] = [2u8; 32];
 
     fn state(store: impl CompletionStore + 'static) -> AppState {
+        state_with_coordinator(store, Arc::new(crate::coalesce::NoopCoordinator))
+    }
+
+    fn state_with_coordinator(
+        store: impl CompletionStore + 'static,
+        coordinator: Arc<dyn zerocache_ports::CoalescingCoordinator>,
+    ) -> AppState {
         AppState {
             store: Arc::new(NoopEmbeddingStore),
             providers: HashMap::new(),
@@ -450,7 +529,7 @@ mod tests {
             completion_store: Arc::new(store),
             completion_providers: HashMap::new(),
             completion_in_flight: Mutex::new(HashMap::new()),
-            coordinator: Arc::new(crate::coalesce::NoopCoordinator),
+            coordinator,
             #[cfg(feature = "semantic")]
             semantic: None,
         }
@@ -735,6 +814,104 @@ mod tests {
         for out in &outs {
             assert_eq!(out.response.body, json!({"x": 1}));
         }
+    }
+
+    struct FollowerCoordinator;
+    impl zerocache_ports::CoalescingCoordinator for FollowerCoordinator {
+        fn try_lead(&self, _k: &CacheKey) -> zerocache_ports::Role {
+            zerocache_ports::Role::Follower
+        }
+        fn complete(&self, _k: &CacheKey) {}
+        fn follow(&self, _k: &CacheKey, _w: Duration) -> zerocache_ports::FollowSignal {
+            zerocache_ports::FollowSignal::Signalled
+        }
+    }
+
+    /// Misses the exact-match lookup (`get` call #1), then hits every later
+    /// `get` -- simulating a peer replica writing the entry mid-follow.
+    struct PeerFillsAfterFirstGet {
+        record: Vec<u8>,
+        gets: AtomicUsize,
+    }
+
+    impl PeerFillsAfterFirstGet {
+        fn with_body(body: serde_json::Value) -> Self {
+            let rec = json!({
+                "body": body, "prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14
+            });
+            Self {
+                record: serde_json::to_vec(&rec).unwrap(),
+                gets: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl CompletionStore for PeerFillsAfterFirstGet {
+        fn get(&self, _key: &CacheKey) -> Result<Option<Vec<u8>>, StoreError> {
+            let n = self.gets.fetch_add(1, Ordering::SeqCst);
+            Ok(if n == 0 {
+                None
+            } else {
+                Some(self.record.clone())
+            })
+        }
+        fn put(&self, _key: CacheKey, _value: Vec<u8>) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn delete(&self, _key: &CacheKey) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_filled_completion_is_served_as_a_hit_without_calling_the_provider() {
+        let provider = Arc::new(MockChatProvider::ok(
+            json!({"never": "called"}),
+            CompletionUsage::default(),
+        ));
+        let body = eligible_body();
+        let store = PeerFillsAfterFirstGet::with_body(json!({"peer": "value"}));
+
+        let st = state_with_coordinator(store, Arc::new(FollowerCoordinator));
+        let out = complete(&st, req(&provider, OWNER_A, &body)).await.unwrap();
+
+        assert!(out.hit, "a peer-filled entry is a hit");
+        assert_eq!(out.hit_kind, Some(HitKind::Exact));
+        assert_eq!(out.response.body, json!({"peer": "value"}));
+        assert_eq!(provider.call_count(), 0, "no upstream call for a peer fill");
+
+        let dump = st.metrics.encode();
+        assert!(
+            dump.contains(
+                "zerocache_cross_replica_coalesced_total{kind=\"completion\",provider=\"openai\"} 1"
+            ),
+            "{dump}"
+        );
+        assert!(
+            dump.contains("zerocache_completion_cache_hits_total{provider=\"openai\"} 1"),
+            "{dump}"
+        );
+    }
+
+    #[tokio::test]
+    async fn noop_coordinator_leaves_the_completion_miss_store_hit_cycle_unchanged() {
+        let provider = Arc::new(MockChatProvider::ok(
+            json!({"choices": [{"message": {"content": "hello"}}]}),
+            CompletionUsage {
+                prompt_tokens: 40,
+                completion_tokens: 12,
+                total_tokens: 52,
+            },
+        ));
+        let st = state(MockCompletionStore::empty());
+        let body = eligible_body();
+
+        let out = complete(&st, req(&provider, OWNER_A, &body)).await.unwrap();
+        assert!(!out.hit);
+        assert_eq!(provider.call_count(), 1);
+        let out2 = complete(&st, req(&provider, OWNER_A, &body)).await.unwrap();
+        assert!(out2.hit);
+        assert_eq!(provider.call_count(), 1);
     }
 
     #[cfg(feature = "semantic")]

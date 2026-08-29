@@ -27,12 +27,13 @@ type SharedFetchOutput = Result<(Arc<HashMap<CacheKey, Vec<f32>>>, ProviderUsage
 type SharedFetch = Shared<Pin<Box<dyn Future<Output = SharedFetchOutput> + Send>>>;
 
 /// What a coalesced *completion* fetch resolves to: the single shared
-/// upstream response, `Arc`-wrapped so every waiter's clone is cheap.
-/// `ChatCompletionResponse` and `ProviderError` are both `Clone`, which
-/// together satisfy `Shared`'s `Output: Clone` bound. Consumed by
-/// `crate::completion::fetch_completion_coalesced`; the alias lives here
-/// next to `SharedFetch` and because `AppState` holds a map of them.
-pub(crate) type SharedCompletionOutput = Result<Arc<ChatCompletionResponse>, ProviderError>;
+/// upstream response plus whether a peer replica filled it (cross-replica
+/// coalescing). `Arc`-wrapped so every waiter's clone is cheap;
+/// `ChatCompletionResponse`, `Coalesced`, and `ProviderError` are all
+/// `Clone`, satisfying `Shared`'s `Output: Clone` bound. Consumed by
+/// `crate::completion::fetch_completion_coalesced`.
+pub(crate) type SharedCompletionOutput =
+    Result<(Arc<ChatCompletionResponse>, crate::coalesce::Coalesced), ProviderError>;
 pub(crate) type SharedCompletion =
     Shared<Pin<Box<dyn Future<Output = SharedCompletionOutput> + Send>>>;
 

@@ -12,9 +12,16 @@ use zerocache_ports::{CoalescingCoordinator, FollowSignal, Role};
 
 use crate::app::AppError;
 
-// Consumed by the #[cfg(test)] module below and, from later tasks, by
-// completion.rs / app.rs. The allow drops as those call sites land.
-#[allow(dead_code)]
+/// Whether a resolved value came from this replica's own provider call or was
+/// filled by a peer replica while we waited. Only `completion.rs` cares:
+/// `FromPeer` is a cache hit (record tokens saved, do not re-store); `Local`
+/// is a miss handled exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Coalesced {
+    Local,
+    FromPeer,
+}
+
 pub(crate) enum CrossReplica<T> {
     /// We ran the provider call (led, promoted, or fell back). Caller stores it.
     Led(T),
@@ -22,7 +29,6 @@ pub(crate) enum CrossReplica<T> {
     Followed(T),
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub(crate) struct CoalesceTiming {
     pub deadline: Duration,
@@ -30,7 +36,6 @@ pub(crate) struct CoalesceTiming {
 }
 
 impl CoalesceTiming {
-    #[allow(dead_code)]
     pub(crate) const PROD: CoalesceTiming = CoalesceTiming {
         deadline: Duration::from_secs(30),
         poll: Duration::from_millis(250),
@@ -82,7 +87,6 @@ async fn spawn_follow(
 /// `Ok(None)` while it is still absent (including a transient inability to
 /// check -- the deadline fallback covers a persistently broken store).
 /// `fetch` performs the real upstream call.
-#[allow(dead_code)]
 pub(crate) async fn coalesce_cross_replica<T, RFut, FFut>(
     coordinator: &Arc<dyn CoalescingCoordinator>,
     key: CacheKey,
