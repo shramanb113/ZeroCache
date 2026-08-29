@@ -9,6 +9,26 @@ pub const DEFAULT_MISTRAL_BASE_URL: &str = "https://api.mistral.ai";
 pub const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 pub const DEFAULT_HUGGINGFACE_BASE_URL: &str = "https://router.huggingface.co/hf-inference";
 
+/// Built-in OpenAI-wire chat providers, registered even when
+/// ZEROCACHE_CHAT_PROVIDERS is unset. Each value is the URL prefix the chat
+/// adapter appends `/chat/completions` to -- NOT a bare origin. Unlike the
+/// ZEROCACHE_*_BASE_URL embedding vars, this cannot be "origin + /v1":
+/// Gemini's OpenAI-compat surface lives under /v1beta/openai. URLs verified
+/// against each provider's current docs 2026-08-29; a stale one produces a
+/// clean 404 on first use (visible in the startup log), never a wrong
+/// answer.
+const BUILTIN_CHAT_PROVIDERS: &[(&str, &str)] = &[
+    ("openai", "https://api.openai.com/v1"),
+    ("mistral", "https://api.mistral.ai/v1"),
+    ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai"),
+    ("groq", "https://api.groq.com/openai/v1"),
+    ("deepseek", "https://api.deepseek.com/v1"),
+    ("together", "https://api.together.ai/v1"),
+    ("openrouter", "https://openrouter.ai/api/v1"),
+    ("xai", "https://api.x.ai/v1"),
+    ("fireworks", "https://api.fireworks.ai/inference/v1"),
+];
+
 pub enum StorageBackend {
     // Embedded, single-process. Fine for local dev or a single-replica
     // deployment; cannot be shared across multiple Kubernetes pods.
@@ -28,6 +48,10 @@ pub struct Config {
     pub mistral_base_url: String,
     pub gemini_base_url: String,
     pub huggingface_base_url: String,
+    /// `(name, url_prefix)` pairs: the built-in OpenAI-wire chat providers
+    /// merged with any ZEROCACHE_CHAT_PROVIDERS overrides/additions. Order
+    /// is unimportant -- main.rs only iterates it.
+    pub chat_providers: Vec<(String, String)>,
     /// Setting this is what registers the `azure` provider at all -- an Azure
     /// resource name *is* its hostname, so unlike every other provider there
     /// is no meaningful default to fall back to.
@@ -124,6 +148,9 @@ impl Config {
                     .as_deref(),
                 DEFAULT_HUGGINGFACE_BASE_URL,
             ),
+            chat_providers: parse_chat_providers(
+                std::env::var("ZEROCACHE_CHAT_PROVIDERS").ok().as_deref(),
+            ),
             azure_openai_base_url: optional_env(
                 std::env::var("ZEROCACHE_AZURE_OPENAI_BASE_URL")
                     .ok()
@@ -181,6 +208,70 @@ fn normalize_chat_url(raw: &str) -> String {
         s = stripped.trim_end_matches('/');
     }
     s.to_string()
+}
+
+/// A chat provider name is a URL path segment: `[a-z0-9][a-z0-9_-]*`.
+fn chat_provider_name_is_valid(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// Parses ZEROCACHE_CHAT_PROVIDERS ("name=url,name=url") layered on top of
+/// BUILTIN_CHAT_PROVIDERS. Each valid entry overrides a built-in's URL or
+/// adds a new provider. A malformed entry is skipped with a warning; the
+/// server always boots with at least the built-ins. Pure (takes the raw
+/// value) so it is unit-testable without mutating real process env vars --
+/// same pattern as parse_ttl_seconds.
+fn parse_chat_providers(raw: Option<&str>) -> Vec<(String, String)> {
+    let mut merged: Vec<(String, String)> = BUILTIN_CHAT_PROVIDERS
+        .iter()
+        .map(|(n, u)| (n.to_string(), normalize_chat_url(u)))
+        .collect();
+
+    let raw = match raw {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => return merged,
+    };
+
+    for piece in raw.split(',') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let (name, url) = match piece.split_once('=') {
+            Some(pair) => pair,
+            None => {
+                eprintln!(
+                    "warning: ZEROCACHE_CHAT_PROVIDERS entry '{piece}' has no '=' -- skipping"
+                );
+                continue;
+            }
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let url = normalize_chat_url(url);
+        if !chat_provider_name_is_valid(&name) {
+            eprintln!(
+                "warning: ZEROCACHE_CHAT_PROVIDERS name '{name}' is not a valid provider name (expected [a-z0-9][a-z0-9_-]*) -- skipping"
+            );
+            continue;
+        }
+        if url.is_empty() {
+            eprintln!(
+                "warning: ZEROCACHE_CHAT_PROVIDERS entry for '{name}' has an empty URL -- skipping"
+            );
+            continue;
+        }
+        match merged.iter_mut().find(|(n, _)| *n == name) {
+            Some(entry) => entry.1 = url,
+            None => merged.push((name, url)),
+        }
+    }
+
+    merged
 }
 
 /// Parses the raw `ZEROCACHE_TTL_SECONDS` value into an optional TTL.
@@ -414,5 +505,119 @@ mod tests {
     fn normalize_chat_url_is_idempotent() {
         let once = normalize_chat_url("https://x.example/v1/chat/completions/");
         assert_eq!(normalize_chat_url(&once), once);
+    }
+
+    fn find<'a>(list: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        list.iter().find(|(n, _)| n == name).map(|(_, u)| u.as_str())
+    }
+
+    #[test]
+    fn chat_providers_unset_yields_exactly_the_builtins() {
+        let list = parse_chat_providers(None);
+        assert_eq!(list.len(), BUILTIN_CHAT_PROVIDERS.len());
+        assert_eq!(find(&list, "openai"), Some("https://api.openai.com/v1"));
+        assert_eq!(
+            find(&list, "gemini"),
+            Some("https://generativelanguage.googleapis.com/v1beta/openai")
+        );
+        assert_eq!(find(&list, "groq"), Some("https://api.groq.com/openai/v1"));
+    }
+
+    #[test]
+    fn chat_providers_empty_or_blank_is_treated_as_unset() {
+        assert_eq!(
+            parse_chat_providers(Some("")).len(),
+            BUILTIN_CHAT_PROVIDERS.len()
+        );
+        assert_eq!(
+            parse_chat_providers(Some("   ")).len(),
+            BUILTIN_CHAT_PROVIDERS.len()
+        );
+    }
+
+    #[test]
+    fn chat_providers_override_replaces_a_builtin_url_only() {
+        let list = parse_chat_providers(Some("openai=http://localhost:8000/v1"));
+        assert_eq!(list.len(), BUILTIN_CHAT_PROVIDERS.len());
+        assert_eq!(find(&list, "openai"), Some("http://localhost:8000/v1"));
+        assert_eq!(
+            find(&list, "gemini"),
+            Some("https://generativelanguage.googleapis.com/v1beta/openai")
+        );
+    }
+
+    #[test]
+    fn chat_providers_adds_a_new_name() {
+        let list = parse_chat_providers(Some("ollama=http://localhost:11434/v1"));
+        assert_eq!(list.len(), BUILTIN_CHAT_PROVIDERS.len() + 1);
+        assert_eq!(find(&list, "ollama"), Some("http://localhost:11434/v1"));
+    }
+
+    #[test]
+    fn chat_providers_applies_multiple_comma_separated_entries() {
+        let list = parse_chat_providers(Some(
+            "ollama=http://localhost:11434/v1,acme=https://llm.acme.internal/v1",
+        ));
+        assert_eq!(list.len(), BUILTIN_CHAT_PROVIDERS.len() + 2);
+        assert_eq!(find(&list, "ollama"), Some("http://localhost:11434/v1"));
+        assert_eq!(find(&list, "acme"), Some("https://llm.acme.internal/v1"));
+    }
+
+    #[test]
+    fn chat_providers_tolerates_whitespace_around_name_and_url() {
+        let list = parse_chat_providers(Some("  ollama =  http://localhost:11434/v1/  "));
+        assert_eq!(find(&list, "ollama"), Some("http://localhost:11434/v1"));
+    }
+
+    #[test]
+    fn chat_providers_normalizes_a_pasted_completions_url() {
+        let list = parse_chat_providers(Some(
+            "groq=https://api.groq.com/openai/v1/chat/completions",
+        ));
+        assert_eq!(find(&list, "groq"), Some("https://api.groq.com/openai/v1"));
+    }
+
+    #[test]
+    fn chat_providers_skips_an_entry_with_no_equals_and_keeps_the_rest() {
+        let list = parse_chat_providers(Some("garbage,ollama=http://x/v1"));
+        assert_eq!(list.len(), BUILTIN_CHAT_PROVIDERS.len() + 1);
+        assert_eq!(find(&list, "ollama"), Some("http://x/v1"));
+    }
+
+    #[test]
+    fn chat_providers_skips_an_illegal_name() {
+        let list = parse_chat_providers(Some("Bad Name=http://x/v1"));
+        assert_eq!(list.len(), BUILTIN_CHAT_PROVIDERS.len());
+        assert_eq!(find(&list, "bad name"), None);
+    }
+
+    #[test]
+    fn chat_providers_skips_an_empty_url() {
+        let list = parse_chat_providers(Some("ollama="));
+        assert_eq!(list.len(), BUILTIN_CHAT_PROVIDERS.len());
+        assert_eq!(find(&list, "ollama"), None);
+    }
+
+    #[test]
+    fn chat_providers_preserves_an_equals_sign_inside_a_url() {
+        let list = parse_chat_providers(Some("ollama=http://x/v1?token=abc"));
+        assert_eq!(find(&list, "ollama"), Some("http://x/v1?token=abc"));
+    }
+
+    #[test]
+    fn builtin_chat_provider_urls_are_already_normalized() {
+        for (name, url) in BUILTIN_CHAT_PROVIDERS {
+            assert!(!url.is_empty(), "{name} has an empty URL");
+            assert_eq!(
+                &normalize_chat_url(url),
+                url,
+                "{name}'s built-in URL is not in normalized form"
+            );
+            assert!(!url.ends_with('/'), "{name} URL has a trailing slash");
+            assert!(
+                !url.ends_with("/chat/completions"),
+                "{name} URL includes the /chat/completions suffix"
+            );
+        }
     }
 }
