@@ -172,6 +172,12 @@ export default function Dashboard() {
               ? `${s.rows.length} provider${s.rows.length === 1 ? "" : "s"} active.`
               : "Waiting for the first cached request."}
           </p>
+          {s && s.semanticIndexEventsApplied > 0 && (
+            <p>
+              {compact(s.semanticIndexEventsApplied)} semantic-index change-feed events applied on
+              this replica (multi-replica redis backend).
+            </p>
+          )}
         </footer>
       </div>
     </>
