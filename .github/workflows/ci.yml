@@ -73,9 +73,11 @@ jobs:
       - run: cargo fmt --check
 
   dashboard:
-    # The dashboard SPA is built ahead of time and its output (dashboard/dist)
-    # is committed so `cargo build` can embed it without Node. This job type
-    # checks it, rebuilds it, and fails if the committed dist is stale.
+    # Type-check and build the dashboard SPA so a broken change is caught here.
+    # The committed dashboard/dist (a convenience so `cargo build` works without
+    # Node) is NOT diffed against this build -- Rollup/esbuild output is not
+    # byte-reproducible across platforms, and the Docker image rebuilds the
+    # dashboard from source anyway (see Dockerfile).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -90,10 +92,3 @@ jobs:
         working-directory: dashboard
       - run: npm run build
         working-directory: dashboard
-      - name: committed dashboard/dist is up to date
-        run: |
-          if ! git diff --quiet -- dashboard/dist; then
-            echo "::error::dashboard/dist is stale -- run 'npm run build' in dashboard/ and commit the result"
-            git diff --stat -- dashboard/dist
-            exit 1
-          fi
