@@ -6,7 +6,7 @@
 mod embedder;
 mod index;
 
-pub use embedder::{SemanticError, TextEmbed};
+pub use embedder::{SemanticError, TextEmbed, TextEmbedder};
 pub use index::{ScopeKey, SearchHit, SemanticIndex};
 
 /// all-MiniLM-L6-v2 output width.
