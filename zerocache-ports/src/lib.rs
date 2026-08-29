@@ -71,6 +71,40 @@ pub trait CompletionVectorStore: Send + Sync {
     fn load_all(&self) -> Result<Vec<VectorRecord>, StoreError>;
 }
 
+/// Which side of a cross-replica single-flight this replica is on for one key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Perform the provider call, then call `complete`.
+    Leader,
+    /// A peer holds the lock; call `follow` and re-read the store.
+    Follower,
+}
+
+/// Result of one bounded `follow` wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowSignal {
+    /// The leader signalled (fill done or failed) -- re-read the store now.
+    Signalled,
+    /// `wait` elapsed with no signal.
+    WaitElapsed,
+}
+
+/// Distributed single-flight for one `CacheKey`. Synchronous: callers run it
+/// on a blocking thread, like the store traits. Every method degrades to a
+/// safe default on any internal (e.g. Redis) error -- a coordination outage
+/// falls back to per-replica behaviour, never a failed request.
+pub trait CoalescingCoordinator: Send + Sync {
+    /// `Leader` => this replica fetches and must call `complete` after.
+    /// `Follower` => await `follow`. Any error => `Leader`.
+    fn try_lead(&self, key: &CacheKey) -> Role;
+    /// Leader only: release the lock and wake followers. Call on success and
+    /// on failure. Errors are ignored (the lock TTLs out).
+    fn complete(&self, key: &CacheKey);
+    /// Follower only: block up to `wait` for the leader's signal. Any error
+    /// => `WaitElapsed`.
+    fn follow(&self, key: &CacheKey, wait: std::time::Duration) -> FollowSignal;
+}
+
 /// Token counts from a chat-completion response, used only for the
 /// tokens-saved metric on a cache hit. All zero when the provider omits a
 /// usage block or the upstream call returned a non-2xx.
@@ -240,6 +274,29 @@ mod tests {
         fn load_all(&self) -> Result<Vec<VectorRecord>, StoreError> {
             Ok(self.0.lock().unwrap().clone())
         }
+    }
+
+    #[test]
+    fn coalescing_coordinator_is_object_safe_and_noop_impl_always_leads() {
+        struct AlwaysLeads;
+        impl CoalescingCoordinator for AlwaysLeads {
+            fn try_lead(&self, _key: &CacheKey) -> Role {
+                Role::Leader
+            }
+            fn complete(&self, _key: &CacheKey) {}
+            fn follow(&self, _key: &CacheKey, _wait: std::time::Duration) -> FollowSignal {
+                FollowSignal::WaitElapsed
+            }
+        }
+
+        let c: Box<dyn CoalescingCoordinator> = Box::new(AlwaysLeads);
+        let key = CacheKey::from_bytes([5u8; 32]);
+        assert_eq!(c.try_lead(&key), Role::Leader);
+        assert_eq!(
+            c.follow(&key, std::time::Duration::from_millis(1)),
+            FollowSignal::WaitElapsed
+        );
+        c.complete(&key);
     }
 
     #[test]
