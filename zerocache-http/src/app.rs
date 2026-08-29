@@ -148,6 +148,8 @@ pub struct Metrics {
     // block, so this is the direct money-saved number.
     completion_hits: IntCounterVec,
     completion_misses: IntCounterVec,
+    // Semantic subset of completion_hits (a semantic hit bumps both).
+    completion_semantic_hits: IntCounterVec,
     completion_prompt_tokens_saved: IntCounterVec,
     completion_completion_tokens_saved: IntCounterVec,
 }
@@ -197,6 +199,14 @@ impl Metrics {
             &["provider"],
         )
         .expect("metric name/help/labels are hardcoded and valid");
+        let completion_semantic_hits = IntCounterVec::new(
+            Opts::new(
+                "zerocache_completion_semantic_hits_total",
+                "Chat-completion requests served via a semantic near-match (subset of zerocache_completion_cache_hits_total)",
+            ),
+            &["provider"],
+        )
+        .expect("metric name/help/labels are hardcoded and valid");
         let completion_prompt_tokens_saved = IntCounterVec::new(
             Opts::new(
                 "zerocache_completion_prompt_tokens_saved_total",
@@ -220,6 +230,7 @@ impl Metrics {
             &prompt_tokens_billed,
             &completion_hits,
             &completion_misses,
+            &completion_semantic_hits,
             &completion_prompt_tokens_saved,
             &completion_completion_tokens_saved,
         ] {
@@ -235,6 +246,7 @@ impl Metrics {
             prompt_tokens_billed,
             completion_hits,
             completion_misses,
+            completion_semantic_hits,
             completion_prompt_tokens_saved,
             completion_completion_tokens_saved,
         }
@@ -270,6 +282,14 @@ impl Metrics {
     /// store).
     pub(crate) fn record_completion_miss(&self, provider: &str) {
         self.completion_misses.with_label_values(&[provider]).inc();
+    }
+
+    /// A completion rescued by the semantic tier. The caller also calls
+    /// `record_completion_hit`; this counter is that total's semantic slice.
+    pub(crate) fn record_completion_semantic_hit(&self, provider: &str) {
+        self.completion_semantic_hits
+            .with_label_values(&[provider])
+            .inc();
     }
 
     /// Renders all registered metrics in Prometheus text exposition format.
@@ -992,6 +1012,22 @@ mod tests {
     use zerocache_ports::ProviderUsage;
 
     use super::*;
+
+    #[test]
+    fn record_completion_semantic_hit_increments_only_the_semantic_counter() {
+        let m = Metrics::new();
+        m.record_completion_semantic_hit("openai");
+        m.record_completion_semantic_hit("openai");
+        let dump = m.encode();
+        assert!(
+            dump.contains("zerocache_completion_semantic_hits_total{provider=\"openai\"} 2"),
+            "{dump}"
+        );
+        assert!(
+            !dump.contains("zerocache_completion_cache_hits_total{provider=\"openai\"} 2"),
+            "{dump}"
+        );
+    }
 
     struct MockStore {
         data: Mutex<StdHashMap<CacheKey, Vec<f32>>>,
