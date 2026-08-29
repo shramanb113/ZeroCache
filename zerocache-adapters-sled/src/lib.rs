@@ -2,7 +2,7 @@ use std::time::{Duration, SystemTime};
 
 use zerocache_core::CacheKey;
 use zerocache_ports::{
-    CompletionStore, CompletionVectorStore, EmbeddingStore, StoreError, VectorRecord,
+    CompletionStore, CompletionVectorStore, EmbeddingStore, StoreError, VectorChanges, VectorRecord,
 };
 
 pub struct SledStore {
@@ -121,11 +121,17 @@ impl CompletionVectorStore for SledStore {
         Ok(())
     }
 
-    fn delete(&self, exact_key: &CacheKey) -> Result<(), StoreError> {
+    fn delete(&self, exact_key: &CacheKey, _scope_hash: &[u8; 32]) -> Result<(), StoreError> {
         self.completion_vectors
             .remove(exact_key.as_bytes())
             .map_err(|e| StoreError(e.to_string()))?;
         Ok(())
+    }
+
+    // Single process: the in-memory index already sees every write directly
+    // through zerocache-http's own index.insert. Nothing to propagate.
+    fn changes_since(&self, _cursor: Option<String>) -> Result<VectorChanges, StoreError> {
+        Ok(VectorChanges::default())
     }
 
     fn load_all(&self) -> Result<Vec<VectorRecord>, StoreError> {
@@ -572,8 +578,18 @@ mod tests {
         let store = SledStore::open(&dir, None).unwrap();
         let rec = sample_record("req-2", 1);
         CompletionVectorStore::insert(&store, rec.clone()).unwrap();
-        CompletionVectorStore::delete(&store, &rec.exact_key).unwrap();
+        CompletionVectorStore::delete(&store, &rec.exact_key, &rec.scope_hash).unwrap();
         assert!(CompletionVectorStore::load_all(&store).unwrap().is_empty());
+        drop(store);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn changes_since_is_a_noop_on_sled() {
+        let dir = temp_dir();
+        let store = SledStore::open(&dir, None).unwrap();
+        let c = CompletionVectorStore::changes_since(&store, None).unwrap();
+        assert!(c.upserts.is_empty() && c.deletes.is_empty() && c.cursor.is_none());
         drop(store);
         std::fs::remove_dir_all(dir).ok();
     }

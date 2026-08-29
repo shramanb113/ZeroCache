@@ -78,7 +78,7 @@ pub async fn semantic_probe(
         })),
         None => {
             sem.index.tombstone(scope, &exact_key);
-            if let Err(e) = sem.vector_store.delete(&exact_key) {
+            if let Err(e) = sem.vector_store.delete(&exact_key, &scope) {
                 warn!("semantic: failed to drop a stale vector record: {e}");
             }
             Ok(None)
@@ -168,7 +168,7 @@ mod tests {
 
     use serde_json::json;
     use zerocache_core::{CacheKey, MatchUnit};
-    use zerocache_ports::{CompletionStore, StoreError, VectorRecord};
+    use zerocache_ports::{CompletionStore, StoreError, VectorChanges, VectorRecord};
 
     use super::*;
 
@@ -187,12 +187,15 @@ mod tests {
             self.0.lock().unwrap().push(r);
             Ok(())
         }
-        fn delete(&self, k: &CacheKey) -> Result<(), StoreError> {
+        fn delete(&self, k: &CacheKey, _scope: &[u8; 32]) -> Result<(), StoreError> {
             self.0.lock().unwrap().retain(|r| &r.exact_key != k);
             Ok(())
         }
         fn load_all(&self) -> Result<Vec<VectorRecord>, StoreError> {
             Ok(self.0.lock().unwrap().clone())
+        }
+        fn changes_since(&self, _c: Option<String>) -> Result<VectorChanges, StoreError> {
+            Ok(VectorChanges::default())
         }
     }
 
