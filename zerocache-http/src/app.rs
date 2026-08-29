@@ -128,6 +128,9 @@ pub struct AppState {
     // domain-separated keys can't collide, and independent locks keep one
     // path's traffic from contending another's.
     pub completion_in_flight: Mutex<HashMap<CacheKey, SharedCompletion>>,
+    // Semantic completion tier; None when disabled or on the redis backend.
+    #[cfg(feature = "semantic")]
+    pub semantic: Option<crate::semantic::SemanticState>,
 }
 
 // Cumulative counters since process start, in Prometheus text-exposition
@@ -149,6 +152,7 @@ pub struct Metrics {
     completion_hits: IntCounterVec,
     completion_misses: IntCounterVec,
     // Semantic subset of completion_hits (a semantic hit bumps both).
+    #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
     completion_semantic_hits: IntCounterVec,
     completion_prompt_tokens_saved: IntCounterVec,
     completion_completion_tokens_saved: IntCounterVec,
@@ -286,6 +290,7 @@ impl Metrics {
 
     /// A completion rescued by the semantic tier. The caller also calls
     /// `record_completion_hit`; this counter is that total's semantic slice.
+    #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
     pub(crate) fn record_completion_semantic_hit(&self, provider: &str) {
         self.completion_semantic_hits
             .with_label_values(&[provider])
@@ -1228,6 +1233,8 @@ mod tests {
             completion_store: Arc::new(NoopCompletionStore),
             completion_providers: StdHashMap::new(),
             completion_in_flight: Mutex::new(StdHashMap::new()),
+            #[cfg(feature = "semantic")]
+            semantic: None,
         }
     }
 

@@ -44,6 +44,13 @@ pub struct CompletionRequest<'a> {
     pub body: &'a serde_json::Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitKind {
+    Exact,
+    #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
+    Semantic,
+}
+
 pub struct CompletionOutcome {
     /// What to send back to the caller: the replayed cached response
     /// (status 200) on a hit, or the live upstream response (its real
@@ -51,6 +58,10 @@ pub struct CompletionOutcome {
     pub response: ChatCompletionResponse,
     /// True when `response` came from cache with no provider call.
     pub hit: bool,
+    /// `Some` on any hit; emitted as `X-Zerocache-Completion-Hit-Kind`.
+    pub hit_kind: Option<HitKind>,
+    /// `Some` only on a semantic hit; emitted as `X-Zerocache-Semantic-Score`.
+    pub semantic_score: Option<f32>,
 }
 
 /// Runs the completion cache flow for one request:
@@ -78,6 +89,8 @@ pub async fn complete(
         return Ok(CompletionOutcome {
             response,
             hit: false,
+            hit_kind: None,
+            semantic_score: None,
         });
     }
 
@@ -126,10 +139,81 @@ pub async fn complete(
                 usage,
             },
             hit: true,
+            hit_kind: Some(HitKind::Exact),
+            semantic_score: None,
         });
     }
 
     tracing::Span::current().record("hit", false);
+
+    #[cfg(feature = "semantic")]
+    let mut semantic_ctx: Option<(zerocache_semantic::ScopeKey, [u8; 32], Vec<f32>)> = None;
+
+    #[cfg(feature = "semantic")]
+    if let Some(sem) = &state.semantic {
+        if let Some((fuzzy_text, coarse_hash)) =
+            crate::semantic::semantic_inputs(sem.match_unit, request.body)
+        {
+            let scope = crate::semantic::scope_key(
+                &request.owner_id,
+                request.provider_name,
+                &cache_scope,
+                request.model,
+            );
+            let embedder = Arc::clone(&sem.embedder);
+            let qvec = match tokio::task::spawn_blocking(move || embedder.embed(&fuzzy_text))
+                .await
+                .expect("embed task panicked")
+            {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("semantic: embed failed, falling back to provider: {e}");
+                    None
+                }
+            };
+
+            if let Some(qvec) = qvec {
+                if let Some(hit) = crate::semantic::semantic_probe(
+                    sem,
+                    &state.completion_store,
+                    scope,
+                    coarse_hash,
+                    &qvec,
+                )
+                .await?
+                {
+                    if let Ok(record) =
+                        serde_json::from_slice::<CachedCompletion>(&hit.record_bytes)
+                    {
+                        let usage = CompletionUsage {
+                            prompt_tokens: record.prompt_tokens,
+                            completion_tokens: record.completion_tokens,
+                            total_tokens: record.total_tokens,
+                        };
+                        state
+                            .metrics
+                            .record_completion_hit(request.provider_name, &usage);
+                        state
+                            .metrics
+                            .record_completion_semantic_hit(request.provider_name);
+                        tracing::Span::current().record("hit", true);
+                        return Ok(CompletionOutcome {
+                            response: ChatCompletionResponse {
+                                status: 200,
+                                body: record.body,
+                                usage,
+                            },
+                            hit: true,
+                            hit_kind: Some(HitKind::Semantic),
+                            semantic_score: Some(hit.score),
+                        });
+                    }
+                }
+                semantic_ctx = Some((scope, coarse_hash, qvec));
+            }
+        }
+    }
+
     let response = fetch_completion_coalesced(state, &request, key).await?;
 
     if (200..300).contains(&response.status) {
@@ -145,12 +229,21 @@ pub async fn complete(
         run_store_task(move || store.put(key, bytes).map_err(AppError::Store))
             .instrument(tracing::info_span!("store_write_back"))
             .await?;
+
+        #[cfg(feature = "semantic")]
+        if let (Some(sem), Some((scope, coarse_hash, qvec))) =
+            (&state.semantic, semantic_ctx.take())
+        {
+            crate::semantic::record_vector(sem, key, scope, coarse_hash, qvec).await;
+        }
     }
 
     state.metrics.record_completion_miss(request.provider_name);
     Ok(CompletionOutcome {
         response,
         hit: false,
+        hit_kind: None,
+        semantic_score: None,
     })
 }
 
@@ -357,6 +450,8 @@ mod tests {
             completion_store: Arc::new(store),
             completion_providers: HashMap::new(),
             completion_in_flight: Mutex::new(HashMap::new()),
+            #[cfg(feature = "semantic")]
+            semantic: None,
         }
     }
 
@@ -638,6 +733,205 @@ mod tests {
         );
         for out in &outs {
             assert_eq!(out.response.body, json!({"x": 1}));
+        }
+    }
+
+    #[cfg(feature = "semantic")]
+    mod semantic {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use zerocache_core::MatchUnit;
+        use zerocache_ports::VectorRecord;
+        use zerocache_semantic::{SemanticIndex, TextEmbed};
+
+        use super::*;
+        use crate::semantic::SemanticState;
+
+        struct ConstEmbedder(AtomicUsize);
+        impl TextEmbed for ConstEmbedder {
+            fn embed(&self, _t: &str) -> Result<Vec<f32>, zerocache_semantic::SemanticError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let mut v = vec![0f32; zerocache_semantic::EMBEDDING_DIM];
+                v[0] = 1.0;
+                Ok(v)
+            }
+        }
+
+        struct FailEmbedder;
+        impl TextEmbed for FailEmbedder {
+            fn embed(&self, _t: &str) -> Result<Vec<f32>, zerocache_semantic::SemanticError> {
+                Err(zerocache_semantic::SemanticError("boom".into()))
+            }
+        }
+
+        struct MemVectorStore(Mutex<Vec<VectorRecord>>);
+        impl zerocache_ports::CompletionVectorStore for MemVectorStore {
+            fn insert(&self, r: VectorRecord) -> Result<(), StoreError> {
+                self.0.lock().unwrap().push(r);
+                Ok(())
+            }
+            fn delete(&self, k: &CacheKey) -> Result<(), StoreError> {
+                self.0.lock().unwrap().retain(|r| &r.exact_key != k);
+                Ok(())
+            }
+            fn load_all(&self) -> Result<Vec<VectorRecord>, StoreError> {
+                Ok(self.0.lock().unwrap().clone())
+            }
+        }
+
+        fn state_semantic(
+            store: MockCompletionStore,
+            embedder: Arc<dyn TextEmbed>,
+            threshold: f32,
+        ) -> AppState {
+            AppState {
+                store: Arc::new(NoopEmbeddingStore),
+                providers: HashMap::new(),
+                image_providers: HashMap::new(),
+                metrics: Metrics::new(),
+                in_flight: Mutex::new(HashMap::new()),
+                image_in_flight: Mutex::new(HashMap::new()),
+                completion_store: Arc::new(store),
+                completion_providers: HashMap::new(),
+                completion_in_flight: Mutex::new(HashMap::new()),
+                semantic: Some(SemanticState {
+                    embedder,
+                    index: Arc::new(SemanticIndex::new()),
+                    vector_store: Arc::new(MemVectorStore(Mutex::new(Vec::new()))),
+                    threshold,
+                    match_unit: MatchUnit::LastUser,
+                }),
+            }
+        }
+
+        fn body(user: &str, max_tokens: u32) -> serde_json::Value {
+            json!({"model":"gpt-4o","messages":[
+                {"role":"system","content":"support bot"},
+                {"role":"user","content": user}
+            ],"temperature":0,"max_tokens": max_tokens})
+        }
+
+        fn sreq<'a>(
+            p: &Arc<MockChatProvider>,
+            owner: [u8; 32],
+            body: &'a serde_json::Value,
+        ) -> CompletionRequest<'a> {
+            CompletionRequest {
+                provider: Arc::clone(p) as Arc<dyn ChatCompletionProvider>,
+                provider_name: "openai",
+                api_key: "sk-caller",
+                owner_id: owner,
+                model: "gpt-4o",
+                body,
+            }
+        }
+
+        #[tokio::test]
+        async fn a_paraphrase_with_the_same_coarse_key_is_a_semantic_hit() {
+            let provider = Arc::new(MockChatProvider::ok(
+                json!({"choices":[{"message":{"content":"A"}}]}),
+                CompletionUsage {
+                    prompt_tokens: 30,
+                    completion_tokens: 6,
+                    total_tokens: 36,
+                },
+            ));
+            let emb = Arc::new(ConstEmbedder(AtomicUsize::new(0)));
+            let st = state_semantic(MockCompletionStore::empty(), emb, 0.97);
+
+            let first = body("how do I reset my password?", 256);
+            let o1 = complete(&st, sreq(&provider, OWNER_A, &first)).await.unwrap();
+            assert!(!o1.hit);
+            assert_eq!(provider.call_count(), 1);
+
+            let second = body("how can i reset the password", 256);
+            let o2 = complete(&st, sreq(&provider, OWNER_A, &second)).await.unwrap();
+            assert!(o2.hit, "a paraphrase must be a semantic hit");
+            assert_eq!(o2.hit_kind, Some(HitKind::Semantic));
+            assert!(o2.semantic_score.unwrap() > 0.99);
+            assert_eq!(provider.call_count(), 1);
+            assert_eq!(o2.response.body, json!({"choices":[{"message":{"content":"A"}}]}));
+
+            let dump = st.metrics.encode();
+            assert!(
+                dump.contains("zerocache_completion_semantic_hits_total{provider=\"openai\"} 1"),
+                "{dump}"
+            );
+            assert!(
+                dump.contains(
+                    "zerocache_completion_prompt_tokens_saved_total{provider=\"openai\"} 30"
+                ),
+                "{dump}"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_exact_hit_never_touches_the_embedder() {
+            let provider = Arc::new(MockChatProvider::ok(
+                json!({"x": 1}),
+                CompletionUsage::default(),
+            ));
+            let emb = Arc::new(ConstEmbedder(AtomicUsize::new(0)));
+            let calls = emb.clone();
+            let st = state_semantic(MockCompletionStore::empty(), emb, 0.97);
+            let b = body("identical", 256);
+            complete(&st, sreq(&provider, OWNER_A, &b)).await.unwrap();
+            let after_miss = calls.0.load(Ordering::SeqCst);
+            complete(&st, sreq(&provider, OWNER_A, &b)).await.unwrap();
+            assert_eq!(calls.0.load(Ordering::SeqCst), after_miss);
+        }
+
+        #[tokio::test]
+        async fn a_different_coarse_key_is_not_a_semantic_hit() {
+            let provider = Arc::new(MockChatProvider::ok(
+                json!({"x": 1}),
+                CompletionUsage::default(),
+            ));
+            let emb = Arc::new(ConstEmbedder(AtomicUsize::new(0)));
+            let st = state_semantic(MockCompletionStore::empty(), emb, 0.97);
+            complete(&st, sreq(&provider, OWNER_A, &body("q one", 256)))
+                .await
+                .unwrap();
+            let o = complete(&st, sreq(&provider, OWNER_A, &body("q two", 512)))
+                .await
+                .unwrap();
+            assert!(!o.hit);
+            assert_eq!(provider.call_count(), 2);
+        }
+
+        #[tokio::test]
+        async fn an_embed_failure_falls_back_to_the_provider() {
+            let provider = Arc::new(MockChatProvider::ok(
+                json!({"x": 1}),
+                CompletionUsage::default(),
+            ));
+            let st = state_semantic(MockCompletionStore::empty(), Arc::new(FailEmbedder), 0.97);
+            complete(&st, sreq(&provider, OWNER_A, &body("a", 256)))
+                .await
+                .unwrap();
+            let o = complete(&st, sreq(&provider, OWNER_A, &body("b", 256)))
+                .await
+                .unwrap();
+            assert!(!o.hit);
+            assert_eq!(provider.call_count(), 2);
+        }
+
+        #[tokio::test]
+        async fn below_threshold_is_not_a_hit() {
+            let provider = Arc::new(MockChatProvider::ok(
+                json!({"x": 1}),
+                CompletionUsage::default(),
+            ));
+            let emb = Arc::new(ConstEmbedder(AtomicUsize::new(0)));
+            let st = state_semantic(MockCompletionStore::empty(), emb, 1.0001);
+            complete(&st, sreq(&provider, OWNER_A, &body("a", 256)))
+                .await
+                .unwrap();
+            let o = complete(&st, sreq(&provider, OWNER_A, &body("b", 256)))
+                .await
+                .unwrap();
+            assert!(!o.hit);
+            assert_eq!(provider.call_count(), 2);
         }
     }
 }

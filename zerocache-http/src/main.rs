@@ -58,10 +58,21 @@ async fn main() {
     log_overridden_base_urls(&config);
     log_chat_providers(&config);
 
-    // One concrete store instance, exposed as two trait objects: the
-    // embedding path and the completion path (crate::completion) share the
+    #[cfg(not(feature = "semantic"))]
+    if config.semantic_enabled {
+        tracing::info!(
+            "ZEROCACHE_SEMANTIC is set but this binary was built without the `semantic` feature -- ignoring"
+        );
+    }
+
+    // One concrete store instance, exposed as multiple trait objects: the
+    // embedding, completion, and (sled only) vector-store paths all share the
     // same sled DB / redis pool -- opening a second handle to the same sled
     // directory would fail its exclusive lock.
+    #[cfg(feature = "semantic")]
+    let mut completion_vector_store: Option<
+        Arc<dyn zerocache_ports::CompletionVectorStore>,
+    > = None;
     let (store, completion_store): (Arc<dyn EmbeddingStore>, Arc<dyn CompletionStore>) =
         match config.storage_backend {
             StorageBackend::Sled => {
@@ -69,6 +80,12 @@ async fn main() {
                     SledStore::open(&config.storage_path, config.ttl)
                         .expect("failed to open sled store"),
                 );
+                #[cfg(feature = "semantic")]
+                {
+                    completion_vector_store = Some(
+                        Arc::clone(&sled) as Arc<dyn zerocache_ports::CompletionVectorStore>
+                    );
+                }
                 (
                     Arc::clone(&sled) as Arc<dyn EmbeddingStore>,
                     sled as Arc<dyn CompletionStore>,
@@ -176,6 +193,25 @@ async fn main() {
         );
     }
 
+    #[cfg(feature = "semantic")]
+    let semantic = match completion_vector_store {
+        Some(vs) => {
+            let s = semantic::build_semantic_state(&config, vs);
+            if let Some(ref st) = s {
+                semantic::rebuild_index(st);
+            }
+            s
+        }
+        None => {
+            if config.semantic_enabled {
+                tracing::warn!(
+                    "ZEROCACHE_SEMANTIC is enabled but the storage backend is redis -- the semantic completion tier is unavailable in v1; running exact-match only"
+                );
+            }
+            None
+        }
+    };
+
     let state = Arc::new(AppState {
         store,
         providers,
@@ -186,6 +222,8 @@ async fn main() {
         completion_store,
         completion_providers,
         completion_in_flight: std::sync::Mutex::new(HashMap::new()),
+        #[cfg(feature = "semantic")]
+        semantic,
     });
 
     let app = Router::new()
@@ -768,6 +806,24 @@ async fn chat_completions_handler(
             .parse()
             .expect("static ascii is a valid header value"),
     );
+    if let Some(kind) = outcome.hit_kind {
+        response.headers_mut().insert(
+            "x-zerocache-completion-hit-kind",
+            match kind {
+                completion::HitKind::Exact => "exact",
+                completion::HitKind::Semantic => "semantic",
+            }
+            .parse()
+            .expect("static ascii is a valid header value"),
+        );
+    }
+    if let Some(score) = outcome.semantic_score {
+        if let Ok(v) = format!("{score:.3}").parse() {
+            response
+                .headers_mut()
+                .insert("x-zerocache-semantic-score", v);
+        }
+    }
     Ok(response)
 }
 
