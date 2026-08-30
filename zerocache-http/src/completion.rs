@@ -569,6 +569,7 @@ mod tests {
             image_in_flight: Mutex::new(HashMap::new()),
             completion_store: Arc::new(store),
             completion_providers: HashMap::new(),
+            completion_stream_providers: HashMap::new(),
             completion_in_flight: Mutex::new(HashMap::new()),
             coordinator,
             #[cfg(feature = "semantic")]
@@ -593,6 +594,21 @@ mod tests {
 
     fn eligible_body() -> serde_json::Value {
         json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}], "temperature": 0})
+    }
+
+    #[tokio::test]
+    async fn a_non_cacheable_streaming_request_is_piped_through_untouched() {
+        // temperature 0.7 => not cacheable => the handler must passthrough,
+        // storing nothing. The end-to-end passthrough assertion lives in the
+        // main.rs `stream_passthrough` test; here we pin the cacheability-gate
+        // classification the handler branch relies on.
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.7,
+            "stream": true
+        });
+        assert!(!zerocache_core::completion_request_is_cacheable(&body));
     }
 
     #[tokio::test]
@@ -1026,6 +1042,7 @@ mod tests {
                 image_in_flight: Mutex::new(HashMap::new()),
                 completion_store: Arc::new(store),
                 completion_providers: HashMap::new(),
+                completion_stream_providers: HashMap::new(),
                 completion_in_flight: Mutex::new(HashMap::new()),
                 coordinator: Arc::new(crate::coalesce::NoopCoordinator),
                 semantic: Some(SemanticState {

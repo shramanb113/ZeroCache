@@ -213,10 +213,19 @@ async fn main() {
         String,
         Arc<dyn zerocache_ports::ChatCompletionProvider>,
     > = HashMap::new();
+    let mut completion_stream_providers: HashMap<
+        String,
+        Arc<dyn zerocache_ports::StreamingChatCompletionProvider>,
+    > = HashMap::new();
     for (name, url) in &config.chat_providers {
+        let adapter = Arc::new(OpenAiWireChatProvider::new(url.clone()));
         completion_providers.insert(
             name.clone(),
-            Arc::new(OpenAiWireChatProvider::new(url.clone())),
+            adapter.clone() as Arc<dyn zerocache_ports::ChatCompletionProvider>,
+        );
+        completion_stream_providers.insert(
+            name.clone(),
+            adapter as Arc<dyn zerocache_ports::StreamingChatCompletionProvider>,
         );
     }
 
@@ -244,6 +253,7 @@ async fn main() {
         image_in_flight: std::sync::Mutex::new(HashMap::new()),
         completion_store,
         completion_providers,
+        completion_stream_providers,
         completion_in_flight: std::sync::Mutex::new(HashMap::new()),
         coordinator,
         #[cfg(feature = "semantic")]
@@ -801,6 +811,35 @@ async fn chat_completions_handler(
         })?
         .to_string();
 
+    let wants_stream = request_body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if wants_stream {
+        let stream_provider = state
+            .completion_stream_providers
+            .get(&provider_name)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!("unknown provider '{provider_name}'"),
+                    }),
+                )
+            })?;
+
+        if !zerocache_core::completion_request_is_cacheable(&request_body) {
+            return stream_passthrough(stream_provider, api_key, request_body).await;
+        }
+
+        // Cacheable streaming request -> handled by complete_streaming (Task 6).
+        // Until Task 6 lands, fall through to passthrough so nothing is
+        // mis-cached (today's behaviour mis-caches SSE as JSON).
+        return stream_passthrough(stream_provider, api_key, request_body).await;
+    }
+
     let owner_id = derive_owner_id(&api_key);
 
     let outcome = complete(
@@ -860,6 +899,45 @@ async fn chat_completions_handler(
     Ok(response)
 }
 
+/// Pipe an upstream SSE stream straight to the client with no caching, no
+/// buffering, no metrics -- for a `stream:true` request that is not
+/// deterministic enough to cache.
+async fn stream_passthrough(
+    provider: Arc<dyn zerocache_ports::StreamingChatCompletionProvider>,
+    api_key: String,
+    body: serde_json::Value,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let (status, upstream) = provider
+        .chat_completion_stream(&api_key, &body)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?;
+
+    let mapped = futures::StreamExt::map(upstream, |item| {
+        item.map(axum::body::Bytes::from)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    });
+    let mut response = Response::builder()
+        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
+        .body(axum::body::Body::from_stream(mapped))
+        .expect("building a streaming response with a valid status cannot fail");
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        "text/event-stream".parse().expect("static ascii"),
+    );
+    response.headers_mut().insert(
+        "x-zerocache-completion-hit",
+        "false".parse().expect("static ascii"),
+    );
+    Ok(response)
+}
+
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (
         [(
@@ -914,5 +992,69 @@ async fn ready_handler(State(state): State<Arc<AppState>>) -> StatusCode {
     match check_store_readiness(&state).await {
         Ok(()) => StatusCode::OK,
         Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stream_passthrough_forwards_upstream_bytes_and_status() {
+        use futures::StreamExt;
+        struct Mock;
+        #[async_trait::async_trait]
+        impl zerocache_ports::StreamingChatCompletionProvider for Mock {
+            async fn chat_completion_stream(
+                &self,
+                _k: &str,
+                _r: &serde_json::Value,
+            ) -> Result<(u16, zerocache_ports::SseByteStream), zerocache_ports::ProviderError>
+            {
+                let s = futures::stream::iter(vec![
+                    Ok(b"data: {\"x\":1}\n\n".to_vec()),
+                    Ok(b"data: [DONE]\n\n".to_vec()),
+                ]);
+                Ok((200, Box::pin(s)))
+            }
+            fn version(&self) -> &'static str {
+                "mock"
+            }
+            fn cache_scope(&self, _m: &str) -> Result<String, zerocache_ports::ProviderError> {
+                Ok("s".into())
+            }
+        }
+
+        // `ErrorResponse` is not `Debug`, so `.unwrap()` on the error arm
+        // won't compile -- match instead.
+        let resp = match stream_passthrough(
+            std::sync::Arc::new(Mock),
+            "sk".to_string(),
+            serde_json::json!({"model": "m", "stream": true, "temperature": 0.9}),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err((status, _)) => panic!("stream_passthrough errored with {status}"),
+        };
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+        assert_eq!(
+            resp.headers().get("x-zerocache-completion-hit").unwrap(),
+            "false"
+        );
+        let mut body = resp.into_body().into_data_stream();
+        let mut buf = Vec::new();
+        while let Some(chunk) = body.next().await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "data: {\"x\":1}\n\ndata: [DONE]\n\n"
+        );
     }
 }

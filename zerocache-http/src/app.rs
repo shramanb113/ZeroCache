@@ -123,6 +123,11 @@ pub struct AppState {
     // OpenAI-shaped chat adapter is registered today; an unknown or
     // unregistered provider 404s straight out of a missing map key.
     pub completion_providers: HashMap<String, Arc<dyn ChatCompletionProvider>>,
+    /// The streaming counterpart to `completion_providers`, populated from the
+    /// same `OpenAiWireChatProvider` structs (every OpenAI-wire endpoint
+    /// supports SSE). A `stream:true` request for a name absent here 404s.
+    pub completion_stream_providers:
+        HashMap<String, Arc<dyn zerocache_ports::StreamingChatCompletionProvider>>,
     // The completion counterpart to `in_flight`: concurrent requests missing
     // on the exact same completion CacheKey share one upstream call. A
     // separate map for the same reason `image_in_flight` is separate --
@@ -1482,6 +1487,7 @@ mod tests {
             image_in_flight: Mutex::new(StdHashMap::new()),
             completion_store: Arc::new(NoopCompletionStore),
             completion_providers: StdHashMap::new(),
+            completion_stream_providers: StdHashMap::new(),
             completion_in_flight: Mutex::new(StdHashMap::new()),
             coordinator: Arc::new(crate::coalesce::NoopCoordinator),
             #[cfg(feature = "semantic")]
