@@ -7,6 +7,7 @@ mod image;
 mod otel;
 #[cfg(feature = "semantic")]
 mod semantic;
+mod sse;
 mod wire;
 
 use std::collections::HashMap;
