@@ -4,7 +4,10 @@ use redis::Commands;
 use zerocache_core::CacheKey;
 use zerocache_ports::{CompletionStore, EmbeddingStore, StoreError};
 
+mod coordinator;
 mod vector;
+
+pub use coordinator::RedisCoordinator;
 
 /// Approximate `XADD MAXLEN ~` cap on the semantic-index event stream. A
 /// safety ceiling, not the expected size -- when ZEROCACHE_TTL_SECONDS is
