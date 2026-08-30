@@ -34,6 +34,11 @@ struct CachedCompletion {
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
+    /// Verbatim upstream SSE payload (minus a withheld injected usage chunk).
+    /// `None` for an entry filled by a non-streaming miss -- a `stream:true`
+    /// hit on such an entry re-chunks `body` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    raw_sse: Option<Vec<u8>>,
 }
 
 fn encode_cached(response: &ChatCompletionResponse) -> Vec<u8> {
@@ -42,6 +47,7 @@ fn encode_cached(response: &ChatCompletionResponse) -> Vec<u8> {
         prompt_tokens: response.usage.prompt_tokens,
         completion_tokens: response.usage.completion_tokens,
         total_tokens: response.usage.total_tokens,
+        raw_sse: None,
     };
     serde_json::to_vec(&record)
         .expect("a CachedCompletion built from a serde_json::Value always re-serializes")
@@ -144,7 +150,7 @@ pub async fn complete(
         };
         state
             .metrics
-            .record_completion_hit(request.provider_name, &usage);
+            .record_completion_hit(request.provider_name, false, &usage);
         tracing::Span::current().record("hit", true);
         return Ok(CompletionOutcome {
             response: ChatCompletionResponse {
@@ -206,10 +212,10 @@ pub async fn complete(
                         };
                         state
                             .metrics
-                            .record_completion_hit(request.provider_name, &usage);
+                            .record_completion_hit(request.provider_name, false, &usage);
                         state
                             .metrics
-                            .record_completion_semantic_hit(request.provider_name);
+                            .record_completion_semantic_hit(request.provider_name, false);
                         tracing::Span::current().record("hit", true);
                         return Ok(CompletionOutcome {
                             response: ChatCompletionResponse {
@@ -235,7 +241,7 @@ pub async fn complete(
         // hit, just very fresh. Record tokens saved; do not re-store.
         state
             .metrics
-            .record_completion_hit(request.provider_name, &response.usage);
+            .record_completion_hit(request.provider_name, false, &response.usage);
         state
             .metrics
             .record_cross_replica_coalesced(request.provider_name, "completion");
@@ -263,7 +269,9 @@ pub async fn complete(
         }
     }
 
-    state.metrics.record_completion_miss(request.provider_name);
+    state
+        .metrics
+        .record_completion_miss(request.provider_name, false);
     Ok(CompletionOutcome {
         response,
         hit: false,
@@ -415,6 +423,17 @@ mod tests {
 
     use super::*;
     use crate::app::Metrics;
+
+    #[test]
+    fn a_pre_streaming_record_without_raw_sse_still_deserializes() {
+        let legacy = serde_json::json!({
+            "body": {"choices": []}, "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3
+        });
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        let rec: CachedCompletion = serde_json::from_slice(&bytes).unwrap();
+        assert!(rec.raw_sse.is_none());
+        assert_eq!(rec.total_tokens, 3);
+    }
 
     struct MockCompletionStore {
         data: Mutex<HashMap<CacheKey, Vec<u8>>>,
@@ -772,20 +791,26 @@ mod tests {
 
         let dump = st.metrics.encode();
         assert!(
-            dump.contains("zerocache_completion_cache_hits_total{provider=\"openai\"} 1"),
-            "{dump}"
-        );
-        assert!(
-            dump.contains("zerocache_completion_cache_misses_total{provider=\"openai\"} 1"),
-            "{dump}"
-        );
-        assert!(
-            dump.contains("zerocache_completion_prompt_tokens_saved_total{provider=\"openai\"} 50"),
+            dump.contains(
+                "zerocache_completion_cache_hits_total{provider=\"openai\",stream=\"false\"} 1"
+            ),
             "{dump}"
         );
         assert!(
             dump.contains(
-                "zerocache_completion_completion_tokens_saved_total{provider=\"openai\"} 20"
+                "zerocache_completion_cache_misses_total{provider=\"openai\",stream=\"false\"} 1"
+            ),
+            "{dump}"
+        );
+        assert!(
+            dump.contains(
+                "zerocache_completion_prompt_tokens_saved_total{provider=\"openai\",stream=\"false\"} 50"
+            ),
+            "{dump}"
+        );
+        assert!(
+            dump.contains(
+                "zerocache_completion_completion_tokens_saved_total{provider=\"openai\",stream=\"false\"} 20"
             ),
             "{dump}"
         );
@@ -910,7 +935,9 @@ mod tests {
             "{dump}"
         );
         assert!(
-            dump.contains("zerocache_completion_cache_hits_total{provider=\"openai\"} 1"),
+            dump.contains(
+                "zerocache_completion_cache_hits_total{provider=\"openai\",stream=\"false\"} 1"
+            ),
             "{dump}"
         );
     }
@@ -1068,12 +1095,14 @@ mod tests {
 
             let dump = st.metrics.encode();
             assert!(
-                dump.contains("zerocache_completion_semantic_hits_total{provider=\"openai\"} 1"),
+                dump.contains(
+                    "zerocache_completion_semantic_hits_total{provider=\"openai\",stream=\"false\"} 1"
+                ),
                 "{dump}"
             );
             assert!(
                 dump.contains(
-                    "zerocache_completion_prompt_tokens_saved_total{provider=\"openai\"} 30"
+                    "zerocache_completion_prompt_tokens_saved_total{provider=\"openai\",stream=\"false\"} 30"
                 ),
                 "{dump}"
             );

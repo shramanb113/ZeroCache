@@ -201,7 +201,7 @@ impl Metrics {
                 "zerocache_completion_cache_hits_total",
                 "Total chat-completion requests served from cache without a provider call",
             ),
-            &["provider"],
+            &["provider", "stream"],
         )
         .expect("metric name/help/labels are hardcoded and valid");
         let completion_misses = IntCounterVec::new(
@@ -209,7 +209,7 @@ impl Metrics {
                 "zerocache_completion_cache_misses_total",
                 "Total chat-completion requests that required a provider call",
             ),
-            &["provider"],
+            &["provider", "stream"],
         )
         .expect("metric name/help/labels are hardcoded and valid");
         let completion_semantic_hits = IntCounterVec::new(
@@ -217,7 +217,7 @@ impl Metrics {
                 "zerocache_completion_semantic_hits_total",
                 "Chat-completion requests served via a semantic near-match (subset of zerocache_completion_cache_hits_total)",
             ),
-            &["provider"],
+            &["provider", "stream"],
         )
         .expect("metric name/help/labels are hardcoded and valid");
         let completion_prompt_tokens_saved = IntCounterVec::new(
@@ -225,7 +225,7 @@ impl Metrics {
                 "zerocache_completion_prompt_tokens_saved_total",
                 "Prompt tokens not billed by the provider because a completion was served from cache",
             ),
-            &["provider"],
+            &["provider", "stream"],
         )
         .expect("metric name/help/labels are hardcoded and valid");
         let completion_completion_tokens_saved = IntCounterVec::new(
@@ -233,7 +233,7 @@ impl Metrics {
                 "zerocache_completion_completion_tokens_saved_total",
                 "Completion tokens not billed by the provider because a completion was served from cache",
             ),
-            &["provider"],
+            &["provider", "stream"],
         )
         .expect("metric name/help/labels are hardcoded and valid");
         let cross_replica_coalesced = IntCounterVec::new(
@@ -301,29 +301,39 @@ impl Metrics {
     /// A completion served from cache: one hit, plus the prompt/completion
     /// tokens the caller was not billed for (taken from the stored
     /// response's own usage block).
-    pub(crate) fn record_completion_hit(&self, provider: &str, usage: &CompletionUsage) {
-        self.completion_hits.with_label_values(&[provider]).inc();
+    pub(crate) fn record_completion_hit(
+        &self,
+        provider: &str,
+        stream: bool,
+        usage: &CompletionUsage,
+    ) {
+        let s = if stream { "true" } else { "false" };
+        self.completion_hits.with_label_values(&[provider, s]).inc();
         self.completion_prompt_tokens_saved
-            .with_label_values(&[provider])
+            .with_label_values(&[provider, s])
             .inc_by(usage.prompt_tokens as u64);
         self.completion_completion_tokens_saved
-            .with_label_values(&[provider])
+            .with_label_values(&[provider, s])
             .inc_by(usage.completion_tokens as u64);
     }
 
     /// A completion that required a provider call (including one that
     /// piggybacked on a coalesced in-flight fetch -- it still wasn't in the
     /// store).
-    pub(crate) fn record_completion_miss(&self, provider: &str) {
-        self.completion_misses.with_label_values(&[provider]).inc();
+    pub(crate) fn record_completion_miss(&self, provider: &str, stream: bool) {
+        let s = if stream { "true" } else { "false" };
+        self.completion_misses
+            .with_label_values(&[provider, s])
+            .inc();
     }
 
     /// A completion rescued by the semantic tier. The caller also calls
     /// `record_completion_hit`; this counter is that total's semantic slice.
     #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
-    pub(crate) fn record_completion_semantic_hit(&self, provider: &str) {
+    pub(crate) fn record_completion_semantic_hit(&self, provider: &str, stream: bool) {
+        let s = if stream { "true" } else { "false" };
         self.completion_semantic_hits
-            .with_label_values(&[provider])
+            .with_label_values(&[provider, s])
             .inc();
     }
 
@@ -1200,15 +1210,60 @@ mod tests {
     #[test]
     fn record_completion_semantic_hit_increments_only_the_semantic_counter() {
         let m = Metrics::new();
-        m.record_completion_semantic_hit("openai");
-        m.record_completion_semantic_hit("openai");
+        m.record_completion_semantic_hit("openai", false);
+        m.record_completion_semantic_hit("openai", false);
         let dump = m.encode();
         assert!(
-            dump.contains("zerocache_completion_semantic_hits_total{provider=\"openai\"} 2"),
+            dump.contains(
+                "zerocache_completion_semantic_hits_total{provider=\"openai\",stream=\"false\"} 2"
+            ),
             "{dump}"
         );
         assert!(
-            !dump.contains("zerocache_completion_cache_hits_total{provider=\"openai\"} 2"),
+            !dump.contains(
+                "zerocache_completion_cache_hits_total{provider=\"openai\",stream=\"false\"} 2"
+            ),
+            "{dump}"
+        );
+    }
+
+    #[test]
+    fn completion_metric_methods_carry_a_stream_label() {
+        let m = Metrics::new();
+        m.record_completion_hit(
+            "openai",
+            true,
+            &CompletionUsage {
+                prompt_tokens: 4,
+                completion_tokens: 2,
+                total_tokens: 6,
+            },
+        );
+        m.record_completion_miss("openai", false);
+        m.record_completion_semantic_hit("openai", true);
+        let dump = m.encode();
+        assert!(
+            dump.contains(
+                "zerocache_completion_cache_hits_total{provider=\"openai\",stream=\"true\"} 1"
+            ),
+            "{dump}"
+        );
+        assert!(
+            dump.contains(
+                "zerocache_completion_cache_misses_total{provider=\"openai\",stream=\"false\"} 1"
+            ),
+            "{dump}"
+        );
+        assert!(
+            dump.contains(
+                "zerocache_completion_semantic_hits_total{provider=\"openai\",stream=\"true\"} 1"
+            ),
+            "{dump}"
+        );
+        assert!(
+            dump.contains(
+                "zerocache_completion_prompt_tokens_saved_total{provider=\"openai\",stream=\"true\"} 4"
+            ),
             "{dump}"
         );
     }
