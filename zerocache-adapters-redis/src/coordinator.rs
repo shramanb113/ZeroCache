@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zerocache_core::CacheKey;
 use zerocache_ports::{CoalescingCoordinator, FollowSignal, Role, StoreError};
@@ -10,20 +12,43 @@ const DONE_PREFIX: &[u8] = b"zerocache:coalesce:done:";
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 // Coarse per-coordinator log rate limit so a Redis outage can't flood logs.
 const WARN_INTERVAL_MS: u64 = 10_000;
+// Followers with no `follow` call for this long have their slot swept.
+const SLOT_TTL: Duration = Duration::from_secs(90);
+
+/// One waiter rendezvous for a key. The flag flips true when a `done:<key>`
+/// message arrives (from any replica, ours included) and stays set until the
+/// `SLOT_TTL` sweep drops the slot -- a later `follow` for the same key then
+/// returns `Signalled` at once, which is harmless: the caller only re-reads
+/// the store and exits on the hit or its own deadline.
+struct KeySlot {
+    lock: Mutex<bool>,
+    cv: Condvar,
+    last_used: Mutex<Instant>,
+}
+
+impl KeySlot {
+    fn new() -> Self {
+        Self {
+            lock: Mutex::new(false),
+            cv: Condvar::new(),
+            last_used: Mutex::new(Instant::now()),
+        }
+    }
+}
+
+type SlotMap = Arc<Mutex<HashMap<CacheKey, Arc<KeySlot>>>>;
 
 /// Redis-backed distributed single-flight. A `SET NX PX` lock elects one
 /// leader per key; a `PUBLISH` on release wakes followers, backed up by the
-/// caller's own periodic store re-read (see crate::coalesce). All Redis I/O
-/// is synchronous; the caller runs this on a blocking thread.
+/// caller's own periodic store re-read (see the coalescing layer in
+/// zerocache-http). All Redis I/O is synchronous; the caller runs this on a
+/// blocking thread.
 pub struct RedisCoordinator {
     pool: r2d2::Pool<redis::Client>,
-    // used by the Task 9 pub/sub reader thread
-    #[expect(dead_code)]
-    client: redis::Client,
     replica_id: Vec<u8>,
     lock_ttl: Duration,
     last_warn_ms: AtomicU64,
-    // Task 9 adds: slots: Arc<Mutex<HashMap<CacheKey, Arc<KeySlot>>>>,
+    slots: SlotMap,
 }
 
 fn lock_key(key: &CacheKey) -> Vec<u8> {
@@ -40,6 +65,67 @@ fn new_replica_id() -> Vec<u8> {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{}-{}", std::process::id(), nanos).into_bytes()
+}
+
+/// Detached thread: psubscribe `done:*` forever, reconnecting on any error.
+fn spawn_pubsub_reader(client: redis::Client, slots: SlotMap) {
+    std::thread::Builder::new()
+        .name("zerocache-coalesce-pubsub".into())
+        .spawn(move || {
+            // Single-threaded loop; a plain local throttles the reconnect warn.
+            let mut last_warn: Option<Instant> = None;
+            loop {
+                match run_pubsub_reader(&client, &slots) {
+                    Ok(()) => {} // unreachable: the inner loop only exits via Err
+                    Err(e) => {
+                        if last_warn
+                            .is_none_or(|t| t.elapsed().as_millis() as u64 >= WARN_INTERVAL_MS)
+                        {
+                            tracing::warn!(
+                                "coalesce pub/sub reader dropped ({e}); reconnecting in 1s"
+                            );
+                            last_warn = Some(Instant::now());
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn coalesce pub/sub reader thread");
+}
+
+/// Blocks on `done:*` messages, flipping the matching key's slot flag and
+/// waking its condvar. Returns only on a Redis error, prompting a reconnect.
+fn run_pubsub_reader(client: &redis::Client, slots: &SlotMap) -> Result<(), StoreError> {
+    let mut conn = client
+        .get_connection()
+        .map_err(|e| StoreError(e.to_string()))?;
+    let mut pubsub = conn.as_pubsub();
+    let mut pattern = DONE_PREFIX.to_vec();
+    pattern.push(b'*');
+    pubsub
+        .psubscribe(pattern)
+        .map_err(|e| StoreError(e.to_string()))?;
+    loop {
+        let msg = pubsub
+            .get_message()
+            .map_err(|e| StoreError(e.to_string()))?;
+        // Channel is DONE_PREFIX + 32 raw key bytes -- not necessarily UTF-8.
+        let channel: Vec<u8> = match msg.get_channel() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if channel.len() != DONE_PREFIX.len() + 32 || &channel[..DONE_PREFIX.len()] != DONE_PREFIX {
+            continue;
+        }
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(&channel[DONE_PREFIX.len()..]);
+        let key = CacheKey::from_bytes(raw);
+        if let Some(slot) = slots.lock().unwrap().get(&key).cloned() {
+            *slot.lock.lock().unwrap() = true;
+            slot.cv.notify_all();
+        }
+    }
 }
 
 impl RedisCoordinator {
@@ -61,13 +147,27 @@ impl RedisCoordinator {
             .max_size(4)
             .build(client.clone())
             .map_err(|e| StoreError(e.to_string()))?;
+        let slots: SlotMap = Arc::new(Mutex::new(HashMap::new()));
+        // The reader owns its own client clone; nothing else needs a raw one.
+        spawn_pubsub_reader(client, Arc::clone(&slots));
         Ok(Self {
             pool,
-            client,
             replica_id: new_replica_id(),
             lock_ttl,
             last_warn_ms: AtomicU64::new(0),
+            slots,
         })
+    }
+
+    /// Get-or-create this key's slot, sweeping entries no `follow` has touched
+    /// in `SLOT_TTL`.
+    fn slot_for(&self, key: &CacheKey) -> Arc<KeySlot> {
+        let mut map = self.slots.lock().unwrap();
+        let now = Instant::now();
+        map.retain(|_, s| now.duration_since(*s.last_used.lock().unwrap()) < SLOT_TTL);
+        let slot = Arc::clone(map.entry(*key).or_insert_with(|| Arc::new(KeySlot::new())));
+        *slot.last_used.lock().unwrap() = now;
+        slot
     }
 
     fn conn(&self) -> Result<r2d2::PooledConnection<redis::Client>, StoreError> {
@@ -152,10 +252,23 @@ impl CoalescingCoordinator for RedisCoordinator {
         }
     }
 
-    fn follow(&self, _key: &CacheKey, wait: Duration) -> FollowSignal {
-        // Task 9 replaces this with a real pub/sub-backed wait.
-        std::thread::sleep(wait);
-        FollowSignal::WaitElapsed
+    fn follow(&self, key: &CacheKey, wait: Duration) -> FollowSignal {
+        let slot = self.slot_for(key);
+        let guard = slot.lock.lock().unwrap();
+        if *guard {
+            return FollowSignal::Signalled;
+        }
+        let (guard, timeout) = slot
+            .cv
+            .wait_timeout(guard, wait)
+            .expect("coalesce slot condvar poisoned");
+        // A spurious wakeup that didn't time out is treated as "re-check the
+        // store" -- safe, the caller re-reads and exits on hit-or-deadline.
+        if *guard || !timeout.timed_out() {
+            FollowSignal::Signalled
+        } else {
+            FollowSignal::WaitElapsed
+        }
     }
 }
 
@@ -164,6 +277,8 @@ impl CoalescingCoordinator for RedisCoordinator {
 //   cargo test -p zerocache-adapters-redis --lib coordinator -- --ignored
 #[cfg(test)]
 mod live_coordinator_tests {
+    use std::sync::Arc;
+    use std::thread;
     use std::time::Duration;
 
     use testcontainers_modules::{
@@ -171,7 +286,7 @@ mod live_coordinator_tests {
         testcontainers::{runners::SyncRunner, Container},
     };
     use zerocache_core::CacheKey;
-    use zerocache_ports::{CoalescingCoordinator, Role};
+    use zerocache_ports::{CoalescingCoordinator, FollowSignal, Role};
 
     use super::*;
 
@@ -238,5 +353,60 @@ mod live_coordinator_tests {
                         // a fresh contender still finds the lock held by b
         let c = RedisCoordinator::connect(&url).unwrap();
         assert_eq!(c.try_lead(&k), Role::Follower);
+    }
+
+    #[test]
+    #[ignore]
+    fn a_follower_is_woken_when_the_leader_completes() {
+        let (_c, url) = start_redis();
+        let leader = RedisCoordinator::connect(&url).unwrap();
+        let follower = Arc::new(RedisCoordinator::connect(&url).unwrap());
+        let k = key(10);
+        assert_eq!(leader.try_lead(&k), Role::Leader);
+        assert_eq!(follower.try_lead(&k), Role::Follower);
+
+        let f = Arc::clone(&follower);
+        let handle = thread::spawn(move || f.follow(&key(10), Duration::from_secs(5)));
+        thread::sleep(Duration::from_millis(200));
+        leader.complete(&k);
+
+        assert_eq!(
+            handle.join().unwrap(),
+            FollowSignal::Signalled,
+            "follow must return Signalled once the leader completes"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn follow_times_out_to_wait_elapsed_when_nothing_is_published() {
+        let (_c, url) = start_redis();
+        let follower = RedisCoordinator::connect(&url).unwrap();
+        let k = key(11);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            follower.follow(&k, Duration::from_millis(300)),
+            FollowSignal::WaitElapsed
+        );
+        assert!(started.elapsed() >= Duration::from_millis(250));
+    }
+
+    #[test]
+    #[ignore]
+    fn two_followers_on_one_replica_both_wake_for_the_same_key() {
+        let (_c, url) = start_redis();
+        let leader = RedisCoordinator::connect(&url).unwrap();
+        let follower = Arc::new(RedisCoordinator::connect(&url).unwrap());
+        let k = key(12);
+        leader.try_lead(&k);
+
+        let f1 = Arc::clone(&follower);
+        let f2 = Arc::clone(&follower);
+        let h1 = thread::spawn(move || f1.follow(&key(12), Duration::from_secs(5)));
+        let h2 = thread::spawn(move || f2.follow(&key(12), Duration::from_secs(5)));
+        thread::sleep(Duration::from_millis(200));
+        leader.complete(&k);
+        assert_eq!(h1.join().unwrap(), FollowSignal::Signalled);
+        assert_eq!(h2.join().unwrap(), FollowSignal::Signalled);
     }
 }
