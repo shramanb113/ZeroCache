@@ -781,6 +781,10 @@ async fn fetch_completion_coalesced_streaming(
     let (status, mut upstream) = match stream_result {
         Ok(v) => v,
         Err(e) => {
+            // No `record_completion_miss` here: a transport failure is not a
+            // billable cache miss. This matches the non-streaming path, where
+            // `complete()` also surfaces a transport error as `Err` with no
+            // miss recorded (only a non-2xx *response* counts as a miss).
             state
                 .completion_in_flight
                 .lock()
