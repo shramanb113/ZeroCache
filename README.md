@@ -253,6 +253,7 @@ Every setting is an environment variable — no config file. Everything is optio
 | `ZEROCACHE_STORAGE_PATH` | `./data` (`/data` in Docker) | sled only. |
 | `ZEROCACHE_REDIS_URL` | `redis://127.0.0.1:6379` | redis only. |
 | `ZEROCACHE_TTL_SECONDS` | unset (never expires) | Per-entry expiry. `0` / unparseable → unset + startup warning. |
+| `ZEROCACHE_CROSS_REPLICA_COALESCING` | unset (off) | Opt-in (`1`/`true`/`yes`); **redis backend only** (set on sled → startup warning, no-op). Redis-lock single-flight so N replicas make one upstream call for the same single-key miss (any chat completion; a one-`input` embedding). A follower that waits and then still has to call upstream can take up to ~60 s (30 s wait + its own 30 s provider timeout). |
 
 **Chat providers**
 
@@ -285,7 +286,7 @@ docker pull ghcr.io/shramanb113/zerocache:latest
 docker pull ghcr.io/shramanb113/zerocache:<commit-sha>
 ```
 
-**Kubernetes / multi-replica** — the default `sled` store is per-process, so replicas don't share hits. Set `ZEROCACHE_STORAGE_BACKEND=redis` + `ZEROCACHE_REDIS_URL` for a shared cache (no distributed lock needed — content-addressed keys make last-write-wins safe). `/health` + `/ready` are standard liveness/readiness probes; scrape `/metrics` per pod and `sum()`.
+**Kubernetes / multi-replica** — the default `sled` store is per-process, so replicas don't share hits. Set `ZEROCACHE_STORAGE_BACKEND=redis` + `ZEROCACHE_REDIS_URL` for a shared cache (no distributed lock needed for correctness — content-addressed keys make last-write-wins safe; set `ZEROCACHE_CROSS_REPLICA_COALESCING=1` to also dedupe concurrent identical single-key misses across replicas, saving the duplicate upstream calls). `/health` + `/ready` are standard liveness/readiness probes; scrape `/metrics` per pod and `sum()`.
 
 **CI/CD** — `ci.yml` runs `build` / `test` / `test-redis` / `build-musl` / `clippy -D warnings` / `fmt` / `dashboard` on every push and PR to `master`; `docker-publish.yml` builds and pushes the image after CI passes on a genuine push (not on fork PRs).
 
@@ -329,7 +330,7 @@ The features that make the completion cache a general LLM gateway, roughly in or
 
 ## Testing
 
-279 tests across 13 crates + 7 `#[ignore]`d real-Redis integration tests (ephemeral container via `testcontainers`), zero `clippy -D warnings` findings.
+323 tests across 13 crates + 26 `#[ignore]`d real-Redis integration tests (ephemeral container via `testcontainers`), zero `clippy -D warnings` findings.
 
 1. **Core** — pure unit tests: key derivation, owner/provider/scope isolation, image domain-separation, the completion canonicalizer + determinism gate.
 2. **Application** — orchestration against mock ports: hit/miss splitting, ordering, coalescing (text, image, completion), within-batch dedup, cache-scope isolation, failure propagation.

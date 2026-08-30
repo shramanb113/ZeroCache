@@ -172,6 +172,13 @@ export default function Dashboard() {
               ? `${s.rows.length} provider${s.rows.length === 1 ? "" : "s"} active.`
               : "Waiting for the first cached request."}
           </p>
+          {s && s.crossReplicaCoalesced > 0 && (
+            <p>
+              {compact(s.crossReplicaCoalesced)} request
+              {s.crossReplicaCoalesced === 1 ? "" : "s"} served from a peer replica's fill — upstream
+              calls avoided across replicas.
+            </p>
+          )}
           {s && s.semanticIndexEventsApplied > 0 && (
             <p>
               {compact(s.semanticIndexEventsApplied)} semantic-index change-feed events applied on

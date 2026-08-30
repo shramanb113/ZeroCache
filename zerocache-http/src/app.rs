@@ -131,8 +131,6 @@ pub struct AppState {
     pub completion_in_flight: Mutex<HashMap<CacheKey, SharedCompletion>>,
     // Cross-replica single-flight (see crate::coalesce). NoopCoordinator
     // unless ZEROCACHE_CROSS_REPLICA_COALESCING=1 on the redis backend.
-    // Read by fetch_coalesced / fetch_completion_coalesced (next tasks).
-    #[allow(dead_code)]
     pub coordinator: Arc<dyn zerocache_ports::CoalescingCoordinator>,
     // Semantic completion tier; None when disabled or on the redis backend.
     #[cfg(feature = "semantic")]
@@ -331,8 +329,7 @@ impl Metrics {
 
     /// A request that avoided its own provider call because a peer replica
     /// filled the entry first (crate::coalesce). `kind` = "embedding" |
-    /// "completion". Consumed by completion.rs (Task 5); allow drops then.
-    #[allow(dead_code)]
+    /// "completion".
     pub(crate) fn record_cross_replica_coalesced(&self, provider: &str, kind: &str) {
         self.cross_replica_coalesced
             .with_label_values(&[provider, kind])
@@ -809,12 +806,12 @@ pub async fn delete_image_batch(
 /// (every key was already in flight elsewhere), it returns default (zero)
 /// usage, the same as an all-hit batch.
 ///
-/// In-process only: each Zerocache instance coalesces its own concurrent
-/// requests, but two different replicas behind a load balancer each run
-/// their own independent `in_flight` map, so the same miss can still be
-/// fetched once per replica. Solving that needs a distributed coordination
-/// mechanism (e.g. a Redis-backed lock), which is real, separate, harder
-/// work -- deliberately out of scope here.
+/// In-process for a multi-key claim: two replicas behind a load balancer
+/// each run their own `in_flight` map, so the same miss is still fetched
+/// once per replica. A claim that reduces to a single key additionally goes
+/// through `crate::coalesce` -- a Redis-lock single-flight across replicas --
+/// when a real coordinator is configured (item 26); the coordinator works one
+/// CacheKey at a time, so a multi-key claim keeps exactly the old behaviour.
 #[tracing::instrument(skip_all, fields(unique_keys = unique_keys.len(), claimed, piggybacked))]
 async fn fetch_coalesced(
     state: &AppState,
@@ -941,6 +938,8 @@ async fn fetch_coalesced(
                                     Ok((Arc::new(by_key), ProviderUsage::default()))
                                 }
                                 Err(AppError::Provider(e)) => Err(e),
+                                // Defensive: the read closure maps store errors
+                                // to Ok(None), so this is unreachable today.
                                 Err(AppError::Store(e)) => Err(ProviderError(format!(
                                     "store error during coalesced embedding fetch: {e}"
                                 ))),
@@ -991,13 +990,14 @@ async fn fetch_coalesced(
 /// The image-embedding counterpart to `fetch_coalesced`, coalescing against
 /// `AppState.image_in_flight` instead of `AppState.in_flight`. Identical
 /// shape and semantics -- same claim-or-piggyback logic, same
-/// only-the-claimer-reports-usage rule, same in-process-only scope -- just
+/// only-the-claimer-reports-usage rule -- just
 /// keyed on `ImageInput`s instead of `String` texts and calling
 /// `ImageEmbeddingProvider::embed_image_batch` instead of
 /// `EmbeddingProvider::embed_batch`. See `fetch_coalesced`'s doc comment for
 /// the full rationale; not repeated here to avoid the two drifting out of
 /// sync with each other in prose while the code itself stays in sync by
-/// construction.
+/// construction. Images are in-process only: no coordinator on this path,
+/// single key or not.
 #[tracing::instrument(skip_all, fields(unique_keys = unique_keys.len(), claimed, piggybacked))]
 async fn fetch_image_coalesced(
     state: &AppState,

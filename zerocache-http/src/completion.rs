@@ -365,6 +365,8 @@ async fn fetch_completion_coalesced(
                             Ok((Arc::new(resp), Coalesced::FromPeer))
                         }
                         Err(AppError::Provider(e)) => Err(e),
+                        // Defensive: the read closure maps store errors to
+                        // Ok(None), so this is unreachable today.
                         Err(AppError::Store(e)) => Err(ProviderError(format!(
                             "store error during coalesced completion fetch: {e}"
                         ))),
