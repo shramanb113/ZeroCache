@@ -174,6 +174,35 @@ pub trait ChatCompletionProvider: Send + Sync {
     fn cache_scope(&self, model: &str) -> Result<String, ProviderError>;
 }
 
+/// A stream of raw upstream SSE bytes. Items are arbitrary byte chunks whose
+/// boundaries do NOT align to SSE frame boundaries -- the caller
+/// (`zerocache-http/src/sse.rs`) owns framing and delta assembly. An `Err`
+/// item is a mid-stream transport failure.
+pub type SseByteStream =
+    std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<Vec<u8>, ProviderError>> + Send>>;
+
+/// Streaming counterpart to `ChatCompletionProvider`. A separate trait (like
+/// `ImageEmbeddingProvider`) so the registry and wiring stay explicit;
+/// `OpenAiWireChatProvider` implements both.
+#[async_trait::async_trait]
+pub trait StreamingChatCompletionProvider: Send + Sync {
+    /// Opens an upstream streaming chat completion with the caller's key.
+    /// `Err` = transport failure before any bytes. `Ok((status, stream))`
+    /// carries the upstream HTTP status; a non-2xx status means the stream
+    /// yields the error body, not SSE frames.
+    async fn chat_completion_stream(
+        &self,
+        api_key: &str,
+        request: &serde_json::Value,
+    ) -> Result<(u16, SseByteStream), ProviderError>;
+
+    /// See `ChatCompletionProvider::version`.
+    fn version(&self) -> &'static str;
+
+    /// See `ChatCompletionProvider::cache_scope`.
+    fn cache_scope(&self, model: &str) -> Result<String, ProviderError>;
+}
+
 #[async_trait::async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     async fn embed_batch(
@@ -348,5 +377,45 @@ mod tests {
         assert!(changes.upserts.is_empty());
         assert!(changes.deletes.is_empty());
         assert!(changes.cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_completion_provider_is_object_safe() {
+        struct Fake;
+
+        #[async_trait::async_trait]
+        impl StreamingChatCompletionProvider for Fake {
+            async fn chat_completion_stream(
+                &self,
+                _api_key: &str,
+                _request: &serde_json::Value,
+            ) -> Result<(u16, SseByteStream), ProviderError> {
+                let frames: Vec<Result<Vec<u8>, ProviderError>> = vec![
+                    Ok(b"data: {\"x\":1}\n\n".to_vec()),
+                    Ok(b"data: [DONE]\n\n".to_vec()),
+                ];
+                let s = futures_util::stream::iter(frames);
+                Ok((200, Box::pin(s)))
+            }
+            fn version(&self) -> &'static str {
+                "fake-v1"
+            }
+            fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+                Ok("fake-scope".into())
+            }
+        }
+
+        let p: Box<dyn StreamingChatCompletionProvider> = Box::new(Fake);
+        let (status, mut stream) = p
+            .chat_completion_stream("k", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        let mut seen = 0;
+        while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
+            item.unwrap();
+            seen += 1;
+        }
+        assert_eq!(seen, 2);
     }
 }
