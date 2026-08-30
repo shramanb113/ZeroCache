@@ -115,7 +115,7 @@ curl http://localhost:8080/openai/v1/chat/completions \
 - Only **deterministic** requests: `temperature == 0` *or* an explicit `seed`, with `n` absent/`1`. Anything else is a transparent passthrough — forwarded, nothing stored, nothing counted.
 - The cache key is the **canonicalized** request body: order-independent, and blind to `user` / `stream` / `metadata` / key order / number spelling. Two requests that differ only in those share an entry.
 - A **non-2xx** upstream response is forwarded with its real status and **never** cached. Only 2xx is stored.
-- Concurrent identical misses within one instance are **coalesced** into a single upstream call; across replicas with `ZEROCACHE_CROSS_REPLICA_COALESCING=1` on the redis backend.
+- Concurrent identical misses within one instance are **coalesced** into a single upstream call — and across replicas when `ZEROCACHE_CROSS_REPLICA_COALESCING=1` on the redis backend.
 - Per-caller namespaced (`owner_id`) and per-endpoint scoped (`cache_scope`), exactly like embeddings — two callers, or the same model string against two different upstreams, never collide.
 
 `X-Zerocache-Completion-Hit` tells you which path a response took. `/metrics` exposes `zerocache_completion_cache_hits_total` / `_misses_total` / `_prompt_tokens_saved_total` / `_completion_tokens_saved_total`, all `provider`-labeled.
