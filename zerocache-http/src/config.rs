@@ -78,6 +78,10 @@ pub struct Config {
     pub vertex_endpoint_template: String,
     /// Semantic completion tier. Only consulted in a `--features semantic` build.
     pub semantic_enabled: bool,
+    /// Redis-backed cross-replica single-flight. Only honoured on the
+    /// redis storage backend (see main.rs).
+    #[expect(dead_code)]
+    pub cross_replica_coalescing: bool,
     #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
     pub semantic_threshold: f32,
     #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
@@ -214,6 +218,11 @@ impl Config {
             semantic_enabled: parse_semantic_enabled(
                 std::env::var("ZEROCACHE_SEMANTIC").ok().as_deref(),
             ),
+            cross_replica_coalescing: parse_cross_replica_coalescing(
+                std::env::var("ZEROCACHE_CROSS_REPLICA_COALESCING")
+                    .ok()
+                    .as_deref(),
+            ),
             semantic_threshold: parse_semantic_threshold(
                 std::env::var("ZEROCACHE_SEMANTIC_THRESHOLD")
                     .ok()
@@ -237,6 +246,10 @@ impl Config {
 }
 
 fn parse_semantic_enabled(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1") | Some("true") | Some("yes"))
+}
+
+fn parse_cross_replica_coalescing(raw: Option<&str>) -> bool {
     matches!(raw, Some("1") | Some("true") | Some("yes"))
 }
 
@@ -824,5 +837,16 @@ mod tests {
             parse_semantic_poll_ms(Some("abc")),
             DEFAULT_SEMANTIC_POLL_MS
         );
+    }
+
+    #[test]
+    fn cross_replica_coalescing_only_for_truthy_values() {
+        assert!(parse_cross_replica_coalescing(Some("1")));
+        assert!(parse_cross_replica_coalescing(Some("true")));
+        assert!(parse_cross_replica_coalescing(Some("yes")));
+        assert!(!parse_cross_replica_coalescing(Some("0")));
+        assert!(!parse_cross_replica_coalescing(Some("")));
+        assert!(!parse_cross_replica_coalescing(Some("on")));
+        assert!(!parse_cross_replica_coalescing(None));
     }
 }
