@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,6 +15,8 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const WARN_INTERVAL_MS: u64 = 10_000;
 // Followers with no `follow` call for this long have their slot swept.
 const SLOT_TTL: Duration = Duration::from_secs(90);
+// build() waits at most this long for the reader's first psubscribe.
+const READER_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One waiter rendezvous for a key. The flag flips true when a `done:<key>`
 /// message arrives (from any replica, ours included) and stays set until the
@@ -68,14 +71,17 @@ fn new_replica_id() -> Vec<u8> {
 }
 
 /// Detached thread: psubscribe `done:*` forever, reconnecting on any error.
-fn spawn_pubsub_reader(client: redis::Client, slots: SlotMap) {
+/// Signals `ready_tx` once, right after the first successful psubscribe.
+fn spawn_pubsub_reader(client: redis::Client, slots: SlotMap, ready_tx: mpsc::Sender<()>) {
     std::thread::Builder::new()
         .name("zerocache-coalesce-pubsub".into())
         .spawn(move || {
             // Single-threaded loop; a plain local throttles the reconnect warn.
             let mut last_warn: Option<Instant> = None;
+            // Taken and sent once, after the first psubscribe succeeds.
+            let mut ready_tx = Some(ready_tx);
             loop {
-                match run_pubsub_reader(&client, &slots) {
+                match run_pubsub_reader(&client, &slots, &mut ready_tx) {
                     Ok(()) => {} // unreachable: the inner loop only exits via Err
                     Err(e) => {
                         if last_warn
@@ -96,7 +102,11 @@ fn spawn_pubsub_reader(client: redis::Client, slots: SlotMap) {
 
 /// Blocks on `done:*` messages, flipping the matching key's slot flag and
 /// waking its condvar. Returns only on a Redis error, prompting a reconnect.
-fn run_pubsub_reader(client: &redis::Client, slots: &SlotMap) -> Result<(), StoreError> {
+fn run_pubsub_reader(
+    client: &redis::Client,
+    slots: &SlotMap,
+    ready_tx: &mut Option<mpsc::Sender<()>>,
+) -> Result<(), StoreError> {
     let mut conn = client
         .get_connection()
         .map_err(|e| StoreError(e.to_string()))?;
@@ -106,6 +116,10 @@ fn run_pubsub_reader(client: &redis::Client, slots: &SlotMap) -> Result<(), Stor
     pubsub
         .psubscribe(pattern)
         .map_err(|e| StoreError(e.to_string()))?;
+    // Subscribed: unblock build(). A send after build() gave up returns Err.
+    if let Some(tx) = ready_tx.take() {
+        let _ = tx.send(());
+    }
     loop {
         let msg = pubsub
             .get_message()
@@ -148,8 +162,18 @@ impl RedisCoordinator {
             .build(client.clone())
             .map_err(|e| StoreError(e.to_string()))?;
         let slots: SlotMap = Arc::new(Mutex::new(HashMap::new()));
+        let (ready_tx, ready_rx) = mpsc::channel();
         // The reader owns its own client clone; nothing else needs a raw one.
-        spawn_pubsub_reader(client, Arc::clone(&slots));
+        spawn_pubsub_reader(client, Arc::clone(&slots), ready_tx);
+        // Block until the reader has psubscribed, so a PUBLISH racing a
+        // just-returned connect() is still delivered. Bounded so a Redis
+        // outage at startup can't hang boot.
+        if ready_rx.recv_timeout(READER_SUBSCRIBE_TIMEOUT).is_err() {
+            tracing::warn!(
+                "coalesce pub/sub reader not ready after {:?}; proceeding (wakes fall back to the caller's poll re-read)",
+                READER_SUBSCRIBE_TIMEOUT
+            );
+        }
         Ok(Self {
             pool,
             replica_id: new_replica_id(),
@@ -343,16 +367,20 @@ mod live_coordinator_tests {
     #[ignore]
     fn complete_does_not_delete_a_lock_owned_by_someone_else() {
         let (_c, url) = start_redis();
+        // a's lock is short so it expires within the sleep below; b's is longer
+        // so it comfortably outlives the c.try_lead a few ms later.
         let a = RedisCoordinator::connect_with_lock_ttl(&url, Duration::from_secs(1)).unwrap();
-        let b = RedisCoordinator::connect_with_lock_ttl(&url, Duration::from_secs(1)).unwrap();
+        let b = RedisCoordinator::connect_with_lock_ttl(&url, Duration::from_secs(2)).unwrap();
+        // Built up front so no pool/reader work sits between b.try_lead and
+        // c.try_lead -- only a.complete does, keeping b's lock unambiguously
+        // live when c contends.
+        let c = RedisCoordinator::connect(&url).unwrap();
         let k = key(4);
         assert_eq!(a.try_lead(&k), Role::Leader);
-        std::thread::sleep(Duration::from_millis(1300)); // a's lock expires
-        assert_eq!(b.try_lead(&k), Role::Leader); // b now owns it
-        a.complete(&k); // must NOT remove b's lock
-                        // a fresh contender still finds the lock held by b
-        let c = RedisCoordinator::connect(&url).unwrap();
-        assert_eq!(c.try_lead(&k), Role::Follower);
+        std::thread::sleep(Duration::from_millis(1300)); // a's 1s lock expires
+        assert_eq!(b.try_lead(&k), Role::Leader); // b now owns it (2s TTL)
+        a.complete(&k); // non-owner: the check-and-del guard must spare b's lock
+        assert_eq!(c.try_lead(&k), Role::Follower); // b's lock still held
     }
 
     #[test]
@@ -389,6 +417,26 @@ mod live_coordinator_tests {
             FollowSignal::WaitElapsed
         );
         assert!(started.elapsed() >= Duration::from_millis(250));
+    }
+
+    #[test]
+    #[ignore]
+    fn connect_returns_only_after_the_reader_is_subscribed() {
+        let (_c, url) = start_redis();
+        let publisher = RedisCoordinator::connect(&url).unwrap();
+        let follower = RedisCoordinator::connect(&url).unwrap();
+        let k = key(20);
+        // Pre-register the wake target (follow() does this first anyway) so the
+        // message has somewhere to land regardless of ordering.
+        follower.slot_for(&k);
+        // Publish immediately -- no 200ms pre-sleep. This is only delivered if
+        // connect() returned with the reader already psubscribed.
+        publisher.complete(&k);
+        assert_eq!(
+            follower.follow(&k, Duration::from_secs(5)),
+            FollowSignal::Signalled,
+            "connect() returning must imply the pub/sub reader is subscribed"
+        );
     }
 
     #[test]
