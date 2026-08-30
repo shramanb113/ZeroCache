@@ -3,6 +3,7 @@
 /data/
 .env
 .claude/
+/.superpowers/
 /docs/
 /demo/node_modules/
 /demo/.mastra/
