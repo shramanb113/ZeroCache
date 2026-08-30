@@ -133,3 +133,19 @@ Any provider that's already OpenAI-wire-compatible (a self-hosted vLLM/Ollama se
 **Stream bounded by `MAXLEN ~` always, `MINID` when `ZEROCACHE_TTL_SECONDS` is set:** approximate size cap (`ZEROCACHE_SEMANTIC_INDEX_MAXLEN`, default 100k ~= 210 MB) on every `XADD`; default millisecond stream IDs let an opportunistic `XTRIM MINID` give the feed the same time-expiry the completion blob store has. A trimmed-but-still-live vector just becomes an exact-fetch miss on replicas that started after the trim — degradation, not corruption. The one edge that is a stale *hit* rather than a miss: if a `put` survives trimming but its later `del` does not, a replica that boots after the trim re-adds the vector and can serve one stale semantic hit until `semantic_probe`’s self-heal sees the missing completion blob and re-tombstones it — bounded, and within the “absent, never wrong” contract the cache already lives by.
 
 **No new opt-in flag:** multi-replica behaviour is implied by `ZEROCACHE_SEMANTIC=1` + the redis backend. Independent of `ZEROCACHE_CROSS_REPLICA_COALESCING` ("Project 2") — the two compose but neither reads the other's state.
+
+---
+
+## 2026-08-30: Cross-replica request coalescing (opt-in, single-key)
+
+Roadmap Project 2. Full design: `docs/superpowers/specs/2026-08-29-cross-replica-request-coalescing-design.md`. Five knobs, all settled with the user:
+
+- **Single-key only.** Cross-replica coalesce only requests resolving to one `CacheKey` (all completions; single-`input` embeddings). A multi-key embedding batch would need K coordinated locks with deadlock-ordering and partial-fill bookkeeping, for a case the in-process dedup + per-replica in-flight map already largely cover. Deferred, not rejected.
+- **Hybrid wait (pub/sub + poll).** Redis `PUBLISH`/`psubscribe` for a sub-millisecond wake, a 250 ms store re-read as the backstop for a missed publish (the SET-NX/subscribe race). Poll-only was the simpler fallback; the user chose the hybrid for wake latency.
+- **Explicit opt-in.** `ZEROCACHE_CROSS_REPLICA_COALESCING=1`, redis backend only. Not auto-on-with-redis: a distributed lock in the hot path is a behaviour change an operator should choose. Sled + flag = startup warn + no-op.
+- **Fixed 60 s lock TTL + explicit release, no watchdog.** Leader `DEL`s the lock (via a `GET`-guarded Lua script so it never deletes a successor's lock) on success and on failure. The full TTL only elapses on a leader crash. A renewal/watchdog task was rejected as complexity for a rare case.
+- **Leader failure -> followers fall back to their own call.** No negative marker, no error caching -- preserves "never cache a non-2xx". The leader still `complete`s (releases + signals) on a non-2xx so peers stop waiting; they then poll, see no fill, and fall back. One follower may re-contend and promote.
+
+Any Redis error in the coordinator degrades to the safe default (lead / wait-elapsed / ignore), so a coordination outage is exactly today's per-replica behaviour, never a failed request. `zerocache-adapters-redis` took no new dependency: `std` threads + the `redis` crate's sync pub/sub.
+
+Independent of `ZEROCACHE_SEMANTIC` and the multi-replica semantic index (2026-08-29 entries above): the two features compose without interaction. `complete()` resolves a request exact-match -> semantic near-match -> provider call, and `coalesce_cross_replica` wraps only that final provider call, so a semantic hit returns early and never enters the cross-replica path.

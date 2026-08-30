@@ -115,7 +115,7 @@ curl http://localhost:8080/openai/v1/chat/completions \
 - Only **deterministic** requests: `temperature == 0` *or* an explicit `seed`, with `n` absent/`1`. Anything else is a transparent passthrough — forwarded, nothing stored, nothing counted.
 - The cache key is the **canonicalized** request body: order-independent, and blind to `user` / `stream` / `metadata` / key order / number spelling. Two requests that differ only in those share an entry.
 - A **non-2xx** upstream response is forwarded with its real status and **never** cached. Only 2xx is stored.
-- Concurrent identical misses within one instance are **coalesced** into a single upstream call.
+- Concurrent identical misses within one instance are **coalesced** into a single upstream call; across replicas with `ZEROCACHE_CROSS_REPLICA_COALESCING=1` on the redis backend.
 - Per-caller namespaced (`owner_id`) and per-endpoint scoped (`cache_scope`), exactly like embeddings — two callers, or the same model string against two different upstreams, never collide.
 
 `X-Zerocache-Completion-Hit` tells you which path a response took. `/metrics` exposes `zerocache_completion_cache_hits_total` / `_misses_total` / `_prompt_tokens_saved_total` / `_completion_tokens_saved_total`, all `provider`-labeled.
@@ -305,20 +305,21 @@ docker pull ghcr.io/shramanb113/zerocache:<commit-sha>
 The features that make the completion cache a general LLM gateway, roughly in order:
 
 1. **Semantic completion cache** — ✅ **Live (opt-in).** A local candle embedder (all-MiniLM-L6-v2, compiled in) generates a prompt vector; on an exact-match miss a hit is a cosine match above a conservative threshold *and* a byte-for-byte match of the rest of the request. Turns a near-zero hit rate on paraphrased chatbot/agent traffic into a useful one. Build with `--features semantic`, enable with `ZEROCACHE_SEMANTIC=1`. Works on both backends: sled in-process, or a Redis Stream change-feed across replicas — set `ZEROCACHE_STORAGE_BACKEND=redis` (needs Redis ≥ 6.2); ~2 s cross-replica propagation lag, tune with `ZEROCACHE_SEMANTIC_POLL_MS`, size the feed with `ZEROCACHE_SEMANTIC_INDEX_MAXLEN`. The threshold, not the embedder, bounds false positives.
-2. **Streaming** — `stream: true`: buffer the SSE on a miss, replay it on a hit.
-3. **Anthropic `/v1/messages`** — a native adapter for Claude's wire shape, so Claude-based agents are cacheable.
-4. **Budgets & rate limits** — per-key monthly spend caps (`429` when exceeded) and per-key RPS limits, with a cost-by-team view in the dashboard.
-5. **Multi-provider failover** — retry a failed request on a second configured provider (the adapters already exist; only the routing policy is missing).
-6. **Request log + replay** (opt-in) — persist request/response pairs, browse them, replay one, diff the result.
-7. **One-click deploy** — `fly.toml` / a Deploy button, and a hosted free tier.
+2. **Cross-replica request coalescing** — ✅ **Live (opt-in).** With `ZEROCACHE_CROSS_REPLICA_COALESCING=1` on the redis backend, two replicas missing on the same single `CacheKey` (any chat completion, or a one-`input` embedding request) share one upstream call via a Redis lock. Multi-item embedding batches and images stay in-process only.
+3. **Streaming** — `stream: true`: buffer the SSE on a miss, replay it on a hit.
+4. **Anthropic `/v1/messages`** — a native adapter for Claude's wire shape, so Claude-based agents are cacheable.
+5. **Budgets & rate limits** — per-key monthly spend caps (`429` when exceeded) and per-key RPS limits, with a cost-by-team view in the dashboard.
+6. **Multi-provider failover** — retry a failed request on a second configured provider (the adapters already exist; only the routing policy is missing).
+7. **Request log + replay** (opt-in) — persist request/response pairs, browse them, replay one, diff the result.
+8. **One-click deploy** — `fly.toml` / a Deploy button, and a hosted free tier.
 
 ---
 
 ## What Zerocache is *not* (yet)
 
 - **Semantic chat caching is opt-in** — a `--features semantic` build plus `ZEROCACHE_SEMANTIC=1` adds a local-embedder near-match tier; the default build is still exact-match on a canonicalized body. On the redis backend it propagates across replicas via a Redis Stream change-feed (~2 s lag); the RediSearch-native KNN path and push propagation are still deferred.
-- **No streaming, no Anthropic `/v1/messages`** — roadmap items 2–3. Non-streaming OpenAI-wire only, today.
-- **No budgets, rate limiting, or failover** — roadmap items 4–5.
+- **No streaming, no Anthropic `/v1/messages`** — roadmap items 3–4. Non-streaming OpenAI-wire only, today.
+- **No budgets, rate limiting, or failover** — roadmap items 5–6.
 - **No fuzzy similarity on embedding vectors** — and it never will do that: finding a near neighbour requires computing the very embedding you're trying to avoid. Text canonicalization (casing/punctuation fold) is the only near-match on the embedding path.
 - **No quantization / eviction** — deferred until a real hit-rate number justifies the work.
 - **No Zerocache SDK** — if a consumer has to install a package, the "drop-in" promise has failed.
