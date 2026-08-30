@@ -900,18 +900,30 @@ async fn fetch_coalesced(
                                     let provider = Arc::clone(&provider);
                                     let api_key = api_key.clone();
                                     let model = model.clone();
+                                    let store = Arc::clone(&store);
                                     move || async move {
                                         let (vectors, usage) = provider
                                             .embed_batch(&api_key, &model, &[single_text])
                                             .await
                                             .map_err(AppError::Provider)?;
-                                        let mut m = HashMap::with_capacity(1);
-                                        m.insert(
-                                            key,
-                                            vectors.into_iter().next().expect(
-                                                "provider returned no vector for a one-text batch",
-                                            ),
+                                        let vector = vectors.into_iter().next().expect(
+                                            "provider returned no vector for a one-text batch",
                                         );
+                                        // Store before returning, so the
+                                        // coordinator's `done` signal implies a
+                                        // readable entry for peers. The caller's
+                                        // write-back repeats it -- an identical
+                                        // content-addressed value, and it is the
+                                        // one that surfaces a store error.
+                                        {
+                                            let vector = vector.clone();
+                                            let _ = run_store_task(move || {
+                                                store.put(key, vector).map_err(AppError::Store)
+                                            })
+                                            .await;
+                                        }
+                                        let mut m = HashMap::with_capacity(1);
+                                        m.insert(key, vector);
                                         Ok((m, usage))
                                     }
                                 },

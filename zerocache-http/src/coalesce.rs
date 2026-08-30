@@ -113,7 +113,15 @@ where
                 if Instant::now() >= deadline {
                     break;
                 }
-                let _ = spawn_follow(coordinator, key, timing.poll).await;
+                if spawn_follow(coordinator, key, timing.poll).await == FollowSignal::Signalled {
+                    // The leader is done. One more read; still absent means it
+                    // stored nothing (non-2xx or a transport error), so promote
+                    // now instead of waiting out the deadline.
+                    if let Some(value) = read().await? {
+                        return Ok(CrossReplica::Followed(value));
+                    }
+                    break;
+                }
             }
             match spawn_try_lead(coordinator, key).await {
                 Role::Leader => {
@@ -146,17 +154,31 @@ mod tests {
         roles: Vec<Role>,
         try_lead_calls: AtomicUsize,
         complete_calls: AtomicUsize,
+        follow_calls: AtomicUsize,
         signal: Mutex<Receiver<()>>,
+        /// `follow` returns `Signalled` at once, every time -- what a leader
+        /// that published `done` and stored nothing looks like to a follower.
+        always_signal: bool,
     }
 
     impl MockCoordinator {
         fn new(roles: Vec<Role>) -> (Arc<Self>, Sender<()>) {
+            Self::build(roles, false)
+        }
+
+        fn new_always_signalling(roles: Vec<Role>) -> (Arc<Self>, Sender<()>) {
+            Self::build(roles, true)
+        }
+
+        fn build(roles: Vec<Role>, always_signal: bool) -> (Arc<Self>, Sender<()>) {
             let (tx, rx) = std::sync::mpsc::channel();
             let me = Arc::new(Self {
                 roles,
                 try_lead_calls: AtomicUsize::new(0),
                 complete_calls: AtomicUsize::new(0),
+                follow_calls: AtomicUsize::new(0),
                 signal: Mutex::new(rx),
+                always_signal,
             });
             (me, tx)
         }
@@ -174,6 +196,10 @@ mod tests {
             self.complete_calls.fetch_add(1, Ordering::SeqCst);
         }
         fn follow(&self, _key: &CacheKey, wait: Duration) -> FollowSignal {
+            self.follow_calls.fetch_add(1, Ordering::SeqCst);
+            if self.always_signal {
+                return FollowSignal::Signalled;
+            }
             match self.signal.lock().unwrap().recv_timeout(wait) {
                 Ok(()) => FollowSignal::Signalled,
                 Err(_) => FollowSignal::WaitElapsed,
@@ -235,6 +261,49 @@ mod tests {
         assert!(matches!(out, CrossReplica::Followed(42)));
         assert_eq!(fetches.load(Ordering::SeqCst), 0);
         assert_eq!(coord.complete_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn follower_signalled_with_the_entry_still_absent_promotes_without_spinning() {
+        let (coord, _tx) =
+            MockCoordinator::new_always_signalling(vec![Role::Follower, Role::Leader]);
+        let c: Arc<dyn CoalescingCoordinator> = coord.clone();
+        let reads = AtomicUsize::new(0);
+        let fetches = AtomicUsize::new(0);
+        let started = Instant::now();
+
+        let out = coalesce_cross_replica(
+            &c,
+            key(),
+            FAST,
+            || async {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Ok::<Option<u32>, AppError>(None)
+            },
+            || async {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                Ok::<u32, AppError>(3)
+            },
+        )
+        .await
+        .unwrap();
+
+        // A leader that published `done` and stored nothing (non-2xx or a
+        // transport error): promote at once instead of polling to the deadline.
+        assert!(matches!(out, CrossReplica::Led(3)));
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(coord.complete_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            reads.load(Ordering::SeqCst) <= 3,
+            "expected one poll pass, got {} reads",
+            reads.load(Ordering::SeqCst)
+        );
+        assert!(
+            coord.follow_calls.load(Ordering::SeqCst) <= 2,
+            "expected one poll pass, got {} follows",
+            coord.follow_calls.load(Ordering::SeqCst)
+        );
+        assert!(started.elapsed() < FAST.deadline, "waited out the deadline");
     }
 
     #[tokio::test]

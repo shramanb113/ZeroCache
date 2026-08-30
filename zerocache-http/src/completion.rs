@@ -36,6 +36,17 @@ struct CachedCompletion {
     total_tokens: u32,
 }
 
+fn encode_cached(response: &ChatCompletionResponse) -> Vec<u8> {
+    let record = CachedCompletion {
+        body: response.body.clone(),
+        prompt_tokens: response.usage.prompt_tokens,
+        completion_tokens: response.usage.completion_tokens,
+        total_tokens: response.usage.total_tokens,
+    };
+    serde_json::to_vec(&record)
+        .expect("a CachedCompletion built from a serde_json::Value always re-serializes")
+}
+
 /// Everything one `POST /{provider}/v1/chat/completions` call needs.
 pub struct CompletionRequest<'a> {
     pub provider: Arc<dyn ChatCompletionProvider>,
@@ -238,14 +249,7 @@ pub async fn complete(
     }
 
     if (200..300).contains(&response.status) {
-        let record = CachedCompletion {
-            body: response.body.clone(),
-            prompt_tokens: response.usage.prompt_tokens,
-            completion_tokens: response.usage.completion_tokens,
-            total_tokens: response.usage.total_tokens,
-        };
-        let bytes = serde_json::to_vec(&record)
-            .expect("a CachedCompletion built from a serde_json::Value always re-serializes");
+        let bytes = encode_cached(&response);
         let store = Arc::clone(&state.completion_store);
         run_store_task(move || store.put(key, bytes).map_err(AppError::Store))
             .instrument(tracing::info_span!("store_write_back"))
@@ -330,11 +334,27 @@ async fn fetch_completion_coalesced(
                                     }))
                             }
                         },
-                        || async move {
-                            provider
-                                .chat_completion(&api_key, &body)
-                                .await
-                                .map_err(AppError::Provider)
+                        {
+                            let store = Arc::clone(&completion_store);
+                            move || async move {
+                                let response = provider
+                                    .chat_completion(&api_key, &body)
+                                    .await
+                                    .map_err(AppError::Provider)?;
+                                // Store before returning, so the coordinator's
+                                // `done` signal implies a readable entry for
+                                // peers. The caller's write-back repeats it --
+                                // an identical content-addressed value, and it
+                                // is the one that surfaces a store error.
+                                if (200..300).contains(&response.status) {
+                                    let bytes = encode_cached(&response);
+                                    let _ = run_store_task(move || {
+                                        store.put(key, bytes).map_err(AppError::Store)
+                                    })
+                                    .await;
+                                }
+                                Ok(response)
+                            }
                         },
                     )
                     .await;

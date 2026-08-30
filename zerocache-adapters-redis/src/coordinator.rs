@@ -18,13 +18,15 @@ const SLOT_TTL: Duration = Duration::from_secs(90);
 // build() waits at most this long for the reader's first psubscribe.
 const READER_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One waiter rendezvous for a key. The flag flips true when a `done:<key>`
-/// message arrives (from any replica, ours included) and stays set until the
-/// `SLOT_TTL` sweep drops the slot -- a later `follow` for the same key then
-/// returns `Signalled` at once, which is harmless: the caller only re-reads
-/// the store and exits on the hit or its own deadline.
+/// One waiter rendezvous for a key. `generation` is bumped once per
+/// `done:<key>` message (from any replica, ours included); `follow` snapshots
+/// it on entry and returns `Signalled` only when it moves. Edge-triggered, so
+/// a past wake can never make a later `follow` return instantly -- which would
+/// turn the caller's wait loop into a full-rate poll. A wake published between
+/// a caller's store re-read and its `follow` costs one poll interval, never a
+/// hang.
 struct KeySlot {
-    lock: Mutex<bool>,
+    generation: Mutex<u64>,
     cv: Condvar,
     last_used: Mutex<Instant>,
 }
@@ -32,7 +34,7 @@ struct KeySlot {
 impl KeySlot {
     fn new() -> Self {
         Self {
-            lock: Mutex::new(false),
+            generation: Mutex::new(0),
             cv: Condvar::new(),
             last_used: Mutex::new(Instant::now()),
         }
@@ -62,6 +64,10 @@ fn done_channel(key: &CacheKey) -> Vec<u8> {
     [DONE_PREFIX, key.as_bytes()].concat()
 }
 
+/// Owner token for the check-and-del lock guard. The pid is commonly `1` in
+/// every container replica, so uniqueness rests on the nanos (two pods booting
+/// in the same nanosecond is not a real event); the `unwrap_or(0)` fallback
+/// needs a pre-1970 clock.
 fn new_replica_id() -> Vec<u8> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -100,8 +106,11 @@ fn spawn_pubsub_reader(client: redis::Client, slots: SlotMap, ready_tx: mpsc::Se
         .expect("failed to spawn coalesce pub/sub reader thread");
 }
 
-/// Blocks on `done:*` messages, flipping the matching key's slot flag and
+/// Blocks on `done:*` messages, bumping the matching key's slot generation and
 /// waking its condvar. Returns only on a Redis error, prompting a reconnect.
+/// Every lock is taken with `unwrap_or_else(into_inner)`: a poisoned slot mutex
+/// must never kill this thread, which would disable pub/sub wakes process-wide,
+/// permanently and silently.
 fn run_pubsub_reader(
     client: &redis::Client,
     slots: &SlotMap,
@@ -109,6 +118,12 @@ fn run_pubsub_reader(
 ) -> Result<(), StoreError> {
     let mut conn = client
         .get_connection()
+        .map_err(|e| StoreError(e.to_string()))?;
+    // Same socket bounds as a pooled conn(): without them a black-holed host
+    // hangs get_message forever instead of erroring into the reconnect path.
+    conn.set_read_timeout(Some(SOCKET_TIMEOUT))
+        .map_err(|e| StoreError(e.to_string()))?;
+    conn.set_write_timeout(Some(SOCKET_TIMEOUT))
         .map_err(|e| StoreError(e.to_string()))?;
     let mut pubsub = conn.as_pubsub();
     let mut pattern = DONE_PREFIX.to_vec();
@@ -121,9 +136,13 @@ fn run_pubsub_reader(
         let _ = tx.send(());
     }
     loop {
-        let msg = pubsub
-            .get_message()
-            .map_err(|e| StoreError(e.to_string()))?;
+        // An idle-read timeout is a liveness tick, not a dropped connection --
+        // reconnecting on it would churn the subscription every SOCKET_TIMEOUT.
+        let msg = match pubsub.get_message() {
+            Ok(m) => m,
+            Err(e) if e.is_timeout() => continue,
+            Err(e) => return Err(StoreError(e.to_string())),
+        };
         // Channel is DONE_PREFIX + 32 raw key bytes -- not necessarily UTF-8.
         let channel: Vec<u8> = match msg.get_channel() {
             Ok(c) => c,
@@ -135,8 +154,13 @@ fn run_pubsub_reader(
         let mut raw = [0u8; 32];
         raw.copy_from_slice(&channel[DONE_PREFIX.len()..]);
         let key = CacheKey::from_bytes(raw);
-        if let Some(slot) = slots.lock().unwrap().get(&key).cloned() {
-            *slot.lock.lock().unwrap() = true;
+        let found = slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned();
+        if let Some(slot) = found {
+            *slot.generation.lock().unwrap_or_else(|e| e.into_inner()) += 1;
             slot.cv.notify_all();
         }
     }
@@ -155,6 +179,9 @@ impl RedisCoordinator {
         Self::build(redis_url, ttl)
     }
 
+    /// Blocks the caller for up to `READER_SUBSCRIBE_TIMEOUT` (5s) when Redis
+    /// pub/sub is unreachable at startup -- acceptable because this runs before
+    /// `axum::serve`, with nothing else scheduled yet.
     fn build(redis_url: &str, lock_ttl: Duration) -> Result<Self, StoreError> {
         let client = redis::Client::open(redis_url).map_err(|e| StoreError(e.to_string()))?;
         let pool = r2d2::Pool::builder()
@@ -278,20 +305,27 @@ impl CoalescingCoordinator for RedisCoordinator {
 
     fn follow(&self, key: &CacheKey, wait: Duration) -> FollowSignal {
         let slot = self.slot_for(key);
-        let guard = slot.lock.lock().unwrap();
-        if *guard {
-            return FollowSignal::Signalled;
-        }
-        let (guard, timeout) = slot
-            .cv
-            .wait_timeout(guard, wait)
-            .expect("coalesce slot condvar poisoned");
-        // A spurious wakeup that didn't time out is treated as "re-check the
-        // store" -- safe, the caller re-reads and exits on hit-or-deadline.
-        if *guard || !timeout.timed_out() {
-            FollowSignal::Signalled
-        } else {
-            FollowSignal::WaitElapsed
+        let deadline = Instant::now() + wait;
+        let mut guard = slot.generation.lock().unwrap_or_else(|e| e.into_inner());
+        let start = *guard;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return FollowSignal::WaitElapsed;
+            }
+            let (g, timeout) = slot
+                .cv
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            // Only a real generation change is a signal; a spurious wakeup
+            // resumes the wait against the remaining budget.
+            if *g != start {
+                return FollowSignal::Signalled;
+            }
+            if timeout.timed_out() {
+                return FollowSignal::WaitElapsed;
+            }
+            guard = g;
         }
     }
 }
@@ -426,17 +460,50 @@ mod live_coordinator_tests {
         let publisher = RedisCoordinator::connect(&url).unwrap();
         let follower = RedisCoordinator::connect(&url).unwrap();
         let k = key(20);
-        // Pre-register the wake target (follow() does this first anyway) so the
-        // message has somewhere to land regardless of ordering.
-        follower.slot_for(&k);
+        // Watch the slot generation directly instead of calling follow(): the
+        // wake is edge-triggered, so a message delivered before follow() takes
+        // its entry snapshot is missed (benign in the caller's poll loop, but
+        // it would make this delivery assertion racy).
+        let slot = follower.slot_for(&k);
+        let start = *slot.generation.lock().unwrap();
         // Publish immediately -- no 200ms pre-sleep. This is only delivered if
         // connect() returned with the reader already psubscribed.
         publisher.complete(&k);
-        assert_eq!(
-            follower.follow(&k, Duration::from_secs(5)),
-            FollowSignal::Signalled,
+        let guard = slot.generation.lock().unwrap();
+        let (generation, res) = slot
+            .cv
+            .wait_timeout_while(guard, Duration::from_secs(5), |g| *g == start)
+            .unwrap();
+        assert!(
+            !res.timed_out(),
             "connect() returning must imply the pub/sub reader is subscribed"
         );
+        assert_eq!(*generation, start + 1);
+    }
+
+    #[test]
+    #[ignore]
+    fn a_wake_is_edge_triggered_so_a_later_follow_still_waits() {
+        let (_c, url) = start_redis();
+        let leader = RedisCoordinator::connect(&url).unwrap();
+        let follower = Arc::new(RedisCoordinator::connect(&url).unwrap());
+        let k = key(13);
+        leader.try_lead(&k);
+
+        let f = Arc::clone(&follower);
+        let handle = thread::spawn(move || f.follow(&key(13), Duration::from_secs(5)));
+        thread::sleep(Duration::from_millis(200));
+        leader.complete(&k);
+        assert_eq!(handle.join().unwrap(), FollowSignal::Signalled);
+
+        // Nothing new published: the past wake must not short-circuit this
+        // call, or the caller's wait loop becomes a full-rate poll.
+        let started = std::time::Instant::now();
+        assert_eq!(
+            follower.follow(&k, Duration::from_millis(300)),
+            FollowSignal::WaitElapsed
+        );
+        assert!(started.elapsed() >= Duration::from_millis(250));
     }
 
     #[test]
