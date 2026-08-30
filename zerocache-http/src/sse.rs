@@ -528,6 +528,53 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_data_frame_makes_it_incomplete() {
+        let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n\
+                   data: {oops not json}\n\n\
+                   data: [DONE]\n\n";
+        let evs = events(raw);
+        assert!(evs.iter().any(|e| matches!(e, SseEvent::Malformed(_))));
+        let mut a = DeltaAssembler::new();
+        for ev in &evs {
+            a.ingest(ev);
+        }
+        assert!(matches!(
+            a.finish().completeness,
+            Completeness::Incomplete(_)
+        ));
+    }
+
+    #[test]
+    fn parser_tolerates_crlf_frame_delimiters() {
+        let evs = events(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\r\n\r\ndata: [DONE]\r\n\r\n",
+        );
+        match evs.first() {
+            Some(SseEvent::Data(v)) => {
+                assert_eq!(v["choices"][0]["delta"]["content"], "hi")
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+        assert!(matches!(evs.last(), Some(SseEvent::Done)));
+    }
+
+    #[test]
+    fn finish_flushes_an_unterminated_trailing_frame() {
+        let mut p = SseFrameParser::new();
+        assert!(p
+            .feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"tail\"}}]}")
+            .is_empty());
+        let flushed = p.finish();
+        assert_eq!(flushed.len(), 1);
+        match &flushed[0] {
+            SseEvent::Data(v) => {
+                assert_eq!(v["choices"][0]["delta"]["content"], "tail")
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn empty_content_and_no_tool_calls_is_incomplete() {
         let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":\"stop\"}]}\n\n\
                    data: [DONE]\n\n";
