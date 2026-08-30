@@ -2,10 +2,6 @@
 //! cache. Pure: no I/O, no async. `zerocache-http/src/completion.rs` drives
 //! it with bytes from a `StreamingChatCompletionProvider`.
 
-// The consumer (`completion.rs::complete_streaming`) lands in a later task of
-// this feature; until then every item here is unused from the binary target.
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 use serde_json::{json, Value};

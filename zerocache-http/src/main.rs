@@ -834,10 +834,33 @@ async fn chat_completions_handler(
             return stream_passthrough(stream_provider, api_key, request_body).await;
         }
 
-        // Cacheable streaming request -> handled by complete_streaming (Task 6).
-        // Until Task 6 lands, fall through to passthrough so nothing is
-        // mis-cached (today's behaviour mis-caches SSE as JSON).
-        return stream_passthrough(stream_provider, api_key, request_body).await;
+        let owner_id = derive_owner_id(&api_key);
+        let outcome = completion::complete_streaming(
+            Arc::clone(&state),
+            completion::CompletionStreamRequest {
+                stream_provider,
+                provider_name: &provider_name,
+                api_key: &api_key,
+                owner_id,
+                model: &model,
+                body: &request_body,
+            },
+        )
+        .await
+        .map_err(|err| {
+            let status = match &err {
+                AppError::Provider(_) => StatusCode::BAD_GATEWAY,
+                AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (
+                status,
+                Json(ErrorResponse {
+                    error: err.to_string(),
+                }),
+            )
+        })?;
+
+        return Ok(streaming_response(outcome));
     }
 
     let owner_id = derive_owner_id(&api_key);
@@ -936,6 +959,65 @@ async fn stream_passthrough(
         "false".parse().expect("static ascii"),
     );
     Ok(response)
+}
+
+/// Turns a `complete_streaming` outcome into the HTTP response: a
+/// `text/event-stream` body plus the same `X-Zerocache-Completion-Hit` /
+/// `-Hit-Kind` / `-Semantic-Score` headers the non-streaming handler sets, or
+/// the forwarded non-2xx upstream error.
+fn streaming_response(outcome: completion::StreamingOutcome) -> Response {
+    match outcome {
+        completion::StreamingOutcome::Stream {
+            body,
+            hit,
+            hit_kind,
+            semantic_score,
+        } => {
+            let mut response = Response::builder()
+                .status(StatusCode::OK)
+                .body(body)
+                .expect("building a streaming response with a valid status cannot fail");
+            let headers = response.headers_mut();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                "text/event-stream".parse().expect("static ascii"),
+            );
+            headers.insert(
+                "x-zerocache-completion-hit",
+                if hit { "true" } else { "false" }
+                    .parse()
+                    .expect("static ascii is a valid header value"),
+            );
+            if let Some(kind) = hit_kind {
+                headers.insert(
+                    "x-zerocache-completion-hit-kind",
+                    match kind {
+                        completion::HitKind::Exact => "exact",
+                        completion::HitKind::Semantic => "semantic",
+                    }
+                    .parse()
+                    .expect("static ascii is a valid header value"),
+                );
+            }
+            if let Some(score) = semantic_score {
+                if let Ok(v) = format!("{score:.3}").parse() {
+                    response
+                        .headers_mut()
+                        .insert("x-zerocache-semantic-score", v);
+                }
+            }
+            response
+        }
+        completion::StreamingOutcome::UpstreamError(resp) => {
+            let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut response = (status, Json(resp.body)).into_response();
+            response.headers_mut().insert(
+                "x-zerocache-completion-hit",
+                "false".parse().expect("static ascii"),
+            );
+            response
+        }
+    }
 }
 
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {

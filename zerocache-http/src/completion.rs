@@ -19,6 +19,7 @@ use tracing::Instrument;
 use zerocache_core::{canonicalize_completion_request, completion_request_is_cacheable, CacheKey};
 use zerocache_ports::{
     ChatCompletionProvider, ChatCompletionResponse, CompletionUsage, ProviderError,
+    StreamingChatCompletionProvider,
 };
 
 use crate::app::{run_store_task, AppError, AppState, SharedCompletion, SharedCompletionOutput};
@@ -408,6 +409,396 @@ async fn fetch_completion_coalesced(
             Ok(((*response).clone(), Coalesced::Local))
         }
     }
+}
+
+// --- streaming completion cache (see crate::sse) ---
+
+/// Everything one `stream:true` `POST /{provider}/v1/chat/completions` call
+/// needs. The streaming counterpart to `CompletionRequest`.
+pub struct CompletionStreamRequest<'a> {
+    pub stream_provider: Arc<dyn StreamingChatCompletionProvider>,
+    pub provider_name: &'a str,
+    pub api_key: &'a str,
+    pub owner_id: [u8; 32],
+    pub model: &'a str,
+    pub body: &'a serde_json::Value,
+}
+
+/// What `complete_streaming` resolves to. `Stream` carries a live SSE body
+/// (a tee of the upstream on a miss, a paced replay on a hit); `UpstreamError`
+/// is a non-2xx upstream response, forwarded verbatim and never cached.
+pub enum StreamingOutcome {
+    Stream {
+        body: axum::body::Body,
+        hit: bool,
+        hit_kind: Option<HitKind>,
+        semantic_score: Option<f32>,
+    },
+    UpstreamError(ChatCompletionResponse),
+}
+
+/// The streaming counterpart to `complete()`. Mirrors its exact-match and
+/// (feature-gated) semantic-probe lookup blocks verbatim; on a hit it replays
+/// the stored completion as a paced SSE stream, and on a miss it tees the
+/// upstream SSE stream to the client live while a background task
+/// (`spawn_tee`) buffers it and, on a clean finish, stores both the assembled
+/// non-streaming body and the raw SSE bytes.
+///
+/// Takes `Arc<AppState>` (not `&AppState`) because the miss path spawns a
+/// background tee that outlives this call.
+#[tracing::instrument(skip_all, fields(provider = %request.provider_name))]
+pub async fn complete_streaming(
+    state: Arc<AppState>,
+    request: CompletionStreamRequest<'_>,
+) -> Result<StreamingOutcome, AppError> {
+    let version = request.stream_provider.version();
+    let cache_scope = request
+        .stream_provider
+        .cache_scope(request.model)
+        .map_err(AppError::Provider)?;
+    let canonical = canonicalize_completion_request(request.body);
+    let key = CacheKey::derive_completion(
+        request.owner_id,
+        request.provider_name,
+        &cache_scope,
+        request.model,
+        version,
+        &canonical,
+    );
+
+    let cached = {
+        let store = Arc::clone(&state.completion_store);
+        run_store_task(move || store.get(&key).map_err(AppError::Store))
+            .instrument(tracing::info_span!("store_lookup"))
+            .await?
+    };
+
+    // A stored record that no longer deserializes is a miss, not an error --
+    // same posture as `complete()`.
+    if let Some(record) =
+        cached.and_then(|bytes| serde_json::from_slice::<CachedCompletion>(&bytes).ok())
+    {
+        let usage = CompletionUsage {
+            prompt_tokens: record.prompt_tokens,
+            completion_tokens: record.completion_tokens,
+            total_tokens: record.total_tokens,
+        };
+        state
+            .metrics
+            .record_completion_hit(request.provider_name, true, &usage);
+        return Ok(StreamingOutcome::Stream {
+            body: replay_body(record),
+            hit: true,
+            hit_kind: Some(HitKind::Exact),
+            semantic_score: None,
+        });
+    }
+
+    #[cfg(feature = "semantic")]
+    let mut semantic_ctx: Option<(zerocache_semantic::ScopeKey, [u8; 32], Vec<f32>)> = None;
+
+    #[cfg(feature = "semantic")]
+    if let Some(sem) = &state.semantic {
+        if let Some((fuzzy_text, coarse_hash)) =
+            crate::semantic::semantic_inputs(sem.match_unit, request.body)
+        {
+            let scope = crate::semantic::scope_key(
+                &request.owner_id,
+                request.provider_name,
+                &cache_scope,
+                request.model,
+            );
+            let embedder = Arc::clone(&sem.embedder);
+            let qvec = match tokio::task::spawn_blocking(move || embedder.embed(&fuzzy_text))
+                .await
+                .expect("embed task panicked")
+            {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("semantic: embed failed, falling back to provider: {e}");
+                    None
+                }
+            };
+
+            if let Some(qvec) = qvec {
+                if let Some(hit) = crate::semantic::semantic_probe(
+                    sem,
+                    &state.completion_store,
+                    scope,
+                    coarse_hash,
+                    &qvec,
+                )
+                .await?
+                {
+                    if let Ok(record) =
+                        serde_json::from_slice::<CachedCompletion>(&hit.record_bytes)
+                    {
+                        let usage = CompletionUsage {
+                            prompt_tokens: record.prompt_tokens,
+                            completion_tokens: record.completion_tokens,
+                            total_tokens: record.total_tokens,
+                        };
+                        state
+                            .metrics
+                            .record_completion_hit(request.provider_name, true, &usage);
+                        state
+                            .metrics
+                            .record_completion_semantic_hit(request.provider_name, true);
+                        return Ok(StreamingOutcome::Stream {
+                            body: replay_body(record),
+                            hit: true,
+                            hit_kind: Some(HitKind::Semantic),
+                            semantic_score: Some(hit.score),
+                        });
+                    }
+                }
+                semantic_ctx = Some((scope, coarse_hash, qvec));
+            }
+        }
+    }
+
+    // Miss: open the upstream stream, injecting stream_options.include_usage
+    // when the caller did not ask for it (so the stored record carries real
+    // token counts even if the client stream must not show them).
+    let patched = patch_stream_options(request.body);
+    let injected = patched != *request.body;
+
+    let (status, mut upstream) = request
+        .stream_provider
+        .chat_completion_stream(request.api_key, &patched)
+        .await
+        .map_err(AppError::Provider)?;
+
+    if !(200..300).contains(&status) {
+        use futures::StreamExt;
+        let mut buf = Vec::new();
+        while let Some(item) = upstream.next().await {
+            match item {
+                Ok(chunk) => buf.extend_from_slice(&chunk),
+                Err(_) => break,
+            }
+        }
+        let body = serde_json::from_slice::<serde_json::Value>(&buf).unwrap_or_else(
+            |_| serde_json::json!({ "error": String::from_utf8_lossy(&buf).into_owned() }),
+        );
+        return Ok(StreamingOutcome::UpstreamError(ChatCompletionResponse {
+            status,
+            body,
+            usage: CompletionUsage::default(),
+        }));
+    }
+
+    let (tx, rx) = futures::channel::mpsc::unbounded::<Result<axum::body::Bytes, std::io::Error>>();
+    spawn_tee(
+        Arc::clone(&state),
+        request.provider_name.to_string(),
+        key,
+        upstream,
+        tx,
+        injected,
+        #[cfg(feature = "semantic")]
+        semantic_ctx.take(),
+    );
+
+    Ok(StreamingOutcome::Stream {
+        body: axum::body::Body::from_stream(rx),
+        hit: false,
+        hit_kind: None,
+        semantic_score: None,
+    })
+}
+
+/// True when `ev` is the trailing usage-only chunk OpenAI emits when
+/// `stream_options.include_usage` is set: `Data` with an empty `choices`
+/// array and a `usage` key.
+fn is_usage_only_data(ev: &crate::sse::SseEvent) -> bool {
+    match ev {
+        crate::sse::SseEvent::Data(v) => {
+            v.get("choices")
+                .and_then(|c| c.as_array())
+                .is_some_and(|a| a.is_empty())
+                && v.get("usage").is_some()
+        }
+        _ => false,
+    }
+}
+
+/// Background task: read the upstream SSE stream to the end, forwarding each
+/// chunk to the client (`tx`) while assembling the non-streaming body and
+/// capturing the raw bytes. On a clean finish (`Completeness::Complete`),
+/// store `{assembled body, token counts, raw SSE}`. An incomplete or
+/// error-carrying stream stores nothing.
+#[allow(clippy::too_many_arguments)]
+fn spawn_tee(
+    state: Arc<AppState>,
+    provider_name: String,
+    key: CacheKey,
+    mut upstream: zerocache_ports::SseByteStream,
+    tx: futures::channel::mpsc::UnboundedSender<Result<axum::body::Bytes, std::io::Error>>,
+    injected: bool,
+    #[cfg(feature = "semantic")] semantic_ctx: Option<(
+        zerocache_semantic::ScopeKey,
+        [u8; 32],
+        Vec<f32>,
+    )>,
+) {
+    tokio::spawn(async move {
+        use futures::StreamExt;
+
+        use crate::sse::{Completeness, DeltaAssembler, SseFrameParser};
+
+        let mut parser = SseFrameParser::new();
+        let mut asm = DeltaAssembler::new();
+        let mut raw_capture: Vec<u8> = Vec::new();
+        let mut malformed: Vec<String> = Vec::new();
+        let mut client_gone = false;
+
+        while let Some(item) = upstream.next().await {
+            match item {
+                Ok(chunk) => {
+                    let events = parser.feed(&chunk);
+                    let suppress = injected && events.len() == 1 && is_usage_only_data(&events[0]);
+                    for ev in &events {
+                        asm.ingest(ev);
+                        if let crate::sse::SseEvent::Malformed(payload) = ev {
+                            malformed.push(payload.clone());
+                        }
+                    }
+                    if !suppress {
+                        if !client_gone
+                            && tx
+                                .unbounded_send(Ok(axum::body::Bytes::copy_from_slice(&chunk)))
+                                .is_err()
+                        {
+                            // Client hung up: stop forwarding, keep draining so
+                            // the store still fills.
+                            client_gone = true;
+                        }
+                        raw_capture.extend_from_slice(&chunk);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("streamed completion upstream error, not caching: {e}");
+                    break;
+                }
+            }
+        }
+
+        for ev in parser.finish() {
+            if let crate::sse::SseEvent::Malformed(payload) = &ev {
+                malformed.push(payload.clone());
+            }
+            asm.ingest(&ev);
+        }
+
+        let out = asm.finish();
+        match out.completeness {
+            Completeness::Complete => {
+                let record = CachedCompletion {
+                    body: out.body.clone(),
+                    prompt_tokens: out.usage.prompt_tokens,
+                    completion_tokens: out.usage.completion_tokens,
+                    total_tokens: out.usage.total_tokens,
+                    raw_sse: Some(raw_capture),
+                };
+                match serde_json::to_vec(&record) {
+                    Ok(bytes) => {
+                        let store = Arc::clone(&state.completion_store);
+                        match run_store_task(move || store.put(key, bytes).map_err(AppError::Store))
+                            .instrument(tracing::info_span!("store_write_back"))
+                            .await
+                        {
+                            Ok(()) => {
+                                #[cfg(feature = "semantic")]
+                                if let (Some(sem), Some((scope, coarse_hash, qvec))) =
+                                    (&state.semantic, semantic_ctx)
+                                {
+                                    crate::semantic::record_vector(
+                                        sem,
+                                        key,
+                                        scope,
+                                        coarse_hash,
+                                        qvec,
+                                    )
+                                    .await;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("streamed completion store write failed: {e}")
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("streamed completion serialize failed: {e}"),
+                }
+                state.metrics.record_completion_miss(&provider_name, true);
+            }
+            Completeness::Incomplete(reason) => {
+                if malformed.is_empty() {
+                    tracing::warn!("streamed completion not cached: {reason}");
+                } else {
+                    tracing::warn!(
+                        "streamed completion not cached: {reason} (malformed frames: {malformed:?})"
+                    );
+                }
+                state.metrics.record_completion_miss(&provider_name, true);
+            }
+        }
+
+        // OpenAI forwards `data: [DONE]` as a normal frame, so it is already in
+        // the client stream / raw_capture -- do not synthesize another here.
+        drop(tx);
+    });
+}
+
+/// A clone of `body` with `stream_options.include_usage = true` merged in when
+/// it is not already set. Given verbatim by the task brief.
+fn patch_stream_options(body: &serde_json::Value) -> serde_json::Value {
+    let mut b = body.clone();
+    let already = b
+        .get("stream_options")
+        .and_then(|so| so.get("include_usage"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !already {
+        let obj = b.as_object_mut().expect("chat body is a JSON object");
+        let so = obj
+            .entry("stream_options")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(so) = so.as_object_mut() {
+            so.insert("include_usage".into(), serde_json::json!(true));
+        }
+    }
+    b
+}
+
+/// Replay a stored completion as a paced SSE stream: the verbatim raw SSE
+/// bytes when present, else re-chunked from the assembled body. Given
+/// verbatim by the task brief.
+fn replay_body(record: CachedCompletion) -> axum::body::Body {
+    let frames = match &record.raw_sse {
+        Some(raw) => crate::sse::split_frames(raw),
+        None => crate::sse::rechunk(&record.body),
+    };
+    let (tx, rx) = futures::channel::mpsc::unbounded::<Result<axum::body::Bytes, std::io::Error>>();
+    tokio::spawn(async move {
+        let ends_with_done = frames
+            .last()
+            .map(|f| f.windows(6).any(|w| w == b"[DONE]"))
+            .unwrap_or(false);
+        for frame in frames {
+            if tx
+                .unbounded_send(Ok(axum::body::Bytes::from(frame)))
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(crate::sse::SSE_REPLAY_FRAME_DELAY).await;
+        }
+        if !ends_with_done {
+            let _ = tx.unbounded_send(Ok(axum::body::Bytes::from_static(b"data: [DONE]\n\n")));
+        }
+    });
+    axum::body::Body::from_stream(rx)
 }
 
 #[cfg(test)]
@@ -977,6 +1368,330 @@ mod tests {
         let out2 = complete(&st, req(&provider, OWNER_A, &body)).await.unwrap();
         assert!(out2.hit);
         assert_eq!(provider.call_count(), 1);
+    }
+
+    mod streaming {
+        use std::sync::atomic::AtomicBool;
+
+        use super::*;
+
+        struct MockStreamProvider {
+            frames: Vec<Vec<u8>>,
+            status: u16,
+            error_body: Vec<u8>,
+            calls: AtomicUsize,
+            last_include_usage: AtomicBool,
+        }
+
+        impl MockStreamProvider {
+            fn ok(frames: Vec<Vec<u8>>) -> Self {
+                Self {
+                    frames,
+                    status: 200,
+                    error_body: Vec::new(),
+                    calls: AtomicUsize::new(0),
+                    last_include_usage: AtomicBool::new(false),
+                }
+            }
+            fn status(status: u16, body: Vec<u8>) -> Self {
+                Self {
+                    frames: Vec::new(),
+                    status,
+                    error_body: body,
+                    calls: AtomicUsize::new(0),
+                    last_include_usage: AtomicBool::new(false),
+                }
+            }
+            fn calls(&self) -> usize {
+                self.calls.load(Ordering::SeqCst)
+            }
+            fn last_request_had_include_usage(&self) -> bool {
+                self.last_include_usage.load(Ordering::SeqCst)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl zerocache_ports::StreamingChatCompletionProvider for MockStreamProvider {
+            async fn chat_completion_stream(
+                &self,
+                _api_key: &str,
+                request: &serde_json::Value,
+            ) -> Result<(u16, zerocache_ports::SseByteStream), ProviderError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let inc = request
+                    .get("stream_options")
+                    .and_then(|so| so.get("include_usage"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                self.last_include_usage.store(inc, Ordering::SeqCst);
+                let items: Vec<Result<Vec<u8>, ProviderError>> =
+                    if (200..300).contains(&self.status) {
+                        self.frames.iter().cloned().map(Ok).collect()
+                    } else {
+                        vec![Ok(self.error_body.clone())]
+                    };
+                Ok((self.status, Box::pin(futures::stream::iter(items))))
+            }
+            // Must match MockChatProvider's version/cache_scope so an entry
+            // written by one path is found by the other.
+            fn version(&self) -> &'static str {
+                "mock-chat-v1"
+            }
+            fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+                Ok("mock-scope".to_string())
+            }
+        }
+
+        fn state_streaming(store: MockCompletionStore) -> Arc<AppState> {
+            Arc::new(state(store))
+        }
+
+        async fn drain(body: axum::body::Body) -> String {
+            use futures::StreamExt;
+            let mut s = body.into_data_stream();
+            let mut buf = Vec::new();
+            while let Some(c) = s.next().await {
+                buf.extend_from_slice(&c.unwrap());
+            }
+            String::from_utf8(buf).unwrap()
+        }
+
+        fn sreq<'a>(
+            p: &Arc<MockStreamProvider>,
+            owner: [u8; 32],
+            body: &'a serde_json::Value,
+        ) -> CompletionStreamRequest<'a> {
+            CompletionStreamRequest {
+                stream_provider: Arc::clone(p)
+                    as Arc<dyn zerocache_ports::StreamingChatCompletionProvider>,
+                provider_name: "openai",
+                api_key: "sk-caller",
+                owner_id: owner,
+                model: "gpt-4o",
+                body,
+            }
+        }
+
+        #[tokio::test]
+        async fn streamed_miss_streams_live_then_a_stream_true_hit_replays_raw_bytes() {
+            let frames = vec![
+                b"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hel\"}}]}\n\n".to_vec(),
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n".to_vec(),
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11}}\n\n".to_vec(),
+                b"data: [DONE]\n\n".to_vec(),
+            ];
+            let provider = Arc::new(MockStreamProvider::ok(frames.clone()));
+            let st = state_streaming(MockCompletionStore::empty());
+            let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"temperature":0,"stream":true});
+
+            let out = complete_streaming(Arc::clone(&st), sreq(&provider, OWNER_A, &body))
+                .await
+                .unwrap();
+            let StreamingOutcome::Stream { body: b, hit, .. } = out else {
+                panic!("expected Stream")
+            };
+            assert!(!hit);
+            let streamed = drain(b).await;
+            assert!(
+                streamed.contains("hel") && streamed.contains("lo") && streamed.contains("[DONE]")
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(provider.calls(), 1);
+
+            let out2 = complete_streaming(Arc::clone(&st), sreq(&provider, OWNER_A, &body))
+                .await
+                .unwrap();
+            let StreamingOutcome::Stream {
+                body: b2,
+                hit: hit2,
+                hit_kind,
+                ..
+            } = out2
+            else {
+                panic!()
+            };
+            assert!(hit2);
+            assert_eq!(hit_kind, Some(HitKind::Exact));
+            assert_eq!(provider.calls(), 1, "the hit must not call upstream");
+            let replayed = drain(b2).await;
+            assert!(replayed.contains("\"content\":\"hel\""));
+            assert!(replayed.contains("[DONE]"));
+        }
+
+        #[tokio::test]
+        async fn a_stream_false_request_hits_an_entry_filled_by_a_streamed_miss() {
+            let frames = vec![
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n".to_vec(),
+                b"data: [DONE]\n\n".to_vec(),
+            ];
+            let provider = Arc::new(MockStreamProvider::ok(frames));
+            let st = state_streaming(MockCompletionStore::empty());
+            let sbody = json!({"model":"gpt-4o","messages":[{"role":"user","content":"q"}],"temperature":0,"stream":true});
+            complete_streaming(Arc::clone(&st), sreq(&provider, OWNER_A, &sbody))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let chat_provider = Arc::new(MockChatProvider::ok(
+                json!({"never":"called"}),
+                CompletionUsage::default(),
+            ));
+            let nbody = json!({"model":"gpt-4o","messages":[{"role":"user","content":"q"}],"temperature":0});
+            let out = complete(&st, req(&chat_provider, OWNER_A, &nbody))
+                .await
+                .unwrap();
+            assert!(
+                out.hit,
+                "stream:false must hit the entry a stream:true miss wrote"
+            );
+            assert_eq!(
+                out.response.body["choices"][0]["message"]["content"],
+                "answer"
+            );
+            assert_eq!(chat_provider.call_count(), 0);
+        }
+
+        #[tokio::test]
+        async fn a_stream_true_request_hits_an_entry_filled_by_a_non_streaming_miss_via_rechunk() {
+            let chat_provider = Arc::new(MockChatProvider::ok(
+                json!({"id":"x","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"stored"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}),
+                CompletionUsage {
+                    prompt_tokens: 3,
+                    completion_tokens: 1,
+                    total_tokens: 4,
+                },
+            ));
+            let st = state_streaming(MockCompletionStore::empty());
+            let nbody = json!({"model":"gpt-4o","messages":[{"role":"user","content":"q"}],"temperature":0});
+            complete(&st, req(&chat_provider, OWNER_A, &nbody))
+                .await
+                .unwrap();
+
+            let stream_provider = Arc::new(MockStreamProvider::ok(vec![]));
+            let sbody = json!({"model":"gpt-4o","messages":[{"role":"user","content":"q"}],"temperature":0,"stream":true});
+            let out = complete_streaming(Arc::clone(&st), sreq(&stream_provider, OWNER_A, &sbody))
+                .await
+                .unwrap();
+            let StreamingOutcome::Stream { body, hit, .. } = out else {
+                panic!()
+            };
+            assert!(hit);
+            assert_eq!(stream_provider.calls(), 0);
+            let replayed = drain(body).await;
+            assert!(replayed.contains("\"content\":\"stored\""));
+            assert!(replayed.trim_end().ends_with("data: [DONE]"));
+        }
+
+        #[tokio::test]
+        async fn an_incomplete_stream_is_not_stored() {
+            let frames = vec![
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n"
+                    .to_vec(),
+            ];
+            let provider = Arc::new(MockStreamProvider::ok(frames));
+            let st = state_streaming(MockCompletionStore::empty());
+            let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"temperature":0,"stream":true});
+            let out = complete_streaming(Arc::clone(&st), sreq(&provider, OWNER_A, &body))
+                .await
+                .unwrap();
+            let StreamingOutcome::Stream { body: b, .. } = out else {
+                panic!()
+            };
+            let _ = drain(b).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            complete_streaming(Arc::clone(&st), sreq(&provider, OWNER_A, &body))
+                .await
+                .unwrap();
+            assert_eq!(
+                provider.calls(),
+                2,
+                "an incomplete stream must not have been cached"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_error_frame_prevents_caching() {
+            let frames = vec![
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n".to_vec(),
+                b"data: {\"error\":{\"message\":\"boom\"}}\n\n".to_vec(),
+                b"data: [DONE]\n\n".to_vec(),
+            ];
+            let provider = Arc::new(MockStreamProvider::ok(frames));
+            let st = state_streaming(MockCompletionStore::empty());
+            let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"temperature":0,"stream":true});
+            let out = complete_streaming(Arc::clone(&st), sreq(&provider, OWNER_A, &body))
+                .await
+                .unwrap();
+            let StreamingOutcome::Stream { body: b, .. } = out else {
+                panic!()
+            };
+            let _ = drain(b).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            complete_streaming(Arc::clone(&st), sreq(&provider, OWNER_A, &body))
+                .await
+                .unwrap();
+            assert_eq!(provider.calls(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_non_2xx_upstream_stream_returns_an_upstream_error_and_is_not_cached() {
+            let provider = Arc::new(MockStreamProvider::status(429, b"slow down".to_vec()));
+            let st = state_streaming(MockCompletionStore::empty());
+            let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"temperature":0,"stream":true});
+            let out = complete_streaming(Arc::clone(&st), sreq(&provider, OWNER_A, &body))
+                .await
+                .unwrap();
+            match out {
+                StreamingOutcome::UpstreamError(resp) => assert_eq!(resp.status, 429),
+                _ => panic!("expected UpstreamError"),
+            }
+            complete_streaming(Arc::clone(&st), sreq(&provider, OWNER_A, &body))
+                .await
+                .unwrap();
+            assert_eq!(provider.calls(), 2);
+        }
+
+        #[tokio::test]
+        async fn include_usage_is_injected_and_the_usage_chunk_is_withheld_from_a_client_that_did_not_ask(
+        ) {
+            let frames = vec![
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n".to_vec(),
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,\"total_tokens\":9}}\n\n".to_vec(),
+                b"data: [DONE]\n\n".to_vec(),
+            ];
+            let provider = Arc::new(MockStreamProvider::ok(frames));
+            let st = state_streaming(MockCompletionStore::empty());
+            let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"temperature":0,"stream":true});
+            let out = complete_streaming(Arc::clone(&st), sreq(&provider, OWNER_A, &body))
+                .await
+                .unwrap();
+            let StreamingOutcome::Stream { body: b, .. } = out else {
+                panic!()
+            };
+            let streamed = drain(b).await;
+            assert!(
+                !streamed.contains("\"usage\""),
+                "the client did not ask for usage"
+            );
+            assert!(
+                provider.last_request_had_include_usage(),
+                "we must have injected it upstream"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let chat_provider =
+                Arc::new(MockChatProvider::ok(json!({}), CompletionUsage::default()));
+            let nbody = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"temperature":0});
+            complete(&st, req(&chat_provider, OWNER_A, &nbody))
+                .await
+                .unwrap();
+            let dump = st.metrics.encode();
+            assert!(
+                dump.contains("zerocache_completion_prompt_tokens_saved_total{provider=\"openai\",stream=\"false\"} 8"),
+                "{dump}"
+            );
+        }
     }
 
     #[cfg(feature = "semantic")]
