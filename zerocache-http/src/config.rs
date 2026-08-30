@@ -80,7 +80,6 @@ pub struct Config {
     pub semantic_enabled: bool,
     /// Redis-backed cross-replica single-flight. Only honoured on the
     /// redis storage backend (see main.rs).
-    #[expect(dead_code)]
     pub cross_replica_coalescing: bool,
     #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
     pub semantic_threshold: f32,

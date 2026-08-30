@@ -39,7 +39,7 @@ use zerocache_adapters_gemini::GeminiProvider;
 use zerocache_adapters_huggingface::HuggingFaceProvider;
 use zerocache_adapters_mistral::MistralProvider;
 use zerocache_adapters_openai::{OpenAiProvider, OpenAiWireChatProvider};
-use zerocache_adapters_redis::RedisStore;
+use zerocache_adapters_redis::{RedisCoordinator, RedisStore};
 use zerocache_adapters_sled::SledStore;
 use zerocache_adapters_vertexai::new_provider as new_vertexai_provider;
 use zerocache_core::derive_owner_id;
@@ -106,6 +106,28 @@ async fn main() {
                 )
             }
         };
+
+    // Redis-backed cross-replica single-flight only when the flag is set on the
+    // redis backend; otherwise the in-process no-op. A redis-connect failure is
+    // a hard boot failure -- the operator asked for it, don't silently downgrade.
+    let coordinator: Arc<dyn zerocache_ports::CoalescingCoordinator> = match (
+        &config.storage_backend,
+        config.cross_replica_coalescing,
+    ) {
+        (StorageBackend::Redis, true) => {
+            let c = RedisCoordinator::connect(&config.redis_url)
+                .expect("failed to connect the cross-replica coordinator to redis");
+            tracing::info!("cross-replica request coalescing is ON (redis single-flight)");
+            Arc::new(c)
+        }
+        (StorageBackend::Sled, true) => {
+            tracing::warn!(
+                    "ZEROCACHE_CROSS_REPLICA_COALESCING is set but the storage backend is sled; cross-replica coalescing needs redis and is disabled"
+                );
+            Arc::new(coalesce::NoopCoordinator)
+        }
+        _ => Arc::new(coalesce::NoopCoordinator),
+    };
 
     let gemini_provider = Arc::new(GeminiProvider::new(config.gemini_base_url.clone()));
 
@@ -222,7 +244,7 @@ async fn main() {
         completion_store,
         completion_providers,
         completion_in_flight: std::sync::Mutex::new(HashMap::new()),
-        coordinator: Arc::new(coalesce::NoopCoordinator),
+        coordinator,
         #[cfg(feature = "semantic")]
         semantic,
     });
