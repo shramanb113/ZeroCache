@@ -3,7 +3,7 @@ use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use serde::{Deserialize, Serialize};
 use zerocache_ports::{
     ChatCompletionProvider, ChatCompletionResponse, CompletionUsage, EmbeddingProvider,
-    ProviderError, ProviderUsage,
+    ProviderError, ProviderUsage, SseByteStream, StreamingChatCompletionProvider,
 };
 
 // Deliberately conservative and uniform across all three provider adapters
@@ -215,8 +215,43 @@ impl ChatCompletionProvider for OpenAiWireChatProvider {
     }
 }
 
+#[async_trait::async_trait]
+impl StreamingChatCompletionProvider for OpenAiWireChatProvider {
+    async fn chat_completion_stream(
+        &self,
+        api_key: &str,
+        request: &serde_json::Value,
+    ) -> Result<(u16, SseByteStream), ProviderError> {
+        let response = self
+            .client
+            .post(format!("{}/chat/completions", self.url_prefix))
+            .bearer_auth(api_key)
+            .json(request)
+            .send()
+            .await
+            .map_err(|e| ProviderError(e.to_string()))?;
+
+        let status = response.status().as_u16();
+        let stream = futures::StreamExt::map(response.bytes_stream(), |chunk| {
+            chunk
+                .map(|b| b.to_vec())
+                .map_err(|e| ProviderError(e.to_string()))
+        });
+        Ok((status, Box::pin(stream)))
+    }
+
+    fn version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+        Ok(self.url_prefix.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use futures::StreamExt;
     use httpmock::prelude::*;
     use serde_json::json;
 
@@ -569,13 +604,69 @@ mod tests {
         let b =
             OpenAiWireChatProvider::new("https://generativelanguage.googleapis.com/v1beta/openai");
         assert_eq!(
-            a.cache_scope("gpt-4o").unwrap(),
+            ChatCompletionProvider::cache_scope(&a, "gpt-4o").unwrap(),
             "https://api.openai.com/v1"
         );
         assert_ne!(
-            a.cache_scope("gpt-4o").unwrap(),
-            b.cache_scope("gpt-4o").unwrap(),
+            ChatCompletionProvider::cache_scope(&a, "gpt-4o").unwrap(),
+            ChatCompletionProvider::cache_scope(&b, "gpt-4o").unwrap(),
             "real OpenAI and a Gemini-compat endpoint must not share completion-cache entries"
         );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_stream_yields_upstream_sse_frames_in_order() {
+        let server = MockServer::start_async().await;
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\"llo\"},\"finish_reason\":\"stop\"}]}\n\n\
+                    data: [DONE]\n\n";
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/chat/completions")
+                    .header("authorization", "Bearer sk-caller");
+                then.status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(body);
+            })
+            .await;
+
+        let provider = OpenAiWireChatProvider::new(server.base_url());
+        let (status, mut stream) = provider
+            .chat_completion_stream("sk-caller", &json!({ "model": "m", "stream": true }))
+            .await
+            .unwrap();
+
+        assert_eq!(status, 200);
+        let mut collected = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        mock.assert_async().await;
+        assert_eq!(String::from_utf8(collected).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn chat_completion_stream_surfaces_a_non_2xx_status_without_erroring() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/chat/completions");
+                then.status(429).body("slow down");
+            })
+            .await;
+
+        let provider = OpenAiWireChatProvider::new(server.base_url());
+        let (status, mut stream) = provider
+            .chat_completion_stream("sk-caller", &json!({ "model": "m", "stream": true }))
+            .await
+            .unwrap();
+
+        assert_eq!(status, 429);
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(String::from_utf8(body).unwrap(), "slow down");
     }
 }
