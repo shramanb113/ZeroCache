@@ -341,8 +341,7 @@ impl Metrics {
 
     /// A cheap clone of the counter vec, for incrementing from inside a
     /// 'static coalesced future that cannot borrow `&Metrics`. Consumed by
-    /// fetch_coalesced (Task 6); allow drops then.
-    #[allow(dead_code)]
+    /// `fetch_coalesced`'s single-key cross-replica path.
     pub(crate) fn cross_replica_coalesced_counter(&self) -> IntCounterVec {
         self.cross_replica_coalesced.clone()
     }
@@ -537,6 +536,7 @@ pub async fn embed_batch(
         let (fetched, usage) = fetch_coalesced(
             state,
             Arc::clone(&request.provider),
+            request.provider_name,
             request.api_key,
             request.model,
             &unique_keys,
@@ -819,6 +819,7 @@ pub async fn delete_image_batch(
 async fn fetch_coalesced(
     state: &AppState,
     provider: Arc<dyn EmbeddingProvider>,
+    provider_name: &str,
     api_key: &str,
     model: &str,
     unique_keys: &[CacheKey],
@@ -846,15 +847,94 @@ async fn fetch_coalesced(
             let model = model.to_string();
             let claim_keys_for_future = claim_keys.clone();
             let claim_texts_for_future = claim_texts.clone();
-
             let claim_count = claim_keys.len();
+
+            // Cross-replica single-flight applies only to a lone claimed key --
+            // the coordinator works one CacheKey at a time. A multi-key claim
+            // keeps exactly today's behaviour.
+            let single_key = (claim_keys.len() == 1).then(|| claim_keys[0]);
+            let coordinator = Arc::clone(&state.coordinator);
+            let store = Arc::clone(&state.store);
+            let coalesced_counter = state.metrics.cross_replica_coalesced_counter();
+            let provider_label = provider_name.to_string();
+
             let fut: Pin<Box<dyn Future<Output = SharedFetchOutput> + Send>> = Box::pin(
                 async move {
-                    let (vectors, usage) = provider
-                        .embed_batch(&api_key, &model, &claim_texts_for_future)
-                        .await?;
-                    let by_key = claim_keys_for_future.into_iter().zip(vectors).collect();
-                    Ok((Arc::new(by_key), usage))
+                    match single_key {
+                        None => {
+                            let (vectors, usage) = provider
+                                .embed_batch(&api_key, &model, &claim_texts_for_future)
+                                .await?;
+                            let by_key = claim_keys_for_future.into_iter().zip(vectors).collect();
+                            Ok((Arc::new(by_key), usage))
+                        }
+                        Some(key) => {
+                            use crate::coalesce::{
+                                coalesce_cross_replica, CoalesceTiming, CrossReplica,
+                            };
+                            let single_text = claim_texts_for_future[0].clone();
+                            let outcome = coalesce_cross_replica::<
+                                (HashMap<CacheKey, Vec<f32>>, ProviderUsage),
+                                _,
+                                _,
+                            >(
+                                &coordinator,
+                                key,
+                                CoalesceTiming::PROD,
+                                || {
+                                    let store = Arc::clone(&store);
+                                    async move {
+                                        let got = run_store_task(move || {
+                                            store.get(&key).map_err(AppError::Store)
+                                        })
+                                        .await
+                                        .unwrap_or(None);
+                                        Ok(got.map(|v| {
+                                            let mut m = HashMap::with_capacity(1);
+                                            m.insert(key, v);
+                                            (m, ProviderUsage::default())
+                                        }))
+                                    }
+                                },
+                                {
+                                    let provider = Arc::clone(&provider);
+                                    let api_key = api_key.clone();
+                                    let model = model.clone();
+                                    move || async move {
+                                        let (vectors, usage) = provider
+                                            .embed_batch(&api_key, &model, &[single_text])
+                                            .await
+                                            .map_err(AppError::Provider)?;
+                                        let mut m = HashMap::with_capacity(1);
+                                        m.insert(
+                                            key,
+                                            vectors.into_iter().next().expect(
+                                                "provider returned no vector for a one-text batch",
+                                            ),
+                                        );
+                                        Ok((m, usage))
+                                    }
+                                },
+                            )
+                            .await;
+
+                            match outcome {
+                                Ok(CrossReplica::Led((by_key, usage))) => {
+                                    Ok((Arc::new(by_key), usage))
+                                }
+                                Ok(CrossReplica::Followed((by_key, _))) => {
+                                    coalesced_counter
+                                        .with_label_values(&[&provider_label, "embedding"])
+                                        .inc();
+                                    Ok((Arc::new(by_key), ProviderUsage::default()))
+                                }
+                                Err(AppError::Provider(e)) => Err(e),
+                                Err(AppError::Store(e)) => Err(ProviderError(format!(
+                                    "store error during coalesced embedding fetch: {e}"
+                                ))),
+                            }
+                        }
+                    }
                 }
                 .instrument(tracing::info_span!("provider_call", texts = claim_count)),
             );
@@ -2610,5 +2690,147 @@ mod tests {
             vec![vec![2.0]],
             "and must return its own vector, not the cached one"
         );
+    }
+
+    // --- cross-replica single-flight for lone-key embedding misses ---
+
+    use zerocache_ports::{CoalescingCoordinator, FollowSignal, Role};
+
+    /// Always a follower whose `follow` returns immediately -- models a peer
+    /// replica that has already claimed and is filling this key.
+    struct FollowerCoord;
+    impl CoalescingCoordinator for FollowerCoord {
+        fn try_lead(&self, _k: &CacheKey) -> Role {
+            Role::Follower
+        }
+        fn complete(&self, _k: &CacheKey) {}
+        fn follow(&self, _k: &CacheKey, _w: std::time::Duration) -> FollowSignal {
+            FollowSignal::Signalled
+        }
+    }
+
+    /// Panics on `try_lead` -- proves a multi-key claim never reaches the
+    /// coordinator.
+    struct AssertNeverContendedCoord;
+    impl CoalescingCoordinator for AssertNeverContendedCoord {
+        fn try_lead(&self, _k: &CacheKey) -> Role {
+            panic!("multi-key batch must not enter the cross-replica path");
+        }
+        fn complete(&self, _k: &CacheKey) {}
+        fn follow(&self, _k: &CacheKey, _w: std::time::Duration) -> FollowSignal {
+            FollowSignal::WaitElapsed
+        }
+    }
+
+    /// `get` misses the first call (so `reconcile` records a miss) then hits
+    /// every later call (so the coalesced re-read finds a peer's fill).
+    struct MissThenHitStore {
+        value: Vec<f32>,
+        gets: std::sync::atomic::AtomicUsize,
+    }
+    impl EmbeddingStore for MissThenHitStore {
+        fn get(&self, _key: &CacheKey) -> Result<Option<Vec<f32>>, StoreError> {
+            let n = self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(if n == 0 {
+                None
+            } else {
+                Some(self.value.clone())
+            })
+        }
+        fn put(&self, _key: CacheKey, _v: Vec<f32>) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn delete(&self, _key: &CacheKey) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_single_key_miss_served_by_a_peer_fill_makes_no_provider_call() {
+        let mut state = state_with(MissThenHitStore {
+            value: vec![3.0, 3.0],
+            gets: std::sync::atomic::AtomicUsize::new(0),
+        });
+        state.coordinator = Arc::new(FollowerCoord);
+        let texts = vec!["solo".to_string()];
+
+        let (vectors, stats) = embed_batch(
+            &state,
+            EmbedRequest {
+                provider: Arc::new(PanicProvider), // must never be called
+                provider_name: "openai",
+                api_key: "k",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &texts,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(vectors, vec![vec![3.0, 3.0]]);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.provider_prompt_tokens, 0, "a peer fill bills nothing");
+
+        let dump = state.metrics.encode();
+        assert!(
+            dump.contains(
+                "zerocache_cross_replica_coalesced_total{kind=\"embedding\",provider=\"openai\"} 1"
+            ),
+            "{dump}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_multi_key_batch_never_enters_the_cross_replica_path() {
+        let mut state = state_with(MockStore::empty());
+        state.coordinator = Arc::new(AssertNeverContendedCoord);
+        let provider = MockProvider {
+            response: vec![vec![1.0], vec![2.0]],
+        };
+        let texts = vec!["alpha".to_string(), "beta".to_string()];
+
+        let (_v, stats) = embed_batch(
+            &state,
+            EmbedRequest {
+                provider: Arc::new(provider),
+                provider_name: "openai",
+                api_key: "k",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &texts,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.misses, 2); // AssertNeverContendedCoord.try_lead would panic
+    }
+
+    #[tokio::test]
+    async fn noop_coordinator_single_key_miss_still_calls_the_provider_and_writes_back() {
+        let state = state_with(MockStore::empty()); // default NoopCoordinator
+        let provider = MockProvider {
+            response: vec![vec![9.0]],
+        };
+        let texts = vec!["fresh".to_string()];
+
+        let (vectors, stats) = embed_batch(
+            &state,
+            EmbedRequest {
+                provider: Arc::new(provider),
+                provider_name: "openai",
+                api_key: "k",
+                owner_id: OWNER_A,
+                model: "m",
+                texts: &texts,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(vectors, vec![vec![9.0]]);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.provider_prompt_tokens, 10);
+        let key = CacheKey::derive(OWNER_A, "openai", "mock-scope", "m", "mock-v1", "fresh");
+        assert_eq!(state.store.get(&key).unwrap(), Some(vec![9.0]));
     }
 }
