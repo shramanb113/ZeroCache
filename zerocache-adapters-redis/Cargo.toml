@@ -6,8 +6,10 @@ edition.workspace = true
 [dependencies]
 zerocache-core = { path = "../zerocache-core" }
 zerocache-ports = { path = "../zerocache-ports" }
-redis = { version = "0.27", features = ["r2d2"] }
+redis = { version = "0.27", features = ["r2d2", "streams"] }
+tracing = "0.1"
 r2d2 = "0.8"
+base64 = "0.22"
 
 [dev-dependencies]
 testcontainers-modules = { version = "0.15", features = ["redis", "blocking"] }

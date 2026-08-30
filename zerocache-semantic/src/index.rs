@@ -30,6 +30,9 @@ struct ScopeIndex {
     hnsw: Hnsw<'static, f32, DistCosine>,
     meta: Vec<NodeMeta>,
     tombstones: HashSet<usize>,
+    /// exact_key -> node id. One node per key per scope: `insert` is
+    /// idempotent, so this stays 1:1 and makes `tombstone` O(1).
+    by_key: HashMap<CacheKey, usize>,
 }
 
 impl ScopeIndex {
@@ -44,6 +47,7 @@ impl ScopeIndex {
             ),
             meta: Vec::new(),
             tombstones: HashSet::new(),
+            by_key: HashMap::new(),
         }
     }
 }
@@ -75,11 +79,19 @@ impl SemanticIndex {
     ) {
         let mut map = self.inner.write().expect("semantic index lock poisoned");
         let si = map.entry(scope).or_insert_with(ScopeIndex::new);
+        if let Some(&id) = si.by_key.get(&exact_key) {
+            // Re-delivery (cursor-gap replay, or a writer seeing its own
+            // vector back via its poll). The vector is content-addressed by
+            // exact_key, so it is byte-identical -- just clear any tombstone.
+            si.tombstones.remove(&id);
+            return;
+        }
         let id = si.meta.len();
         si.meta.push(NodeMeta {
             coarse_key_hash,
             exact_key,
         });
+        si.by_key.insert(exact_key, id);
         si.hnsw.insert((vector, id));
     }
 
@@ -115,10 +127,8 @@ impl SemanticIndex {
     pub fn tombstone(&self, scope: ScopeKey, exact_key: &CacheKey) {
         let mut map = self.inner.write().expect("semantic index lock poisoned");
         if let Some(si) = map.get_mut(&scope) {
-            for (id, meta) in si.meta.iter().enumerate() {
-                if &meta.exact_key == exact_key {
-                    si.tombstones.insert(id);
-                }
+            if let Some(&id) = si.by_key.get(exact_key) {
+                si.tombstones.insert(id);
             }
         }
     }
@@ -149,6 +159,32 @@ mod tests {
     const SCOPE_A: ScopeKey = [1u8; 32];
     const SCOPE_B: ScopeKey = [2u8; 32];
     const COARSE: [u8; 32] = [3u8; 32];
+
+    #[test]
+    fn reinserting_a_live_key_does_not_grow_the_graph() {
+        let idx = SemanticIndex::new();
+        let v = vec_at(0.3);
+        idx.insert(SCOPE_A, &v, COARSE, key(10));
+        idx.insert(SCOPE_A, &v, COARSE, key(10));
+        assert_eq!(idx.len(SCOPE_A), 1);
+        let hit = idx.search(SCOPE_A, &v, COARSE, 0.97).expect("still searchable");
+        assert_eq!(hit.exact_key, key(10));
+    }
+
+    #[test]
+    fn reinserting_a_tombstoned_key_revives_it() {
+        let idx = SemanticIndex::new();
+        let v = vec_at(0.3);
+        idx.insert(SCOPE_A, &v, COARSE, key(10));
+        idx.tombstone(SCOPE_A, &key(10));
+        assert!(idx.search(SCOPE_A, &v, COARSE, 0.97).is_none());
+        idx.insert(SCOPE_A, &v, COARSE, key(10));
+        assert!(
+            idx.search(SCOPE_A, &v, COARSE, 0.97).is_some(),
+            "a re-delivered vector must clear the tombstone"
+        );
+        assert_eq!(idx.len(SCOPE_A), 1);
+    }
 
     #[test]
     fn search_returns_the_inserted_node_for_an_identical_vector() {

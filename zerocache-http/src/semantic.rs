@@ -8,11 +8,11 @@ use std::sync::Arc;
 use tracing::warn;
 
 use zerocache_core::{coarse_key_hash, completion_fuzzy_text, CacheKey, MatchUnit};
-use zerocache_ports::{CompletionStore, CompletionVectorStore, VectorRecord};
+use zerocache_ports::{CompletionStore, CompletionVectorStore, VectorChanges, VectorRecord};
 use zerocache_semantic::{ScopeKey, SemanticIndex, TextEmbed, TextEmbedder};
 
-use crate::app::{run_store_task, AppError};
-use crate::config::Config;
+use crate::app::{run_store_task, AppError, AppState, Metrics};
+use crate::config::{Config, StorageBackend};
 
 /// Bump only when the coarse-canonical *format* changes. `rebuild_index` skips
 /// persisted records with a different value.
@@ -78,7 +78,7 @@ pub async fn semantic_probe(
         })),
         None => {
             sem.index.tombstone(scope, &exact_key);
-            if let Err(e) = sem.vector_store.delete(&exact_key) {
+            if let Err(e) = sem.vector_store.delete(&exact_key, &scope) {
                 warn!("semantic: failed to drop a stale vector record: {e}");
             }
             Ok(None)
@@ -136,13 +136,31 @@ pub fn build_semantic_state(
 }
 
 /// Replay persisted vector records into the in-memory index at startup.
-pub fn rebuild_index(sem: &SemanticState) {
+/// Returns `Some(cursor)` when the store has a shared change-feed (redis) and
+/// the caller must spawn `run_semantic_poll_task`; `None` on a single-process
+/// store (sled).
+pub fn rebuild_index(sem: &SemanticState, config: &Config) -> Option<String> {
     let start = std::time::Instant::now();
-    let records = match sem.vector_store.load_all() {
-        Ok(r) => r,
+    let changes = match sem.vector_store.changes_since(None) {
+        Ok(c) => c,
         Err(e) => {
-            warn!("semantic: load_all failed at startup, index starts empty: {e}");
-            return;
+            warn!("semantic: changes_since(None) failed at startup, index starts empty: {e}");
+            // On redis, still start the poll task so a transient boot-time
+            // outage self-heals; "0-0" == replay from the start.
+            return matches!(config.storage_backend, StorageBackend::Redis)
+                .then(|| "0-0".to_string());
+        }
+    };
+    let poll_cursor = changes.cursor.clone();
+    let records: Vec<VectorRecord> = if poll_cursor.is_some() {
+        changes.upserts
+    } else {
+        match sem.vector_store.load_all() {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("semantic: load_all failed at startup, index starts empty: {e}");
+                return None;
+            }
         }
     };
     let (mut loaded, mut skipped) = (0usize, 0usize);
@@ -159,6 +177,78 @@ pub fn rebuild_index(sem: &SemanticState) {
         "semantic: index rebuilt — {loaded} vectors loaded, {skipped} skipped, in {:?}",
         start.elapsed()
     );
+    poll_cursor
+}
+
+/// Apply one batch of change-feed events to the local index. Extracted from
+/// the poll loop so it is testable without a tokio runtime or an `AppState`.
+fn apply_vector_changes(
+    index: &SemanticIndex,
+    metrics: &Metrics,
+    changes: VectorChanges,
+    cursor: &mut String,
+) {
+    let mut ups = 0u64;
+    let mut dels = 0u64;
+    for r in changes.upserts {
+        if r.index_version != SEMANTIC_INDEX_VERSION {
+            continue;
+        }
+        index.insert(r.scope_hash, &r.vector, r.coarse_key_hash, r.exact_key);
+        ups += 1;
+    }
+    for (k, s) in changes.deletes {
+        index.tombstone(s, &k);
+        dels += 1;
+    }
+    if let Some(c) = changes.cursor {
+        *cursor = c;
+    }
+    if ups > 0 || dels > 0 {
+        metrics.record_semantic_index_events_applied(ups, dels);
+    }
+}
+
+/// One background task per process (redis only). Polls `changes_since(cursor)`
+/// on `poll` interval via `spawn_blocking` and applies remote upserts/deletes
+/// to the local in-memory index. The query path never touches Redis; this is
+/// the only place the semantic tier reaches the network on the redis backend.
+pub async fn run_semantic_poll_task(
+    state: Arc<AppState>,
+    mut cursor: String,
+    poll: std::time::Duration,
+) {
+    let mut ticker = tokio::time::interval(poll);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut consecutive_errors: u32 = 0;
+    loop {
+        ticker.tick().await;
+        let Some(sem) = state.semantic.as_ref() else {
+            return;
+        };
+        let vs = Arc::clone(&sem.vector_store);
+        let cur = cursor.clone();
+        match tokio::task::spawn_blocking(move || vs.changes_since(Some(cur))).await {
+            Ok(Ok(changes)) => {
+                consecutive_errors = 0;
+                apply_vector_changes(sem.index.as_ref(), &state.metrics, changes, &mut cursor);
+            }
+            Ok(Err(e)) => {
+                consecutive_errors += 1;
+                if consecutive_errors == 1 || consecutive_errors.is_multiple_of(30) {
+                    warn!(
+                        "semantic index poll failed ({consecutive_errors}x), keeping cursor {cursor}: {e} (the redis semantic index needs Redis >= 6.2 for exclusive XRANGE / XTRIM MINID)"
+                    );
+                }
+            }
+            Err(join) => {
+                consecutive_errors += 1;
+                if consecutive_errors == 1 || consecutive_errors.is_multiple_of(30) {
+                    warn!("semantic index poll task join error ({consecutive_errors}x): {join}");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -168,9 +258,10 @@ mod tests {
 
     use serde_json::json;
     use zerocache_core::{CacheKey, MatchUnit};
-    use zerocache_ports::{CompletionStore, StoreError, VectorRecord};
+    use zerocache_ports::{CompletionStore, StoreError, VectorChanges, VectorRecord};
 
     use super::*;
+    use crate::app::Metrics;
 
     struct ConstEmbedder;
     impl zerocache_semantic::TextEmbed for ConstEmbedder {
@@ -187,12 +278,15 @@ mod tests {
             self.0.lock().unwrap().push(r);
             Ok(())
         }
-        fn delete(&self, k: &CacheKey) -> Result<(), StoreError> {
+        fn delete(&self, k: &CacheKey, _scope: &[u8; 32]) -> Result<(), StoreError> {
             self.0.lock().unwrap().retain(|r| &r.exact_key != k);
             Ok(())
         }
         fn load_all(&self) -> Result<Vec<VectorRecord>, StoreError> {
             Ok(self.0.lock().unwrap().clone())
+        }
+        fn changes_since(&self, _c: Option<String>) -> Result<VectorChanges, StoreError> {
+            Ok(VectorChanges::default())
         }
     }
 
@@ -306,5 +400,118 @@ mod tests {
         cfg.semantic_enabled = false;
         let vs: Arc<dyn CompletionVectorStore> = Arc::new(MemVectorStore(Mutex::new(Vec::new())));
         assert!(build_semantic_state(&cfg, vs).is_none());
+    }
+
+    fn rec(scope: ScopeKey, n: u8, iv: u8) -> VectorRecord {
+        VectorRecord {
+            exact_key: CacheKey::from_bytes([n; 32]),
+            scope_hash: scope,
+            coarse_key_hash: [7u8; 32],
+            index_version: iv,
+            vector: unit_vec(),
+        }
+    }
+
+    #[test]
+    fn apply_vector_changes_makes_upserts_searchable_and_advances_the_cursor() {
+        let sem = sem_state();
+        let m = Metrics::new();
+        let scope = scope_key(&[1u8; 32], "openai", "s", "gpt-4o");
+        let mut cursor = "0-0".to_string();
+        apply_vector_changes(
+            sem.index.as_ref(),
+            &m,
+            VectorChanges {
+                upserts: vec![rec(scope, 10, SEMANTIC_INDEX_VERSION)],
+                deletes: vec![],
+                cursor: Some("15-0".to_string()),
+            },
+            &mut cursor,
+        );
+        assert_eq!(cursor, "15-0");
+        assert!(sem
+            .index
+            .search(scope, &unit_vec(), [7u8; 32], 0.97)
+            .is_some());
+        assert!(m
+            .encode()
+            .contains("zerocache_semantic_index_events_applied_total{op=\"upsert\"} 1"));
+    }
+
+    #[test]
+    fn apply_vector_changes_tombstones_deletes_and_skips_version_skew() {
+        let sem = sem_state();
+        let m = Metrics::new();
+        let scope = scope_key(&[1u8; 32], "openai", "s", "gpt-4o");
+        let mut cursor = "0-0".to_string();
+        apply_vector_changes(
+            sem.index.as_ref(),
+            &m,
+            VectorChanges {
+                upserts: vec![
+                    rec(scope, 10, SEMANTIC_INDEX_VERSION),
+                    rec(scope, 20, SEMANTIC_INDEX_VERSION + 1),
+                ],
+                deletes: vec![],
+                cursor: Some("1-0".to_string()),
+            },
+            &mut cursor,
+        );
+        assert_eq!(
+            sem.index.len(scope),
+            1,
+            "the version-skew record must be skipped"
+        );
+
+        apply_vector_changes(
+            sem.index.as_ref(),
+            &m,
+            VectorChanges {
+                upserts: vec![],
+                deletes: vec![(CacheKey::from_bytes([10u8; 32]), scope)],
+                cursor: Some("2-0".to_string()),
+            },
+            &mut cursor,
+        );
+        assert!(sem
+            .index
+            .search(scope, &unit_vec(), [7u8; 32], 0.97)
+            .is_none());
+    }
+
+    #[test]
+    fn rebuild_index_on_a_changes_since_error_starts_empty_and_returns_a_redis_cursor() {
+        struct ErrStore;
+        impl CompletionVectorStore for ErrStore {
+            fn insert(&self, _r: VectorRecord) -> Result<(), zerocache_ports::StoreError> {
+                Ok(())
+            }
+            fn delete(
+                &self,
+                _k: &CacheKey,
+                _s: &[u8; 32],
+            ) -> Result<(), zerocache_ports::StoreError> {
+                Ok(())
+            }
+            fn load_all(&self) -> Result<Vec<VectorRecord>, zerocache_ports::StoreError> {
+                Ok(vec![])
+            }
+            fn changes_since(
+                &self,
+                _c: Option<String>,
+            ) -> Result<VectorChanges, zerocache_ports::StoreError> {
+                Err(zerocache_ports::StoreError("redis down".into()))
+            }
+        }
+        let mut cfg = crate::config::Config::from_env();
+        cfg.storage_backend = crate::config::StorageBackend::Redis;
+        let sem = SemanticState {
+            embedder: Arc::new(ConstEmbedder),
+            index: Arc::new(SemanticIndex::new()),
+            vector_store: Arc::new(ErrStore),
+            threshold: 0.97,
+            match_unit: MatchUnit::LastUser,
+        };
+        assert_eq!(rebuild_index(&sem, &cfg), Some("0-0".to_string()));
     }
 }

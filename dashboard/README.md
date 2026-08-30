@@ -50,6 +50,11 @@ and `/ready`.
 Counters reset to zero when the Zerocache process restarts; the page detects the
 backwards jump and clears the session chart.
 
+When the multi-replica redis semantic index is running (CLAUDE.md Deviations
+item 25), the footer also surfaces `zerocache_semantic_index_events_applied_total{op}`
+— change-feed events (`upsert` / `delete`) this replica has applied from the
+shared `zerocache:semantic:events` Redis Stream — whenever it is non-zero.
+
 ## Developing
 
 ```sh

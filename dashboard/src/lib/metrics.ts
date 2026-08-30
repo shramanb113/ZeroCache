@@ -66,6 +66,7 @@ export interface Snapshot {
   completionSemanticHits: number;
   /** requests a peer replica filled for us (cross-replica coalescing) */
   crossReplicaCoalesced: number;
+  semanticIndexEventsApplied: number;
 }
 
 const M = {
@@ -78,6 +79,7 @@ const M = {
   eMiss: "zerocache_cache_misses_total",
   eBilled: "zerocache_provider_prompt_tokens_total",
   crossReplicaCoalesced: "zerocache_cross_replica_coalesced_total",
+  semanticIndexEvents: "zerocache_semantic_index_events_applied_total",
 } as const;
 
 /** The metric family names this dashboard depends on, exported so the Rust side
@@ -155,6 +157,11 @@ export function shape(
   const servedFromCache = cHit + eHit;
   const totalReq = servedFromCache + cMiss + eMiss;
 
+  const semanticIndexEventsApplied = (raw[M.semanticIndexEvents] ?? []).reduce(
+    (acc, r) => acc + r.value,
+    0,
+  );
+
   return {
     rows,
     totalUsd: completionUsd + embeddingUsd,
@@ -168,5 +175,6 @@ export function shape(
     embeddingTokensSaved,
     completionSemanticHits: cSemantic,
     crossReplicaCoalesced,
+    semanticIndexEventsApplied,
   };
 }

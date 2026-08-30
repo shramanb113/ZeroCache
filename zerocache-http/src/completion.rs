@@ -948,12 +948,18 @@ mod tests {
                 self.0.lock().unwrap().push(r);
                 Ok(())
             }
-            fn delete(&self, k: &CacheKey) -> Result<(), StoreError> {
+            fn delete(&self, k: &CacheKey, _scope: &[u8; 32]) -> Result<(), StoreError> {
                 self.0.lock().unwrap().retain(|r| &r.exact_key != k);
                 Ok(())
             }
             fn load_all(&self) -> Result<Vec<VectorRecord>, StoreError> {
                 Ok(self.0.lock().unwrap().clone())
+            }
+            fn changes_since(
+                &self,
+                _c: Option<String>,
+            ) -> Result<zerocache_ports::VectorChanges, StoreError> {
+                Ok(zerocache_ports::VectorChanges::default())
             }
         }
 

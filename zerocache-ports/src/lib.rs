@@ -63,12 +63,33 @@ pub struct VectorRecord {
     pub vector: Vec<f32>,
 }
 
+/// An incremental slice of index changes since a cursor, plus the cursor to
+/// pass on the next call. `changes_since(None)` means "everything from the
+/// start" and is how a replica does its initial load on the redis backend.
+/// A backend with no shared feed (sled) returns `Default` -- empty,
+/// `cursor: None` -- and the caller then relies on `load_all`.
+#[derive(Debug, Clone, Default)]
+pub struct VectorChanges {
+    pub upserts: Vec<VectorRecord>,
+    /// `(exact_key, scope_hash)` -- the scope so the caller can tombstone the
+    /// right per-scope graph in O(1) without scanning every scope.
+    pub deletes: Vec<(CacheKey, [u8; 32])>,
+    /// Opaque resume token (a Redis stream ID for the redis impl). `None`
+    /// means no change-feed: do not spawn a poll loop, use `load_all`.
+    pub cursor: Option<String>,
+}
+
 /// Persistence for `VectorRecord`s. Separate from `CompletionStore` because it
 /// must enumerate (`load_all`) to rebuild the index at boot. sled only in v1.
 pub trait CompletionVectorStore: Send + Sync {
     fn insert(&self, record: VectorRecord) -> Result<(), StoreError>;
-    fn delete(&self, exact_key: &CacheKey) -> Result<(), StoreError>;
+    fn delete(&self, exact_key: &CacheKey, scope_hash: &[u8; 32]) -> Result<(), StoreError>;
     fn load_all(&self) -> Result<Vec<VectorRecord>, StoreError>;
+
+    /// Changes since `cursor` (exclusive). `None` = full replay. Returns
+    /// `cursor: None` on a backend with no shared feed (sled), signalling the
+    /// caller to skip the poll loop and rely on `load_all`.
+    fn changes_since(&self, cursor: Option<String>) -> Result<VectorChanges, StoreError>;
 }
 
 /// Which side of a cross-replica single-flight this replica is on for one key.
@@ -267,12 +288,15 @@ mod tests {
             self.0.lock().unwrap().push(record);
             Ok(())
         }
-        fn delete(&self, exact_key: &CacheKey) -> Result<(), StoreError> {
+        fn delete(&self, exact_key: &CacheKey, _scope_hash: &[u8; 32]) -> Result<(), StoreError> {
             self.0.lock().unwrap().retain(|r| &r.exact_key != exact_key);
             Ok(())
         }
         fn load_all(&self) -> Result<Vec<VectorRecord>, StoreError> {
             Ok(self.0.lock().unwrap().clone())
+        }
+        fn changes_since(&self, _cursor: Option<String>) -> Result<VectorChanges, StoreError> {
+            Ok(VectorChanges::default())
         }
     }
 
@@ -313,7 +337,16 @@ mod tests {
             })
             .unwrap();
         assert_eq!(store.load_all().unwrap().len(), 1);
-        store.delete(&key).unwrap();
+        store.delete(&key, &[1u8; 32]).unwrap();
         assert!(store.load_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn changes_since_default_is_empty_with_no_cursor() {
+        let store: Box<dyn CompletionVectorStore> = Box::new(Mem(Default::default()));
+        let changes = store.changes_since(None).unwrap();
+        assert!(changes.upserts.is_empty());
+        assert!(changes.deletes.is_empty());
+        assert!(changes.cursor.is_none());
     }
 }
