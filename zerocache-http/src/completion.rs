@@ -18,12 +18,15 @@ use tracing::Instrument;
 
 use zerocache_core::{canonicalize_completion_request, completion_request_is_cacheable, CacheKey};
 use zerocache_ports::{
-    ChatCompletionProvider, ChatCompletionResponse, CompletionUsage, ProviderError,
+    ChatCompletionProvider, ChatCompletionResponse, CompletionUsage, FollowSignal, ProviderError,
     StreamingChatCompletionProvider,
 };
 
 use crate::app::{run_store_task, AppError, AppState, SharedCompletion, SharedCompletionOutput};
-use crate::coalesce::{coalesce_cross_replica, CoalesceTiming, Coalesced, CrossReplica};
+use crate::coalesce::{
+    coalesce_cross_replica, spawn_complete, spawn_follow, spawn_try_lead, CoalesceTiming,
+    Coalesced, CrossReplica,
+};
 
 /// The stored form of a cached completion: the upstream response body plus
 /// the token counts it reported, so a later hit can both replay the body and
@@ -40,6 +43,18 @@ struct CachedCompletion {
     /// hit on such an entry re-chunks `body` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     raw_sse: Option<Vec<u8>>,
+}
+
+impl CachedCompletion {
+    /// The token counts this record carries, as the `CompletionUsage` the
+    /// metrics layer wants.
+    fn usage_struct(&self) -> CompletionUsage {
+        CompletionUsage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens: self.total_tokens,
+        }
+    }
 }
 
 fn encode_cached(response: &ChatCompletionResponse) -> Vec<u8> {
@@ -557,17 +572,225 @@ pub async fn complete_streaming(
         }
     }
 
-    // Miss: open the upstream stream, injecting stream_options.include_usage
-    // when the caller did not ask for it (so the stored record carries real
-    // token counts even if the client stream must not show them).
+    // Miss: coalesce with any identical concurrent fetch -- in-process
+    // (AppState.completion_in_flight, shared with the non-streaming path: a
+    // streamed and a non-streamed miss on the same body have the same key)
+    // and, on the redis backend with the flag on, across replicas
+    // (state.coordinator) -- before opening the upstream stream. `patched`
+    // injects stream_options.include_usage when the caller did not ask for
+    // it, so the stored record carries real token counts even when the
+    // client stream must not show them.
     let patched = patch_stream_options(request.body);
+
+    match fetch_completion_coalesced_streaming(
+        &state,
+        &request,
+        key,
+        patched,
+        #[cfg(feature = "semantic")]
+        semantic_ctx.take(),
+    )
+    .await?
+    {
+        StreamClaim::Live(body) => Ok(StreamingOutcome::Stream {
+            body,
+            hit: false,
+            hit_kind: None,
+            semantic_score: None,
+        }),
+        StreamClaim::UpstreamError(resp) => Ok(StreamingOutcome::UpstreamError(resp)),
+        StreamClaim::Filled { from_peer } => {
+            let record = read_cached_completion(&state, key).await?.ok_or_else(|| {
+                AppError::Provider(ProviderError(
+                    "coalesced fill vanished from the store".into(),
+                ))
+            })?;
+            let usage = record.usage_struct();
+            if from_peer {
+                state
+                    .metrics
+                    .record_completion_hit(request.provider_name, true, &usage);
+                state
+                    .metrics
+                    .record_cross_replica_coalesced(request.provider_name, "completion");
+            } else {
+                // An in-process piggybacker counts as a miss (item 21).
+                state
+                    .metrics
+                    .record_completion_miss(request.provider_name, true);
+            }
+            Ok(StreamingOutcome::Stream {
+                body: replay_body(record),
+                hit: from_peer,
+                hit_kind: from_peer.then_some(HitKind::Exact),
+                semantic_score: None,
+            })
+        }
+    }
+}
+
+/// What `fetch_completion_coalesced_streaming` resolves to.
+enum StreamClaim {
+    /// This request claimed the key and is tee-ing the upstream stream live;
+    /// the body is its response. Only the claimer gets this.
+    Live(axum::body::Body),
+    /// The entry was filled while we waited -- by the claiming request's tee
+    /// on this replica (`from_peer: false`, a miss) or by a peer replica
+    /// (`from_peer: true`, a cross-replica coalesced hit). The caller
+    /// re-reads the store and replays it.
+    Filled { from_peer: bool },
+    /// The upstream returned a non-2xx: forward it verbatim, cache nothing.
+    UpstreamError(ChatCompletionResponse),
+}
+
+/// A `run_store_task(get)` + deserialize, propagating store errors.
+async fn read_cached_completion(
+    state: &Arc<AppState>,
+    key: CacheKey,
+) -> Result<Option<CachedCompletion>, AppError> {
+    let store = Arc::clone(&state.completion_store);
+    let bytes = run_store_task(move || store.get(&key).map_err(AppError::Store)).await?;
+    Ok(bytes.and_then(|b| serde_json::from_slice::<CachedCompletion>(&b).ok()))
+}
+
+/// Same, but any store error is folded to `None` -- for the follower poll
+/// loop, where a transient inability to check must not fail the request (the
+/// deadline fallback covers a persistently broken store).
+async fn try_read_cached_completion(
+    state: &Arc<AppState>,
+    key: CacheKey,
+) -> Option<CachedCompletion> {
+    read_cached_completion(state, key).await.ok().flatten()
+}
+
+/// The streaming counterpart to `fetch_completion_coalesced`. Claims the key
+/// or piggybacks under `state.completion_in_flight`; the claimer additionally
+/// runs cross-replica single-flight (`state.coordinator`) before opening its
+/// own upstream stream. On a 2xx claim it hands `spawn_tee` a oneshot that
+/// resolves the shared in-flight future (for in-process piggybackers) when
+/// the stream ends -- `spawn_tee` is then the single owner of the store
+/// write, `coordinator.complete`, the `completion_in_flight` removal, the
+/// oneshot, and the claimer's `record_completion_miss`.
+async fn fetch_completion_coalesced_streaming(
+    state: &Arc<AppState>,
+    request: &CompletionStreamRequest<'_>,
+    key: CacheKey,
+    patched: serde_json::Value,
+    #[cfg(feature = "semantic")] semantic_ctx: Option<(
+        zerocache_semantic::ScopeKey,
+        [u8; 32],
+        Vec<f32>,
+    )>,
+) -> Result<StreamClaim, AppError> {
+    enum LocalClaim {
+        Piggyback(SharedCompletion),
+        Claim(futures::channel::oneshot::Sender<SharedCompletionOutput>),
+    }
+
+    let claim = {
+        let mut in_flight = state
+            .completion_in_flight
+            .lock()
+            .expect("completion_in_flight mutex poisoned");
+        if let Some(existing) = in_flight.get(&key) {
+            LocalClaim::Piggyback(existing.clone())
+        } else {
+            let (tx, rx) = futures::channel::oneshot::channel::<SharedCompletionOutput>();
+            let shared: SharedCompletion = async move {
+                rx.await.unwrap_or_else(|_| {
+                    Err(ProviderError(
+                        "tee task dropped before it resolved the streamed completion".into(),
+                    ))
+                })
+            }
+            .boxed()
+            .shared();
+            in_flight.insert(key, shared);
+            LocalClaim::Claim(tx)
+        }
+    };
+
+    let oneshot_tx = match claim {
+        LocalClaim::Piggyback(shared) => {
+            // The claimer's tee (or a peer) fills the store, then resolves
+            // this shared future. An in-process piggybacker counts as a
+            // miss (item 21) -- the caller re-reads the store and replays.
+            let _ = shared.await.map_err(AppError::Provider)?;
+            return Ok(StreamClaim::Filled { from_peer: false });
+        }
+        LocalClaim::Claim(tx) => tx,
+    };
+
+    // --- claimer: cross-replica single-flight, then our own upstream call ---
+
+    if spawn_try_lead(&state.coordinator, key).await == zerocache_ports::Role::Follower {
+        let deadline = tokio::time::Instant::now() + CoalesceTiming::PROD.deadline;
+        let mut found: Option<CachedCompletion> = None;
+        loop {
+            if let Some(rec) = try_read_cached_completion(state, key).await {
+                found = Some(rec);
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if spawn_follow(&state.coordinator, key, CoalesceTiming::PROD.poll).await
+                == FollowSignal::Signalled
+            {
+                // Leader done. One more read; still absent means it stored
+                // nothing (non-2xx or transport error) -- promote instead of
+                // waiting out the deadline.
+                found = try_read_cached_completion(state, key).await;
+                break;
+            }
+        }
+
+        if let Some(record) = found {
+            let resp = ChatCompletionResponse {
+                status: 200,
+                body: record.body.clone(),
+                usage: record.usage_struct(),
+            };
+            state
+                .completion_in_flight
+                .lock()
+                .expect("completion_in_flight mutex poisoned")
+                .remove(&key);
+            let _ = oneshot_tx.send(Ok((Arc::new(resp), Coalesced::FromPeer)));
+            spawn_complete(&state.coordinator, key).await;
+            return Ok(StreamClaim::Filled { from_peer: true });
+        }
+
+        // Deadline with no peer fill: grab the lock best-effort and fall
+        // through to our own upstream call. `spawn_tee` releases the lock
+        // (via coordinator.complete) when the stream ends, whether or not we
+        // actually became leader here -- RedisCoordinator's release is
+        // GET-guarded, so releasing a lock we do not hold is a safe no-op.
+        let _ = spawn_try_lead(&state.coordinator, key).await;
+    }
+
+    // --- leader (or promoted follower): our own upstream call ---
+
     let injected = patched != *request.body;
 
-    let (status, mut upstream) = request
+    let stream_result = request
         .stream_provider
         .chat_completion_stream(request.api_key, &patched)
-        .await
-        .map_err(AppError::Provider)?;
+        .await;
+
+    let (status, mut upstream) = match stream_result {
+        Ok(v) => v,
+        Err(e) => {
+            state
+                .completion_in_flight
+                .lock()
+                .expect("completion_in_flight mutex poisoned")
+                .remove(&key);
+            let _ = oneshot_tx.send(Err(e.clone()));
+            spawn_complete(&state.coordinator, key).await;
+            return Err(AppError::Provider(e));
+        }
+    };
 
     if !(200..300).contains(&status) {
         use futures::StreamExt;
@@ -581,12 +804,21 @@ pub async fn complete_streaming(
         let body = serde_json::from_slice::<serde_json::Value>(&buf).unwrap_or_else(
             |_| serde_json::json!({ "error": String::from_utf8_lossy(&buf).into_owned() }),
         );
+        state
+            .completion_in_flight
+            .lock()
+            .expect("completion_in_flight mutex poisoned")
+            .remove(&key);
+        let _ = oneshot_tx.send(Err(ProviderError(format!(
+            "streamed completion upstream returned status {status}"
+        ))));
+        spawn_complete(&state.coordinator, key).await;
         // Parity with the non-streaming path: `complete()` records a miss
         // unconditionally on a non-2xx, before its store guard.
         state
             .metrics
             .record_completion_miss(request.provider_name, true);
-        return Ok(StreamingOutcome::UpstreamError(ChatCompletionResponse {
+        return Ok(StreamClaim::UpstreamError(ChatCompletionResponse {
             status,
             body,
             usage: CompletionUsage::default(),
@@ -595,22 +827,18 @@ pub async fn complete_streaming(
 
     let (tx, rx) = futures::channel::mpsc::unbounded::<Result<axum::body::Bytes, std::io::Error>>();
     spawn_tee(
-        Arc::clone(&state),
+        Arc::clone(state),
         request.provider_name.to_string(),
         key,
         upstream,
         tx,
         injected,
+        oneshot_tx,
         #[cfg(feature = "semantic")]
-        semantic_ctx.take(),
+        semantic_ctx,
     );
 
-    Ok(StreamingOutcome::Stream {
-        body: axum::body::Body::from_stream(rx),
-        hit: false,
-        hit_kind: None,
-        semantic_score: None,
-    })
+    Ok(StreamClaim::Live(axum::body::Body::from_stream(rx)))
 }
 
 /// True when `ev` is the trailing usage-only chunk OpenAI emits when
@@ -633,6 +861,12 @@ fn is_usage_only_data(ev: &crate::sse::SseEvent) -> bool {
 /// capturing the raw bytes. On a clean finish (`Completeness::Complete`),
 /// store `{assembled body, token counts, raw SSE}`. An incomplete or
 /// error-carrying stream stores nothing.
+///
+/// After Task 7 this task is the single owner, on stream end, of: the store
+/// write, `coordinator.complete(key)`, removing `key` from
+/// `completion_in_flight`, resolving the claimer's coalescing oneshot (so
+/// in-process piggybackers unblock), and `record_completion_miss` for the
+/// claimer.
 #[allow(clippy::too_many_arguments)]
 fn spawn_tee(
     state: Arc<AppState>,
@@ -641,6 +875,7 @@ fn spawn_tee(
     mut upstream: zerocache_ports::SseByteStream,
     tx: futures::channel::mpsc::UnboundedSender<Result<axum::body::Bytes, std::io::Error>>,
     injected: bool,
+    completion_oneshot: futures::channel::oneshot::Sender<SharedCompletionOutput>,
     #[cfg(feature = "semantic")] semantic_ctx: Option<(
         zerocache_semantic::ScopeKey,
         [u8; 32],
@@ -699,6 +934,11 @@ fn spawn_tee(
         let out = asm.finish();
         match out.completeness {
             Completeness::Complete => {
+                let assembled_response = ChatCompletionResponse {
+                    status: 200,
+                    body: out.body.clone(),
+                    usage: out.usage,
+                };
                 let record = CachedCompletion {
                     body: out.body.clone(),
                     prompt_tokens: out.usage.prompt_tokens,
@@ -735,6 +975,18 @@ fn spawn_tee(
                     }
                     Err(e) => tracing::warn!("streamed completion serialize failed: {e}"),
                 }
+                // Release the in-flight slot and the cross-replica lock, and
+                // hand the assembled response to any in-process piggybacker
+                // (it re-reads the store, but resolving unblocks it). Store
+                // write is above, so `done` implies a readable entry.
+                state
+                    .completion_in_flight
+                    .lock()
+                    .expect("completion_in_flight mutex poisoned")
+                    .remove(&key);
+                let _ =
+                    completion_oneshot.send(Ok((Arc::new(assembled_response), Coalesced::Local)));
+                spawn_complete(&state.coordinator, key).await;
                 state.metrics.record_completion_miss(&provider_name, true);
             }
             Completeness::Incomplete(reason) => {
@@ -745,6 +997,15 @@ fn spawn_tee(
                         "streamed completion not cached: {reason} (malformed frames: {malformed:?})"
                     );
                 }
+                state
+                    .completion_in_flight
+                    .lock()
+                    .expect("completion_in_flight mutex poisoned")
+                    .remove(&key);
+                let _ = completion_oneshot.send(Err(ProviderError(format!(
+                    "streamed completion not cached: {reason}"
+                ))));
+                spawn_complete(&state.coordinator, key).await;
                 state.metrics.record_completion_miss(&provider_name, true);
             }
         }
@@ -1303,6 +1564,16 @@ mod tests {
                 gets: AtomicUsize::new(0),
             }
         }
+
+        /// Store the given already-serialized `CachedCompletion` bytes and
+        /// hand them back on the 2nd+ `get` (1st `get` is a miss), so a
+        /// cross-replica follower poll finds a peer fill.
+        fn with_record(bytes: Vec<u8>) -> Self {
+            Self {
+                record: bytes,
+                gets: AtomicUsize::new(0),
+            }
+        }
     }
 
     impl CompletionStore for PeerFillsAfterFirstGet {
@@ -1386,6 +1657,10 @@ mod tests {
             error_body: Vec<u8>,
             calls: AtomicUsize,
             last_include_usage: AtomicBool,
+            /// Sleep before each frame, so a claimer's tee task stays
+            /// in-flight long enough for concurrent callers to piggyback
+            /// deterministically. `Duration::ZERO` in `ok`/`status`.
+            delay: Duration,
         }
 
         impl MockStreamProvider {
@@ -1396,6 +1671,7 @@ mod tests {
                     error_body: Vec::new(),
                     calls: AtomicUsize::new(0),
                     last_include_usage: AtomicBool::new(false),
+                    delay: Duration::ZERO,
                 }
             }
             fn status(status: u16, body: Vec<u8>) -> Self {
@@ -1405,6 +1681,17 @@ mod tests {
                     error_body: body,
                     calls: AtomicUsize::new(0),
                     last_include_usage: AtomicBool::new(false),
+                    delay: Duration::ZERO,
+                }
+            }
+            fn slow(frames: Vec<Vec<u8>>, delay: Duration) -> Self {
+                Self {
+                    frames,
+                    status: 200,
+                    error_body: Vec::new(),
+                    calls: AtomicUsize::new(0),
+                    last_include_usage: AtomicBool::new(false),
+                    delay,
                 }
             }
             fn calls(&self) -> usize {
@@ -1435,7 +1722,15 @@ mod tests {
                     } else {
                         vec![Ok(self.error_body.clone())]
                     };
-                Ok((self.status, Box::pin(futures::stream::iter(items))))
+                let delay = self.delay;
+                let stream = futures::stream::unfold(items.into_iter(), move |mut it| async move {
+                    let next = it.next()?;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    Some((next, it))
+                });
+                Ok((self.status, Box::pin(stream)))
             }
             // Must match MockChatProvider's version/cache_scope so an entry
             // written by one path is found by the other.
@@ -1449,6 +1744,13 @@ mod tests {
 
         fn state_streaming(store: MockCompletionStore) -> Arc<AppState> {
             Arc::new(state(store))
+        }
+
+        fn state_streaming_with_coordinator(
+            store: impl CompletionStore + 'static,
+            coord: Arc<dyn zerocache_ports::CoalescingCoordinator>,
+        ) -> Arc<AppState> {
+            Arc::new(state_with_coordinator(store, coord))
         }
 
         async fn drain(body: axum::body::Body) -> String {
@@ -1703,6 +2005,135 @@ mod tests {
                 dump.contains("zerocache_completion_prompt_tokens_saved_total{provider=\"openai\",stream=\"false\"} 8"),
                 "{dump}"
             );
+        }
+
+        #[tokio::test]
+        async fn five_concurrent_identical_streamed_misses_make_one_upstream_call() {
+            let frames = vec![
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n".to_vec(),
+                b"data: [DONE]\n\n".to_vec(),
+            ];
+            let provider = Arc::new(MockStreamProvider::slow(frames, Duration::from_millis(60)));
+            let st = state_streaming(MockCompletionStore::empty());
+            let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"temperature":0,"stream":true});
+
+            let mut handles = Vec::new();
+            for _ in 0..5 {
+                let st = Arc::clone(&st);
+                let provider = Arc::clone(&provider);
+                let body = body.clone();
+                handles.push(tokio::spawn(async move {
+                    let out = complete_streaming(
+                        st,
+                        CompletionStreamRequest {
+                            stream_provider: provider
+                                as Arc<dyn zerocache_ports::StreamingChatCompletionProvider>,
+                            provider_name: "openai",
+                            api_key: "sk",
+                            owner_id: OWNER_A,
+                            model: "gpt-4o",
+                            body: &body,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let StreamingOutcome::Stream { body: b, .. } = out else {
+                        panic!()
+                    };
+                    drain(b).await
+                }));
+            }
+            let outs: Vec<String> = futures::future::join_all(handles)
+                .await
+                .into_iter()
+                .map(Result::unwrap)
+                .collect();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            assert_eq!(
+                provider.calls(),
+                1,
+                "5 concurrent identical streamed misses coalesce to one upstream call"
+            );
+            for o in &outs {
+                assert!(o.contains("\"content\":\"x\"") && o.contains("[DONE]"));
+            }
+        }
+
+        #[tokio::test]
+        async fn a_cross_replica_follower_replays_a_peer_filled_streamed_completion() {
+            let provider = Arc::new(MockStreamProvider::ok(vec![])); // must never be called
+            let record = json!({
+                "body": {"choices":[{"index":0,"message":{"role":"assistant","content":"peer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}},
+                "prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6
+            });
+            let store = PeerFillsAfterFirstGet::with_record(serde_json::to_vec(&record).unwrap());
+            let st = state_streaming_with_coordinator(store, Arc::new(FollowerCoordinator));
+            let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"q"}],"temperature":0,"stream":true});
+
+            let out = complete_streaming(Arc::clone(&st), sreq(&provider, OWNER_A, &body))
+                .await
+                .unwrap();
+            let StreamingOutcome::Stream {
+                body: b,
+                hit,
+                hit_kind,
+                ..
+            } = out
+            else {
+                panic!()
+            };
+            assert!(hit);
+            assert_eq!(hit_kind, Some(HitKind::Exact));
+            assert_eq!(provider.calls(), 0);
+            let replayed = drain(b).await;
+            assert!(replayed.contains("\"content\":\"peer\""));
+
+            let dump = st.metrics.encode();
+            assert!(
+                dump.contains("zerocache_cross_replica_coalesced_total{kind=\"completion\",provider=\"openai\"} 1"),
+                "{dump}"
+            );
+            assert!(
+                dump.contains(
+                    "zerocache_completion_cache_hits_total{provider=\"openai\",stream=\"true\"} 1"
+                ),
+                "{dump}"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_in_process_streamed_piggybacker_is_counted_as_a_miss() {
+            let frames = vec![
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"y\"},\"finish_reason\":\"stop\"}]}\n\n".to_vec(),
+                b"data: [DONE]\n\n".to_vec(),
+            ];
+            let provider = Arc::new(MockStreamProvider::slow(frames, Duration::from_millis(60)));
+            let st = state_streaming(MockCompletionStore::empty());
+            let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"temperature":0,"stream":true});
+
+            let (a, b) = tokio::join!(
+                complete_streaming(Arc::clone(&st), sreq(&provider, OWNER_A, &body)),
+                complete_streaming(Arc::clone(&st), sreq(&provider, OWNER_A, &body)),
+            );
+            for out in [a.unwrap(), b.unwrap()] {
+                let StreamingOutcome::Stream { body: bd, hit, .. } = out else {
+                    panic!()
+                };
+                assert!(
+                    !hit,
+                    "both a claimer and an in-process piggybacker are misses for streams"
+                );
+                let _ = drain(bd).await;
+            }
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let dump = st.metrics.encode();
+            assert!(
+                dump.contains(
+                    "zerocache_completion_cache_misses_total{provider=\"openai\",stream=\"true\"} 2"
+                ),
+                "{dump}"
+            );
+            assert_eq!(provider.calls(), 1);
         }
     }
 

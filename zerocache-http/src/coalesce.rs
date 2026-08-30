@@ -56,21 +56,21 @@ impl CoalescingCoordinator for NoopCoordinator {
     }
 }
 
-async fn spawn_try_lead(coord: &Arc<dyn CoalescingCoordinator>, key: CacheKey) -> Role {
+pub(crate) async fn spawn_try_lead(coord: &Arc<dyn CoalescingCoordinator>, key: CacheKey) -> Role {
     let c = Arc::clone(coord);
     tokio::task::spawn_blocking(move || c.try_lead(&key))
         .await
         .expect("coordinator try_lead task panicked")
 }
 
-async fn spawn_complete(coord: &Arc<dyn CoalescingCoordinator>, key: CacheKey) {
+pub(crate) async fn spawn_complete(coord: &Arc<dyn CoalescingCoordinator>, key: CacheKey) {
     let c = Arc::clone(coord);
     tokio::task::spawn_blocking(move || c.complete(&key))
         .await
         .expect("coordinator complete task panicked");
 }
 
-async fn spawn_follow(
+pub(crate) async fn spawn_follow(
     coord: &Arc<dyn CoalescingCoordinator>,
     key: CacheKey,
     wait: Duration,
