@@ -581,6 +581,11 @@ pub async fn complete_streaming(
         let body = serde_json::from_slice::<serde_json::Value>(&buf).unwrap_or_else(
             |_| serde_json::json!({ "error": String::from_utf8_lossy(&buf).into_owned() }),
         );
+        // Parity with the non-streaming path: `complete()` records a miss
+        // unconditionally on a non-2xx, before its store guard.
+        state
+            .metrics
+            .record_completion_miss(request.provider_name, true);
         return Ok(StreamingOutcome::UpstreamError(ChatCompletionResponse {
             status,
             body,
@@ -1650,6 +1655,13 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(provider.calls(), 2);
+            let dump = st.metrics.encode();
+            assert!(
+                dump.contains(
+                    "zerocache_completion_cache_misses_total{provider=\"openai\",stream=\"true\"} 2"
+                ),
+                "a non-2xx streaming response must still count as a miss: {dump}"
+            );
         }
 
         #[tokio::test]
