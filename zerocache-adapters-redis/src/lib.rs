@@ -421,4 +421,22 @@ mod live_redis_tests {
             Some(b"completion-blob".to_vec())
         );
     }
+
+    #[test]
+    #[ignore]
+    fn completion_store_round_trips_a_record_with_embedded_raw_sse_bytes() {
+        let (_container, url) = start_redis();
+        let store = RedisStore::connect(&url, None).unwrap();
+        let key = completion_key("streamed-req");
+        // A streamed completion record embeds its raw SSE bytes, which are not
+        // guaranteed valid UTF-8; the store value is opaque, so every byte must
+        // survive the round trip.
+        let value: Vec<u8> = (0u16..512).map(|n| (n % 256) as u8).collect();
+
+        CompletionStore::put(&store, key, value.clone()).unwrap();
+        assert_eq!(CompletionStore::get(&store, &key).unwrap(), Some(value));
+
+        CompletionStore::delete(&store, &key).unwrap();
+        assert_eq!(CompletionStore::get(&store, &key).unwrap(), None);
+    }
 }
