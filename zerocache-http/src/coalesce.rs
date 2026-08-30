@@ -100,9 +100,11 @@ where
 {
     match spawn_try_lead(coordinator, key).await {
         Role::Leader => {
-            let value = fetch().await?;
+            // Release + PUBLISH on failure too, or the lock sits for its full
+            // TTL with no signal and every peer waits out its own deadline.
+            let result = fetch().await;
             spawn_complete(coordinator, key).await;
-            Ok(CrossReplica::Led(value))
+            Ok(CrossReplica::Led(result?))
         }
         Role::Follower => {
             let deadline = Instant::now() + timing.deadline;
@@ -125,9 +127,9 @@ where
             }
             match spawn_try_lead(coordinator, key).await {
                 Role::Leader => {
-                    let value = fetch().await?;
+                    let result = fetch().await;
                     spawn_complete(coordinator, key).await;
-                    Ok(CrossReplica::Led(value))
+                    Ok(CrossReplica::Led(result?))
                 }
                 Role::Follower => Ok(CrossReplica::Led(fetch().await?)),
             }
@@ -232,6 +234,28 @@ mod tests {
 
         assert!(matches!(out, CrossReplica::Led(7)));
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(coord.complete_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_leader_whose_fetch_errors_still_releases_the_lock() {
+        let (coord, _tx) = MockCoordinator::new(vec![Role::Leader]);
+        let c: Arc<dyn CoalescingCoordinator> = coord.clone();
+
+        let out = coalesce_cross_replica(
+            &c,
+            key(),
+            FAST,
+            || async { Ok::<Option<u32>, AppError>(None) },
+            || async {
+                Err::<u32, AppError>(AppError::Provider(zerocache_ports::ProviderError(
+                    "upstream unreachable".into(),
+                )))
+            },
+        )
+        .await;
+
+        assert!(matches!(out, Err(AppError::Provider(_))));
         assert_eq!(coord.complete_calls.load(Ordering::SeqCst), 1);
     }
 
