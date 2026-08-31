@@ -98,6 +98,40 @@ impl CacheKey {
         Self(*hasher.finalize().as_bytes())
     }
 
+    /// Cache key for an Anthropic `/v1/messages` response. Domain-separated
+    /// from `derive` / `derive_image` / `derive_completion` via the
+    /// "anthropic-messages\0" literal below the model-version field, so a
+    /// Messages key can never collide with a text embedding, image embedding,
+    /// or OpenAI-shaped chat-completion key even when `canonical_request`
+    /// happens to equal another entry's bytes exactly.
+    ///
+    /// `canonical_request` is the output of `canonicalize_messages_request`
+    /// (with the caller's `anthropic-beta` header value, if any, appended by
+    /// the orchestrator — see `zerocache-http/src/messages.rs`).
+    pub fn derive_messages(
+        owner_id: [u8; 32],
+        provider: &str,
+        cache_scope: &str,
+        model: &str,
+        model_version: &str,
+        canonical_request: &str,
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&owner_id);
+        hasher.update(b"\0");
+        hasher.update(provider.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(cache_scope.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(model.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(model_version.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(b"anthropic-messages\0");
+        hasher.update(canonical_request.as_bytes());
+        Self(*hasher.finalize().as_bytes())
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -418,5 +452,79 @@ mod tests {
             a, b,
             "the image path needs the same endpoint isolation the text path gets"
         );
+    }
+
+    #[test]
+    fn derive_messages_same_inputs_produce_same_key() {
+        let a = CacheKey::derive_messages(
+            OWNER_A,
+            "anthropic",
+            SCOPE_A,
+            "claude-opus-4-6",
+            "v1",
+            r#"{"messages":["hi"],"temperature":0}"#,
+        );
+        let b = CacheKey::derive_messages(
+            OWNER_A,
+            "anthropic",
+            SCOPE_A,
+            "claude-opus-4-6",
+            "v1",
+            r#"{"messages":["hi"],"temperature":0}"#,
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn derive_messages_different_canonical_request_owner_or_scope_produce_different_keys() {
+        let base = CacheKey::derive_messages(OWNER_A, "anthropic", SCOPE_A, "m", "v1", "x");
+        assert_ne!(
+            base,
+            CacheKey::derive_messages(OWNER_A, "anthropic", SCOPE_A, "m", "v1", "y")
+        );
+        assert_ne!(
+            base,
+            CacheKey::derive_messages(OWNER_B, "anthropic", SCOPE_A, "m", "v1", "x")
+        );
+        assert_ne!(
+            base,
+            CacheKey::derive_messages(OWNER_A, "anthropic", SCOPE_B, "m", "v1", "x")
+        );
+    }
+
+    #[test]
+    fn derive_messages_field_boundary_is_not_ambiguous() {
+        let a = CacheKey::derive_messages(OWNER_A, "anthropic", SCOPE_A, "cla", "ude", "x");
+        let b = CacheKey::derive_messages(OWNER_A, "anthropic", SCOPE_A, "clau", "de", "x");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn derive_messages_never_collides_with_a_completion_key_of_identical_bytes() {
+        // The "anthropic-messages\0" domain-separation literal must make this
+        // impossible even when every other field lines up exactly.
+        let completion_key =
+            CacheKey::derive_completion(OWNER_A, "anthropic", SCOPE_A, "m", "v1", "hello");
+        let messages_key =
+            CacheKey::derive_messages(OWNER_A, "anthropic", SCOPE_A, "m", "v1", "hello");
+        assert_ne!(completion_key, messages_key);
+    }
+
+    #[test]
+    fn derive_messages_never_collides_with_a_text_or_image_key() {
+        let text_key = CacheKey::derive(OWNER_A, "anthropic", SCOPE_A, "m", "v1", "hello");
+        let image_key = CacheKey::derive_image(
+            OWNER_A,
+            "anthropic",
+            SCOPE_A,
+            "m",
+            "v1",
+            "image/png",
+            "hello",
+        );
+        let messages_key =
+            CacheKey::derive_messages(OWNER_A, "anthropic", SCOPE_A, "m", "v1", "hello");
+        assert_ne!(text_key, messages_key);
+        assert_ne!(image_key, messages_key);
     }
 }
