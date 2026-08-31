@@ -143,6 +143,11 @@ impl EmbeddingProvider for OpenAiProvider {
 /// `OpenAiProvider`, which is the embeddings adapter and hardcodes `/v1/`.
 pub struct OpenAiWireChatProvider {
     client: reqwest_middleware::ClientWithMiddleware,
+    /// Streaming has no total-response deadline -- a long generation is the
+    /// point of `stream: true` -- but keeps `PROVIDER_TIMEOUT` as a per-read
+    /// idle cap so a genuinely hung upstream still dies. No retry middleware:
+    /// a partially-consumed stream must not be replayed.
+    stream_client: reqwest::Client,
     url_prefix: String,
 }
 
@@ -159,6 +164,10 @@ impl OpenAiWireChatProvider {
             client: ClientBuilder::new(inner)
                 .with(RetryTransientMiddleware::new_with_policy(retry_policy))
                 .build(),
+            stream_client: reqwest::Client::builder()
+                .read_timeout(PROVIDER_TIMEOUT)
+                .build()
+                .expect("reqwest client with a read timeout is always constructible"),
             url_prefix: url_prefix.into(),
         }
     }
@@ -223,7 +232,7 @@ impl StreamingChatCompletionProvider for OpenAiWireChatProvider {
         request: &serde_json::Value,
     ) -> Result<(u16, SseByteStream), ProviderError> {
         let response = self
-            .client
+            .stream_client
             .post(format!("{}/chat/completions", self.url_prefix))
             .bearer_auth(api_key)
             .json(request)

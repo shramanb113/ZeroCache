@@ -19,9 +19,21 @@ pub enum SseEvent {
     Malformed(String),
 }
 
-/// Push parser: fed arbitrary byte chunks, emits complete SSE events. Only
+/// One complete SSE frame: its exact bytes including the terminating blank
+/// line, and the event it parsed to. `event` is `None` for a frame carrying
+/// no `data:` field (a `:` comment / keep-alive) -- still forwarded verbatim.
+#[derive(Debug)]
+pub struct ParsedFrame {
+    pub raw: Vec<u8>,
+    pub event: Option<SseEvent>,
+}
+
+/// Push parser: fed arbitrary byte chunks, emits complete SSE frames. Only
 /// `data:` fields are interpreted (OpenAI streams carry nothing else);
-/// comment lines (`:`) and other fields are ignored.
+/// comment lines (`:`) and other fields yield `event: None`. Frame-granular
+/// on purpose: the streaming tee forwards `raw` one frame at a time so it can
+/// withhold exactly the injected usage frame without disturbing a boundary,
+/// even when a read splits a frame or carries two.
 pub struct SseFrameParser {
     buf: Vec<u8>,
 }
@@ -31,31 +43,33 @@ impl SseFrameParser {
         Self { buf: Vec::new() }
     }
 
-    pub fn feed(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<ParsedFrame> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
         // Frames are separated by a blank line ("\n\n"). Tolerate "\r\n\r\n".
         while let Some(pos) = find_frame_boundary(&self.buf) {
+            let raw = self.buf[..pos.0 + pos.1].to_vec();
             let frame = self.buf[..pos.0].to_vec();
             self.buf.drain(..pos.0 + pos.1);
-            if let Some(ev) = parse_frame(&frame) {
-                out.push(ev);
-            }
+            out.push(ParsedFrame {
+                event: parse_frame(&frame),
+                raw,
+            });
         }
         out
     }
 
     /// Flush a trailing frame with no terminating blank line (some servers
-    /// drop it on a clean close).
-    pub fn finish(&mut self) -> Vec<SseEvent> {
+    /// drop it on a clean close). Returns its raw bytes too, so a byte-exact
+    /// tee still forwards what the upstream sent.
+    pub fn finish(&mut self) -> Option<ParsedFrame> {
         if self.buf.iter().any(|b| !b.is_ascii_whitespace()) {
             let frame = std::mem::take(&mut self.buf);
-            if let Some(ev) = parse_frame(&frame) {
-                return vec![ev];
-            }
+            let event = parse_frame(&frame);
+            return Some(ParsedFrame { raw: frame, event });
         }
         self.buf.clear();
-        Vec::new()
+        None
     }
 }
 
@@ -411,8 +425,12 @@ mod tests {
 
     fn events(raw: &str) -> Vec<SseEvent> {
         let mut p = SseFrameParser::new();
-        let mut out = p.feed(raw.as_bytes());
-        out.extend(p.finish());
+        let mut out: Vec<SseEvent> = p
+            .feed(raw.as_bytes())
+            .into_iter()
+            .filter_map(|f| f.event)
+            .collect();
+        out.extend(p.finish().and_then(|f| f.event));
         out
     }
 
@@ -423,8 +441,14 @@ mod tests {
         assert!(a.is_empty());
         let b = p.feed(b"ta\":{\"content\":\"hi\"}}]}\n\n");
         assert_eq!(b.len(), 1);
-        match &b[0] {
-            SseEvent::Data(v) => assert_eq!(v["choices"][0]["delta"]["content"], "hi"),
+        assert_eq!(
+            b[0].raw,
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+        );
+        match &b[0].event {
+            Some(SseEvent::Data(v)) => {
+                assert_eq!(v["choices"][0]["delta"]["content"], "hi")
+            }
             other => panic!("expected Data, got {other:?}"),
         }
     }
@@ -560,10 +584,13 @@ mod tests {
         assert!(p
             .feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"tail\"}}]}")
             .is_empty());
-        let flushed = p.finish();
-        assert_eq!(flushed.len(), 1);
-        match &flushed[0] {
-            SseEvent::Data(v) => {
+        let flushed = p.finish().expect("a non-whitespace tail flushes");
+        assert_eq!(
+            flushed.raw,
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"tail\"}}]}"
+        );
+        match &flushed.event {
+            Some(SseEvent::Data(v)) => {
                 assert_eq!(v["choices"][0]["delta"]["content"], "tail")
             }
             other => panic!("expected Data, got {other:?}"),
@@ -606,12 +633,46 @@ mod tests {
         let joined: Vec<u8> = frames.concat();
         let mut a = DeltaAssembler::new();
         let mut p = SseFrameParser::new();
-        for ev in p.feed(&joined) {
-            a.ingest(&ev);
+        for f in p.feed(&joined) {
+            if let Some(ev) = &f.event {
+                a.ingest(ev);
+            }
         }
         let out = a.finish();
         assert!(matches!(out.completeness, Completeness::Complete));
         assert_eq!(out.body["choices"][0]["message"]["content"], "hello world");
+    }
+
+    #[test]
+    fn feed_splits_a_chunk_carrying_usage_and_done_into_two_frames() {
+        // The leak scenario: HTTP/2 delivers the trailing usage frame and
+        // `[DONE]` in one read. Frame-granular parsing must still hand them
+        // back separately, each with its own bytes, so the tee can withhold
+        // exactly the usage frame.
+        let mut p = SseFrameParser::new();
+        let frames = p.feed(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\ndata: [DONE]\n\n",
+        );
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].raw.ends_with(b"}}\n\n"));
+        assert!(matches!(frames[0].event, Some(SseEvent::Data(_))));
+        assert_eq!(frames[1].raw, b"data: [DONE]\n\n");
+        assert!(matches!(frames[1].event, Some(SseEvent::Done)));
+    }
+
+    #[test]
+    fn feed_holds_a_partial_trailing_frame_until_its_boundary_arrives() {
+        // The corruption scenario: a read ends with a whole frame plus the
+        // first bytes of the next. Only the complete frame is emitted; the
+        // partial bytes stay buffered and are never forwarded mid-frame.
+        let mut p = SseFrameParser::new();
+        let first = p.feed(b"data: {\"choices\":[],\"usage\":{\"total_tokens\":3}}\n\ndata: [DO");
+        assert_eq!(first.len(), 1);
+        assert!(matches!(first[0].event, Some(SseEvent::Data(_))));
+        let second = p.feed(b"NE]\n\n");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].raw, b"data: [DONE]\n\n");
+        assert!(matches!(second[0].event, Some(SseEvent::Done)));
     }
 
     #[test]

@@ -270,7 +270,10 @@ pub async fn complete(
         });
     }
 
-    if (200..300).contains(&response.status) {
+    // `Piggyback` is a miss (item 21) but the request it rode on already
+    // stored this exact value; re-storing here would overwrite a streaming
+    // claimer's `raw_sse`-carrying record with a `raw_sse: None` one.
+    if matches!(coalesced, Coalesced::Local) && (200..300).contains(&response.status) {
         let bytes = encode_cached(&response);
         let store = Arc::clone(&state.completion_store);
         run_store_task(move || store.put(key, bytes).map_err(AppError::Store))
@@ -419,9 +422,10 @@ async fn fetch_completion_coalesced(
         }
         Claim::Piggyback(fut) => {
             // An in-process piggybacker counts as a miss (item 21) regardless
-            // of how the claim itself resolved.
+            // of how the claim itself resolved -- but the claimer already
+            // stored the value, so `complete()` must skip its write-back.
             let (response, _) = fut.await.map_err(AppError::Provider)?;
-            Ok(((*response).clone(), Coalesced::Local))
+            Ok(((*response).clone(), Coalesced::Piggyback))
         }
     }
 }
@@ -599,12 +603,38 @@ pub async fn complete_streaming(
             semantic_score: None,
         }),
         StreamClaim::UpstreamError(resp) => Ok(StreamingOutcome::UpstreamError(resp)),
-        StreamClaim::Filled { from_peer } => {
-            let record = read_cached_completion(&state, key).await?.ok_or_else(|| {
-                AppError::Provider(ProviderError(
-                    "coalesced fill vanished from the store".into(),
-                ))
-            })?;
+        StreamClaim::Filled {
+            from_peer,
+            fallback,
+        } => {
+            let record = match read_cached_completion(&state, key).await? {
+                Some(record) => record,
+                None => {
+                    // The fill is not in the store: the claimer's write
+                    // failed, or it was a non-2xx that is never stored.
+                    // Degrade to the response the shared future resolved to
+                    // rather than 502 -- "absent, never wrong".
+                    let Some(resp) = fallback else {
+                        return Err(AppError::Provider(ProviderError(
+                            "coalesced completion fill produced no result".into(),
+                        )));
+                    };
+                    if !(200..300).contains(&resp.status) {
+                        state
+                            .metrics
+                            .record_completion_miss(request.provider_name, true);
+                        return Ok(StreamingOutcome::UpstreamError((*resp).clone()));
+                    }
+                    CachedCompletion {
+                        body: resp.body.clone(),
+                        prompt_tokens: resp.usage.prompt_tokens,
+                        completion_tokens: resp.usage.completion_tokens,
+                        total_tokens: resp.usage.total_tokens,
+                        // No raw SSE: replayed via `rechunk`.
+                        raw_sse: None,
+                    }
+                }
+            };
             let usage = record.usage_struct();
             if from_peer {
                 state
@@ -638,7 +668,18 @@ enum StreamClaim {
     /// on this replica (`from_peer: false`, a miss) or by a peer replica
     /// (`from_peer: true`, a cross-replica coalesced hit). The caller
     /// re-reads the store and replays it.
-    Filled { from_peer: bool },
+    ///
+    /// `fallback` is the response the shared in-flight future resolved to,
+    /// kept only for the degraded path: if the store read comes back empty
+    /// (the claimer's write failed, or it was a non-2xx that is never
+    /// stored) the caller serves this rather than failing the request. A
+    /// non-2xx `fallback` is forwarded verbatim; a 2xx one is replayed via
+    /// `rechunk`. `None` when the claimer produced nothing at all (an
+    /// incomplete stream or a transport error).
+    Filled {
+        from_peer: bool,
+        fallback: Option<Arc<ChatCompletionResponse>>,
+    },
     /// The upstream returned a non-2xx: forward it verbatim, cache nothing.
     UpstreamError(ChatCompletionResponse),
 }
@@ -715,8 +756,16 @@ async fn fetch_completion_coalesced_streaming(
             // The claimer's tee (or a peer) fills the store, then resolves
             // this shared future. An in-process piggybacker counts as a
             // miss (item 21) -- the caller re-reads the store and replays.
-            let _ = shared.await.map_err(AppError::Provider)?;
-            return Ok(StreamClaim::Filled { from_peer: false });
+            // Keep the resolved response as a fallback: if the claimer's
+            // store write failed, or it was a non-2xx (never stored), the
+            // caller degrades to this instead of failing the request. A
+            // resolve error (incomplete stream / transport failure) leaves
+            // no fallback.
+            let fallback = shared.await.ok().map(|(resp, _)| resp);
+            return Ok(StreamClaim::Filled {
+                from_peer: false,
+                fallback,
+            });
         }
         LocalClaim::Claim(tx) => tx,
     };
@@ -746,19 +795,22 @@ async fn fetch_completion_coalesced_streaming(
         }
 
         if let Some(record) = found {
-            let resp = ChatCompletionResponse {
+            let resp = Arc::new(ChatCompletionResponse {
                 status: 200,
                 body: record.body.clone(),
                 usage: record.usage_struct(),
-            };
+            });
             state
                 .completion_in_flight
                 .lock()
                 .expect("completion_in_flight mutex poisoned")
                 .remove(&key);
-            let _ = oneshot_tx.send(Ok((Arc::new(resp), Coalesced::FromPeer)));
+            let _ = oneshot_tx.send(Ok((Arc::clone(&resp), Coalesced::FromPeer)));
             spawn_complete(&state.coordinator, key).await;
-            return Ok(StreamClaim::Filled { from_peer: true });
+            return Ok(StreamClaim::Filled {
+                from_peer: true,
+                fallback: Some(resp),
+            });
         }
 
         // Deadline with no peer fill: grab the lock best-effort and fall
@@ -808,25 +860,27 @@ async fn fetch_completion_coalesced_streaming(
         let body = serde_json::from_slice::<serde_json::Value>(&buf).unwrap_or_else(
             |_| serde_json::json!({ "error": String::from_utf8_lossy(&buf).into_owned() }),
         );
+        let error_response = ChatCompletionResponse {
+            status,
+            body,
+            usage: CompletionUsage::default(),
+        };
         state
             .completion_in_flight
             .lock()
             .expect("completion_in_flight mutex poisoned")
             .remove(&key);
-        let _ = oneshot_tx.send(Err(ProviderError(format!(
-            "streamed completion upstream returned status {status}"
-        ))));
+        // Hand the real non-2xx response to any in-process piggybacker (as a
+        // `Filled` fallback) so it forwards the same status/body the claimer
+        // does, rather than surfacing a synthetic 502. Nothing is stored.
+        let _ = oneshot_tx.send(Ok((Arc::new(error_response.clone()), Coalesced::Local)));
         spawn_complete(&state.coordinator, key).await;
         // Parity with the non-streaming path: `complete()` records a miss
         // unconditionally on a non-2xx, before its store guard.
         state
             .metrics
             .record_completion_miss(request.provider_name, true);
-        return Ok(StreamClaim::UpstreamError(ChatCompletionResponse {
-            status,
-            body,
-            usage: CompletionUsage::default(),
-        }));
+        return Ok(StreamClaim::UpstreamError(error_response));
     }
 
     let (tx, rx) = futures::channel::mpsc::unbounded::<Result<axum::body::Bytes, std::io::Error>>();
@@ -872,6 +926,10 @@ fn is_usage_only_data(ev: &crate::sse::SseEvent) -> bool {
 /// in-process piggybackers unblock), and `record_completion_miss` for the
 /// claimer.
 #[allow(clippy::too_many_arguments)]
+// `forward!` writes `client_gone` to short-circuit later sends; its final
+// expansion (the post-loop `finish()` frame) writes it on a path with no
+// subsequent read. That last dead write is intentional, not a bug.
+#[allow(unused_assignments)]
 fn spawn_tee(
     state: Arc<AppState>,
     provider_name: String,
@@ -897,28 +955,42 @@ fn spawn_tee(
         let mut malformed: Vec<String> = Vec::new();
         let mut client_gone = false;
 
+        // Forward one whole frame, unless it is the injected trailing usage
+        // frame a client that never set `stream_options.include_usage` must
+        // not see. Frame-granular so a read that splits a frame or carries
+        // two -- routine on HTTP/2 -- can never leak or bisect the usage
+        // frame, in the client stream or in `raw_capture`.
+        macro_rules! forward {
+            ($raw:expr) => {{
+                let raw: &[u8] = $raw;
+                if !client_gone
+                    && tx
+                        .unbounded_send(Ok(axum::body::Bytes::copy_from_slice(raw)))
+                        .is_err()
+                {
+                    // Client hung up: stop forwarding, keep draining so the
+                    // store still fills.
+                    client_gone = true;
+                }
+                raw_capture.extend_from_slice(raw);
+            }};
+        }
+
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => {
-                    let events = parser.feed(&chunk);
-                    let suppress = injected && events.len() == 1 && is_usage_only_data(&events[0]);
-                    for ev in &events {
-                        asm.ingest(ev);
-                        if let crate::sse::SseEvent::Malformed(payload) = ev {
-                            malformed.push(payload.clone());
+                    for frame in parser.feed(&chunk) {
+                        if let Some(ev) = &frame.event {
+                            asm.ingest(ev);
+                            if let crate::sse::SseEvent::Malformed(payload) = ev {
+                                malformed.push(payload.clone());
+                            }
                         }
-                    }
-                    if !suppress {
-                        if !client_gone
-                            && tx
-                                .unbounded_send(Ok(axum::body::Bytes::copy_from_slice(&chunk)))
-                                .is_err()
-                        {
-                            // Client hung up: stop forwarding, keep draining so
-                            // the store still fills.
-                            client_gone = true;
+                        let suppress =
+                            injected && frame.event.as_ref().is_some_and(is_usage_only_data);
+                        if !suppress {
+                            forward!(&frame.raw);
                         }
-                        raw_capture.extend_from_slice(&chunk);
                     }
                 }
                 Err(e) => {
@@ -928,11 +1000,18 @@ fn spawn_tee(
             }
         }
 
-        for ev in parser.finish() {
-            if let crate::sse::SseEvent::Malformed(payload) = &ev {
-                malformed.push(payload.clone());
+        if let Some(frame) = parser.finish() {
+            if let Some(ev) = &frame.event {
+                asm.ingest(ev);
+                if let crate::sse::SseEvent::Malformed(payload) = ev {
+                    malformed.push(payload.clone());
+                }
             }
-            asm.ingest(&ev);
+            // An unterminated trailing frame the chunk loop held back: still
+            // forward its bytes so the client and `raw_capture` see exactly
+            // what the upstream sent. Never the injected usage frame (that
+            // arrives terminated, before `[DONE]`).
+            forward!(&frame.raw);
         }
 
         let out = asm.finish();
@@ -1098,12 +1177,22 @@ mod tests {
 
     struct MockCompletionStore {
         data: Mutex<HashMap<CacheKey, Vec<u8>>>,
+        /// When set, every `put` errors and stores nothing -- so a claimer's
+        /// write-back fails and a later `get` still misses.
+        put_fails: bool,
     }
 
     impl MockCompletionStore {
         fn empty() -> Self {
             Self {
                 data: Mutex::new(HashMap::new()),
+                put_fails: false,
+            }
+        }
+        fn put_always_fails() -> Self {
+            Self {
+                data: Mutex::new(HashMap::new()),
+                put_fails: true,
             }
         }
     }
@@ -1113,6 +1202,9 @@ mod tests {
             Ok(self.data.lock().unwrap().get(key).cloned())
         }
         fn put(&self, key: CacheKey, value: Vec<u8>) -> Result<(), StoreError> {
+            if self.put_fails {
+                return Err(StoreError("mock put failure".into()));
+            }
             self.data.lock().unwrap().insert(key, value);
             Ok(())
         }
@@ -1178,6 +1270,10 @@ mod tests {
         }
         fn with_scope(mut self, scope: &str) -> Self {
             self.scope = scope.to_string();
+            self
+        }
+        fn with_delay(mut self, d: Duration) -> Self {
+            self.delay = Some(d);
             self
         }
         fn call_count(&self) -> usize {
@@ -2138,6 +2234,81 @@ mod tests {
                 "{dump}"
             );
             assert_eq!(provider.calls(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_streamed_piggybacker_forwards_a_non_streaming_claimers_non_2xx() {
+            // A non-streaming claimer holds the in-flight slot with a slow
+            // upstream that returns 429; a stream:true request for the same
+            // deterministic body piggybacks. The claimer stores nothing (a
+            // non-2xx is never cached), so the piggybacker's store read
+            // misses -- it must forward the real 429, not a synthetic 502.
+            let chat_provider =
+                Arc::new(MockChatProvider::with_status(429).with_delay(Duration::from_millis(60)));
+            let stream_provider = Arc::new(MockStreamProvider::ok(vec![])); // never called
+            let st = state_streaming(MockCompletionStore::empty());
+            let nbody = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"temperature":0});
+            let sbody = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"temperature":0,"stream":true});
+
+            let (claimer, piggy) =
+                tokio::join!(complete(&st, req(&chat_provider, OWNER_A, &nbody)), async {
+                    // Let the non-streaming claimer register first.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    complete_streaming(Arc::clone(&st), sreq(&stream_provider, OWNER_A, &sbody))
+                        .await
+                },);
+
+            assert_eq!(claimer.unwrap().response.status, 429);
+            match piggy.unwrap() {
+                StreamingOutcome::UpstreamError(resp) => assert_eq!(resp.status, 429),
+                _ => panic!("expected UpstreamError(429), not a degraded 502"),
+            }
+            assert_eq!(
+                stream_provider.calls(),
+                0,
+                "the piggybacker must not open its own upstream stream"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_streamed_piggybacker_degrades_to_a_replay_when_the_claimers_store_write_fails() {
+            // The claimer's tee assembles a complete completion but every
+            // store `put` errors, so nothing is persisted. The in-process
+            // piggybacker's store read misses -- it must replay the response
+            // the shared future handed back rather than surface a 502.
+            let frames = vec![
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"kept\"},\"finish_reason\":\"stop\"}]}\n\n".to_vec(),
+                b"data: [DONE]\n\n".to_vec(),
+            ];
+            let provider = Arc::new(MockStreamProvider::slow(frames, Duration::from_millis(60)));
+            let st = state_streaming(MockCompletionStore::put_always_fails());
+            let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"temperature":0,"stream":true});
+
+            let (a, b) = tokio::join!(
+                complete_streaming(Arc::clone(&st), sreq(&provider, OWNER_A, &body)),
+                complete_streaming(Arc::clone(&st), sreq(&provider, OWNER_A, &body)),
+            );
+            let mut bodies = Vec::new();
+            for out in [a.unwrap(), b.unwrap()] {
+                match out {
+                    StreamingOutcome::Stream { body: bd, hit, .. } => {
+                        assert!(!hit, "claimer and piggybacker are both misses");
+                        bodies.push(drain(bd).await);
+                    }
+                    _ => panic!("expected a Stream outcome, not an error"),
+                }
+            }
+            assert_eq!(
+                provider.calls(),
+                1,
+                "one upstream call despite the store failure"
+            );
+            for body in &bodies {
+                assert!(
+                    body.contains("kept"),
+                    "both requests still receive the completion: {body}"
+                );
+            }
         }
     }
 

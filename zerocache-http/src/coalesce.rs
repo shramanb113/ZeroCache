@@ -12,14 +12,22 @@ use zerocache_ports::{CoalescingCoordinator, FollowSignal, Role};
 
 use crate::app::AppError;
 
-/// Whether a resolved value came from this replica's own provider call or was
-/// filled by a peer replica while we waited. Only `completion.rs` cares:
-/// `FromPeer` is a cache hit (record tokens saved, do not re-store); `Local`
-/// is a miss handled exactly as before.
+/// How a resolved value was obtained. Only `completion.rs` cares:
+/// - `Local` -- this request ran the provider call (led, promoted, or fell
+///   back). It stores the result.
+/// - `FromPeer` -- a peer replica filled the entry while we waited; the value
+///   was read back from the store. A cache hit: record tokens saved, do not
+///   re-store.
+/// - `Piggyback` -- an in-process piggybacker on another request's in-flight
+///   fetch. Still a miss (item 21), but the claimer already stored the value,
+///   so this request must NOT re-store: its `encode_cached` would overwrite a
+///   `raw_sse`-carrying record written by a streaming claimer with a
+///   `raw_sse: None` one, permanently downgrading later `stream:true` hits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Coalesced {
     Local,
     FromPeer,
+    Piggyback,
 }
 
 pub(crate) enum CrossReplica<T> {
