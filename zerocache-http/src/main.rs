@@ -26,7 +26,7 @@ use app::{
     check_store_readiness, delete_batch, embed_batch, AppError, AppState, DeleteRequest,
     EmbedRequest, Metrics,
 };
-use completion::{complete, CompletionRequest};
+use completion::{complete, delete_completion, CompletionDeleteRequest, CompletionRequest};
 use config::{
     Config, StorageBackend, DEFAULT_GEMINI_BASE_URL, DEFAULT_HUGGINGFACE_BASE_URL,
     DEFAULT_MISTRAL_BASE_URL, DEFAULT_OPENAI_BASE_URL,
@@ -280,7 +280,7 @@ async fn main() {
         )
         .route(
             "/:provider/v1/chat/completions",
-            post(chat_completions_handler),
+            post(chat_completions_handler).delete(delete_chat_completions_handler),
         )
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
@@ -920,6 +920,87 @@ async fn chat_completions_handler(
         }
     }
     Ok(response)
+}
+
+/// `DELETE /{provider}/v1/chat/completions` -- evict the cache entry a
+/// matching `POST` would have hit, scoped to the caller's own `owner_id`.
+/// Same body shape and validation ladder as the `POST`; `stream` /
+/// `stream_options` are on the canonicalization denylist, so a body carrying
+/// either targets the same entry. Response: `{"deleted": 1}` -- the count is
+/// keys requested, not keys found (deletion is idempotent), matching
+/// `DELETE /{provider}/v1/embeddings`.
+#[tracing::instrument(skip_all, fields(provider = %provider_name))]
+async fn delete_chat_completions_handler(
+    State(state): State<Arc<AppState>>,
+    Path(provider_name): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Result<Json<DeleteResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let Json(request_body) = body.map_err(json_rejection_to_error_response)?;
+
+    let api_key = extract_bearer_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "missing or malformed Authorization header (expected 'Bearer <key>')"
+                    .to_string(),
+            }),
+        )
+    })?;
+
+    let provider = state
+        .completion_providers
+        .get(&provider_name)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("unknown provider '{provider_name}'"),
+                }),
+            )
+        })?;
+
+    let model = request_body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ErrorResponse {
+                    error: "request body is missing a string 'model' field".to_string(),
+                }),
+            )
+        })?
+        .to_string();
+
+    let owner_id = derive_owner_id(&api_key);
+
+    delete_completion(
+        &state,
+        CompletionDeleteRequest {
+            provider,
+            provider_name: &provider_name,
+            owner_id,
+            model: &model,
+            body: &request_body,
+        },
+    )
+    .await
+    .map_err(|err| {
+        let status = match &err {
+            AppError::Provider(_) => StatusCode::BAD_GATEWAY,
+            AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (
+            status,
+            Json(ErrorResponse {
+                error: err.to_string(),
+            }),
+        )
+    })?;
+
+    Ok(Json(DeleteResponse { deleted: 1 }))
 }
 
 /// Pipe an upstream SSE stream straight to the client with no caching, no

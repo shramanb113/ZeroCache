@@ -57,6 +57,29 @@ impl CachedCompletion {
     }
 }
 
+/// Derives the completion cache key from the output-affecting request fields.
+/// Shared by `complete`, `complete_streaming`, and `delete_completion` so the
+/// three derivations -- the canonicalization step and the `derive_completion`
+/// argument order -- cannot drift apart. The caller resolves `version` and
+/// `cache_scope` from its own (differently-typed) provider handle first.
+fn derive_completion_key(
+    owner_id: [u8; 32],
+    provider_name: &str,
+    cache_scope: &str,
+    model: &str,
+    version: &str,
+    body: &serde_json::Value,
+) -> CacheKey {
+    CacheKey::derive_completion(
+        owner_id,
+        provider_name,
+        cache_scope,
+        model,
+        version,
+        &canonicalize_completion_request(body),
+    )
+}
+
 fn encode_cached(response: &ChatCompletionResponse) -> Vec<u8> {
     let record = CachedCompletion {
         body: response.body.clone(),
@@ -135,14 +158,13 @@ pub async fn complete(
         .provider
         .cache_scope(request.model)
         .map_err(AppError::Provider)?;
-    let canonical = canonicalize_completion_request(request.body);
-    let key = CacheKey::derive_completion(
+    let key = derive_completion_key(
         request.owner_id,
         request.provider_name,
         &cache_scope,
         request.model,
         version,
-        &canonical,
+        request.body,
     );
 
     let cached = {
@@ -297,6 +319,66 @@ pub async fn complete(
         hit_kind: None,
         semantic_score: None,
     })
+}
+
+/// Everything a `DELETE /{provider}/v1/chat/completions` call needs. Only the
+/// output-affecting fields matter -- the same ones the cache key is built from
+/// -- so a matching `POST` body and this request resolve to one key.
+pub struct CompletionDeleteRequest<'a> {
+    pub provider: Arc<dyn ChatCompletionProvider>,
+    pub provider_name: &'a str,
+    pub owner_id: [u8; 32],
+    pub model: &'a str,
+    pub body: &'a serde_json::Value,
+}
+
+/// Evicts the cache entry a matching `POST /{provider}/v1/chat/completions`
+/// would have hit, scoped to this caller's `owner_id`. Idempotent: deleting an
+/// absent key succeeds. With the semantic tier enabled the request's vector
+/// record and in-memory index node are dropped too -- the same self-heal
+/// `semantic_probe` performs on a stale entry.
+#[tracing::instrument(skip_all, fields(provider = %request.provider_name))]
+pub async fn delete_completion(
+    state: &AppState,
+    request: CompletionDeleteRequest<'_>,
+) -> Result<(), AppError> {
+    let version = request.provider.version();
+    let cache_scope = request
+        .provider
+        .cache_scope(request.model)
+        .map_err(AppError::Provider)?;
+    let key = derive_completion_key(
+        request.owner_id,
+        request.provider_name,
+        &cache_scope,
+        request.model,
+        version,
+        request.body,
+    );
+
+    let store = Arc::clone(&state.completion_store);
+    run_store_task(move || store.delete(&key).map_err(AppError::Store))
+        .instrument(tracing::info_span!("store_delete"))
+        .await?;
+
+    #[cfg(feature = "semantic")]
+    if let Some(sem) = &state.semantic {
+        let scope = crate::semantic::scope_key(
+            &request.owner_id,
+            request.provider_name,
+            &cache_scope,
+            request.model,
+        );
+        sem.index.tombstone(scope, &key);
+        let vs = Arc::clone(&sem.vector_store);
+        if let Err(e) =
+            run_store_task(move || vs.delete(&key, &scope).map_err(AppError::Store)).await
+        {
+            tracing::warn!("completion delete: failed to drop the semantic vector record: {e}");
+        }
+    }
+
+    Ok(())
 }
 
 /// Fetches one completion, coalescing with any identical concurrent in-flight
@@ -475,14 +557,13 @@ pub async fn complete_streaming(
         .stream_provider
         .cache_scope(request.model)
         .map_err(AppError::Provider)?;
-    let canonical = canonicalize_completion_request(request.body);
-    let key = CacheKey::derive_completion(
+    let key = derive_completion_key(
         request.owner_id,
         request.provider_name,
         &cache_scope,
         request.model,
         version,
-        &canonical,
+        request.body,
     );
 
     let cached = {
@@ -1746,6 +1827,162 @@ mod tests {
         assert_eq!(provider.call_count(), 1);
     }
 
+    mod delete {
+        use super::*;
+
+        fn dreq<'a>(
+            provider: &Arc<MockChatProvider>,
+            owner: [u8; 32],
+            body: &'a serde_json::Value,
+        ) -> CompletionDeleteRequest<'a> {
+            CompletionDeleteRequest {
+                provider: Arc::clone(provider) as Arc<dyn ChatCompletionProvider>,
+                provider_name: "openai",
+                owner_id: owner,
+                model: "gpt-4o",
+                body,
+            }
+        }
+
+        #[tokio::test]
+        async fn delete_removes_an_entry_a_matching_request_would_hit() {
+            let provider = Arc::new(MockChatProvider::ok(
+                json!({"choices": [{"message": {"content": "hello"}}]}),
+                CompletionUsage::default(),
+            ));
+            let st = state(MockCompletionStore::empty());
+            let body = eligible_body();
+
+            complete(&st, req(&provider, OWNER_A, &body)).await.unwrap();
+            assert!(
+                complete(&st, req(&provider, OWNER_A, &body))
+                    .await
+                    .unwrap()
+                    .hit
+            );
+            assert_eq!(provider.call_count(), 1);
+
+            delete_completion(&st, dreq(&provider, OWNER_A, &body))
+                .await
+                .unwrap();
+
+            assert!(
+                !complete(&st, req(&provider, OWNER_A, &body))
+                    .await
+                    .unwrap()
+                    .hit
+            );
+            assert_eq!(provider.call_count(), 2, "the entry was evicted");
+        }
+
+        #[tokio::test]
+        async fn delete_of_an_absent_key_succeeds() {
+            let provider = Arc::new(MockChatProvider::ok(
+                json!({"x": 1}),
+                CompletionUsage::default(),
+            ));
+            let st = state(MockCompletionStore::empty());
+            let body = eligible_body();
+
+            delete_completion(&st, dreq(&provider, OWNER_A, &body))
+                .await
+                .unwrap();
+            delete_completion(&st, dreq(&provider, OWNER_A, &body))
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn delete_is_scoped_per_owner() {
+            let provider = Arc::new(MockChatProvider::ok(
+                json!({"x": 1}),
+                CompletionUsage::default(),
+            ));
+            let st = state(MockCompletionStore::empty());
+            let body = eligible_body();
+
+            complete(&st, req(&provider, OWNER_A, &body)).await.unwrap();
+            complete(&st, req(&provider, OWNER_B, &body)).await.unwrap();
+            assert_eq!(provider.call_count(), 2);
+
+            delete_completion(&st, dreq(&provider, OWNER_A, &body))
+                .await
+                .unwrap();
+
+            assert!(
+                complete(&st, req(&provider, OWNER_B, &body))
+                    .await
+                    .unwrap()
+                    .hit,
+                "another caller's identical-body entry is untouched"
+            );
+            assert!(
+                !complete(&st, req(&provider, OWNER_A, &body))
+                    .await
+                    .unwrap()
+                    .hit
+            );
+        }
+
+        #[tokio::test]
+        async fn delete_only_touches_the_matching_cache_scope() {
+            let st = state(MockCompletionStore::empty());
+            let body = eligible_body();
+            let p_a = Arc::new(
+                MockChatProvider::ok(json!({"s": "a"}), CompletionUsage::default())
+                    .with_scope("https://api.openai.com/v1"),
+            );
+            let p_b = Arc::new(
+                MockChatProvider::ok(json!({"s": "b"}), CompletionUsage::default())
+                    .with_scope("https://vllm.internal/v1"),
+            );
+
+            complete(&st, req(&p_a, OWNER_A, &body)).await.unwrap();
+            complete(&st, req(&p_b, OWNER_A, &body)).await.unwrap();
+
+            delete_completion(&st, dreq(&p_a, OWNER_A, &body))
+                .await
+                .unwrap();
+
+            assert!(!complete(&st, req(&p_a, OWNER_A, &body)).await.unwrap().hit);
+            assert!(
+                complete(&st, req(&p_b, OWNER_A, &body)).await.unwrap().hit,
+                "the same body under a different provider scope survives"
+            );
+        }
+
+        #[tokio::test]
+        async fn delete_ignores_stream_fields_in_the_body() {
+            // `stream` / `stream_options` are on the canonicalization
+            // denylist, so a delete body carrying either still targets the
+            // entry a plain `POST` wrote.
+            let provider = Arc::new(MockChatProvider::ok(
+                json!({"x": 1}),
+                CompletionUsage::default(),
+            ));
+            let st = state(MockCompletionStore::empty());
+            let stored = eligible_body();
+            complete(&st, req(&provider, OWNER_A, &stored))
+                .await
+                .unwrap();
+
+            let mut delete_body = eligible_body();
+            delete_body["stream"] = json!(true);
+            delete_body["stream_options"] = json!({"include_usage": true});
+            delete_completion(&st, dreq(&provider, OWNER_A, &delete_body))
+                .await
+                .unwrap();
+
+            assert!(
+                !complete(&st, req(&provider, OWNER_A, &stored))
+                    .await
+                    .unwrap()
+                    .hit
+            );
+            assert_eq!(provider.call_count(), 2);
+        }
+    }
+
     mod streaming {
         use std::sync::atomic::AtomicBool;
 
@@ -2524,6 +2761,57 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!o.hit);
+            assert_eq!(provider.call_count(), 2);
+        }
+
+        #[tokio::test]
+        async fn delete_drops_the_semantic_vector_record_and_the_exact_entry() {
+            let provider = Arc::new(MockChatProvider::ok(
+                json!({"choices":[{"message":{"content":"A"}}]}),
+                CompletionUsage::default(),
+            ));
+            let emb = Arc::new(ConstEmbedder(AtomicUsize::new(0)));
+            let st = state_semantic(MockCompletionStore::empty(), emb, 0.97);
+            let b = body("how do I reset my password?", 256);
+
+            complete(&st, sreq(&provider, OWNER_A, &b)).await.unwrap();
+            assert_eq!(
+                st.semantic
+                    .as_ref()
+                    .unwrap()
+                    .vector_store
+                    .load_all()
+                    .unwrap()
+                    .len(),
+                1,
+                "the miss recorded a vector"
+            );
+
+            delete_completion(
+                &st,
+                CompletionDeleteRequest {
+                    provider: Arc::clone(&provider) as Arc<dyn ChatCompletionProvider>,
+                    provider_name: "openai",
+                    owner_id: OWNER_A,
+                    model: "gpt-4o",
+                    body: &b,
+                },
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                st.semantic
+                    .as_ref()
+                    .unwrap()
+                    .vector_store
+                    .load_all()
+                    .unwrap()
+                    .is_empty(),
+                "delete dropped the vector record"
+            );
+            let o = complete(&st, sreq(&provider, OWNER_A, &b)).await.unwrap();
+            assert!(!o.hit, "the exact entry was evicted too");
             assert_eq!(provider.call_count(), 2);
         }
     }
