@@ -1,4 +1,5 @@
 mod cache_key;
+mod canonical;
 mod canonicalize;
 mod completion;
 mod normalize;
