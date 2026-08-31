@@ -13,6 +13,7 @@ members = [
     "zerocache-adapters-azure",
     "zerocache-adapters-bedrock",
     "zerocache-adapters-vertexai",
+    "zerocache-adapters-anthropic",
     "zerocache-http",
 ]
 # Deliberately NOT a member: the opt-in semantic tier (candle + a bundled

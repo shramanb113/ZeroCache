@@ -5260,6 +5260,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "zerocache-adapters-anthropic"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "httpmock",
+ "reqwest",
+ "reqwest-middleware",
+ "reqwest-retry",
+ "serde_json",
+ "tokio",
+ "zerocache-ports",
+]
+
+[[package]]
 name = "zerocache-adapters-azure"
 version = "0.1.0"
 dependencies = [
