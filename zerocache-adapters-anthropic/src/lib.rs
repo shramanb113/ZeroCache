@@ -116,12 +116,15 @@ impl MessagesProvider for AnthropicMessagesProvider {
         let body: serde_json::Value =
             serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({ "error": text }));
 
+        // Only the two headline counts feed our metrics; `cache_creation_input_tokens`
+        // / `cache_read_input_tokens` (Anthropic prompt caching) are intentionally not
+        // surfaced here.
         let input = body["usage"]["input_tokens"].as_u64().unwrap_or(0) as u32;
         let output = body["usage"]["output_tokens"].as_u64().unwrap_or(0) as u32;
         let usage = CompletionUsage {
             prompt_tokens: input,
             completion_tokens: output,
-            total_tokens: input + output,
+            total_tokens: input.saturating_add(output),
         };
 
         Ok(ChatCompletionResponse {
@@ -405,5 +408,31 @@ mod tests {
             collected.extend_from_slice(&chunk.unwrap());
         }
         assert_eq!(String::from_utf8(collected).unwrap(), body);
+
+        // A non-2xx surfaces its real status and still streams the error body.
+        let err_server = MockServer::start_async().await;
+        err_server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/messages");
+                then.status(400).body("bad request");
+            })
+            .await;
+
+        let provider = AnthropicMessagesProvider::new(err_server.base_url());
+        let (status, mut stream) = provider
+            .messages_stream_passthrough(
+                "sk-caller",
+                &json!({"messages": [], "stream": true}),
+                &MessageHeaders::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(status, 400);
+        let mut collected = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(String::from_utf8(collected).unwrap(), "bad request");
     }
 }

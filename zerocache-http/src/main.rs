@@ -1079,9 +1079,21 @@ fn messages_headers_from(headers: &HeaderMap) -> zerocache_ports::MessageHeaders
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
     };
+    // `HeaderMap::get` yields only the first value; a caller may send several
+    // `anthropic-beta` lines. Comma-join them so none is lost upstream or from
+    // the cache key. `anthropic-version` stays single.
+    let beta = {
+        let joined = headers
+            .get_all("anthropic-beta")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect::<Vec<_>>()
+            .join(",");
+        (!joined.is_empty()).then_some(joined)
+    };
     zerocache_ports::MessageHeaders {
         anthropic_version: get("anthropic-version"),
-        anthropic_beta: get("anthropic-beta"),
+        anthropic_beta: beta,
     }
 }
 
@@ -1176,6 +1188,8 @@ async fn messages_handler(
     // Forward the upstream status verbatim (a hit is 200); an out-of-range
     // value can only come from a broken upstream -> 502.
     let status = StatusCode::from_u16(outcome.response.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    // Deferred: upstream rate-limit / request-id headers are not forwarded on this path
+    // (needs a ports change touching the shared chat surface). See Deviations item 30.
     let mut response = (status, Json(outcome.response.body)).into_response();
     response.headers_mut().insert(
         "x-zerocache-completion-hit",
@@ -1720,5 +1734,74 @@ mod tests {
         .err()
         .map(|(s, _)| s);
         assert_eq!(got, Some(StatusCode::UNPROCESSABLE_ENTITY));
+    }
+
+    #[tokio::test]
+    async fn messages_handler_stream_true_is_a_passthrough_that_caches_nothing() {
+        use futures::StreamExt;
+
+        let p = Arc::new(MsgProvider(std::sync::atomic::AtomicUsize::new(0)));
+        let store = Arc::new(MsgStore(StdMutex::new(StdHashMap::new())));
+        let mut mp: StdHashMap<String, Arc<dyn MessagesProvider>> = StdHashMap::new();
+        mp.insert(
+            "anthropic".to_string(),
+            Arc::clone(&p) as Arc<dyn MessagesProvider>,
+        );
+        let state = Arc::new(AppState {
+            store: Arc::new(NoEmb),
+            providers: StdHashMap::new(),
+            image_providers: StdHashMap::new(),
+            metrics: Metrics::new(),
+            in_flight: StdMutex::new(StdHashMap::new()),
+            image_in_flight: StdMutex::new(StdHashMap::new()),
+            completion_store: Arc::clone(&store) as Arc<dyn CompletionStore>,
+            completion_providers: StdHashMap::new(),
+            completion_stream_providers: StdHashMap::new(),
+            messages_providers: mp,
+            completion_in_flight: StdMutex::new(StdHashMap::new()),
+            coordinator: Arc::new(crate::coalesce::NoopCoordinator),
+            #[cfg(feature = "semantic")]
+            semantic: None,
+        });
+
+        let body = serde_json::json!({
+            "model": "claude-opus-4-6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+            "temperature": 0,
+            "stream": true
+        });
+
+        let resp = messages_handler(
+            State(Arc::clone(&state)),
+            Path("anthropic".to_string()),
+            bearer("sk-caller"),
+            Ok(Json(body)),
+        )
+        .await
+        .unwrap_or_else(|(s, _)| panic!("stream passthrough errored: {s}"));
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+        assert_eq!(
+            resp.headers().get("x-zerocache-completion-hit").unwrap(),
+            "false"
+        );
+
+        // passthrough must not go through `complete_messages`
+        assert_eq!(p.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // drain the (empty) body so the response future completes
+        let mut b = resp.into_body().into_data_stream();
+        while let Some(chunk) = b.next().await {
+            chunk.unwrap();
+        }
+        assert!(
+            store.0.lock().unwrap().is_empty(),
+            "the passthrough path stores nothing"
+        );
     }
 }

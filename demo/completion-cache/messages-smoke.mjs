@@ -4,10 +4,15 @@ import { strict as assert } from "node:assert";
 
 const ZEROCACHE_URL = process.env.ZEROCACHE_URL || "http://localhost:8080";
 const API_KEY = process.env.ANTHROPIC_API_KEY;
-const MODEL = process.env.MODEL || "claude-opus-4-1-20250805";
+const MODEL = process.env.MODEL;
 
 if (!API_KEY) {
   console.error("ANTHROPIC_API_KEY env var required");
+  process.exit(1);
+}
+
+if (!MODEL) {
+  console.error("MODEL env var required (must be a model that accepts temperature: 0, e.g. claude-opus-4-1-20250805)");
   process.exit(1);
 }
 

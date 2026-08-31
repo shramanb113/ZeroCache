@@ -15,6 +15,7 @@ use std::sync::Arc;
 use futures::future::FutureExt;
 use tracing::Instrument;
 
+use zerocache_adapters_anthropic::DEFAULT_ANTHROPIC_VERSION;
 use zerocache_core::{canonicalize_messages_request, messages_request_is_cacheable, CacheKey};
 use zerocache_ports::{ChatCompletionResponse, MessageHeaders, MessagesProvider, ProviderError};
 
@@ -46,10 +47,10 @@ pub struct MessagesDeleteRequest<'a> {
     pub headers: MessageHeaders,
 }
 
-/// Canonicalization + `anthropic-beta` header fold + `CacheKey::derive_messages`
-/// in one place so `complete_messages` and `delete_messages` cannot drift on
-/// the key. The caller resolves `version` and `cache_scope` from its provider
-/// handle first.
+/// Canonicalization + `anthropic-version` + `anthropic-beta` header fold +
+/// `CacheKey::derive_messages` in one place so `complete_messages` and
+/// `delete_messages` cannot drift on the key. The caller resolves `version`
+/// and `cache_scope` from its provider handle first.
 fn derive_messages_key(
     owner_id: [u8; 32],
     provider_name: &str,
@@ -60,10 +61,19 @@ fn derive_messages_key(
     headers: &MessageHeaders,
 ) -> CacheKey {
     let mut canonical = canonicalize_messages_request(body);
+    // `anthropic-version` and `anthropic-beta` both change the response shape, so
+    // two requests that differ only by either must not share an entry. Folded here
+    // (not in the canonicalizer) because they arrive as headers. Version is folded
+    // unconditionally against the adapter's own default so an absent header and an
+    // explicit "2023-06-01" collapse to one key.
+    canonical.push_str("\0anthropic-version:");
+    canonical.push_str(
+        headers
+            .anthropic_version
+            .as_deref()
+            .unwrap_or(DEFAULT_ANTHROPIC_VERSION),
+    );
     if let Some(beta) = &headers.anthropic_beta {
-        // A beta feature can change the response shape, so two requests that
-        // differ only by an active beta must not share an entry. Folded here
-        // (not in the canonicalizer) because it arrives as a header.
         canonical.push_str("\0anthropic-beta:");
         canonical.push_str(beta);
     }
@@ -675,6 +685,125 @@ mod tests {
         .unwrap();
         assert!(!out.hit, "the anthropic-beta header folds into the key");
         assert_eq!(p.count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_different_anthropic_version_header_misses() {
+        let p = Arc::new(MockMessagesProvider::ok());
+        let st = state(MockCompletionStore::empty());
+        let body = cacheable_body();
+
+        let h1 = MessageHeaders {
+            anthropic_version: Some("2023-06-01".into()),
+            anthropic_beta: None,
+        };
+        let h2 = MessageHeaders {
+            anthropic_version: Some("2099-01-01".into()),
+            anthropic_beta: None,
+        };
+
+        complete_messages(&st, req(&p, OWNER_A, &body, h1.clone()))
+            .await
+            .unwrap();
+        complete_messages(&st, req(&p, OWNER_A, &body, h1))
+            .await
+            .unwrap();
+        assert_eq!(p.count(), 1, "same version repeats -> hit");
+
+        complete_messages(&st, req(&p, OWNER_A, &body, h2))
+            .await
+            .unwrap();
+        assert_eq!(p.count(), 2, "a different anthropic-version must miss");
+    }
+
+    #[tokio::test]
+    async fn an_absent_anthropic_version_and_the_explicit_default_share_an_entry() {
+        let p = Arc::new(MockMessagesProvider::ok());
+        let st = state(MockCompletionStore::empty());
+        let body = cacheable_body();
+
+        complete_messages(&st, req(&p, OWNER_A, &body, MessageHeaders::default()))
+            .await
+            .unwrap();
+        complete_messages(
+            &st,
+            req(
+                &p,
+                OWNER_A,
+                &body,
+                MessageHeaders {
+                    anthropic_version: Some("2023-06-01".into()),
+                    anthropic_beta: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(p.count(), 1, "absent header == explicit 2023-06-01");
+    }
+
+    #[tokio::test]
+    async fn a_messages_hit_bumps_the_completion_metric_counters() {
+        let p = Arc::new(MockMessagesProvider::ok());
+        let st = state(MockCompletionStore::empty());
+        let body = cacheable_body();
+
+        complete_messages(&st, req(&p, OWNER_A, &body, MessageHeaders::default()))
+            .await
+            .unwrap(); // miss, stores usage
+        complete_messages(&st, req(&p, OWNER_A, &body, MessageHeaders::default()))
+            .await
+            .unwrap(); // hit
+
+        let dump = st.metrics.encode();
+        for line in [
+            "zerocache_completion_cache_hits_total{provider=\"anthropic\",stream=\"false\"} 1",
+            "zerocache_completion_cache_misses_total{provider=\"anthropic\",stream=\"false\"} 1",
+            "zerocache_completion_prompt_tokens_saved_total{provider=\"anthropic\",stream=\"false\"} 9",
+            "zerocache_completion_completion_tokens_saved_total{provider=\"anthropic\",stream=\"false\"} 3",
+        ] {
+            assert!(dump.contains(line), "missing `{line}` in:\n{dump}");
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_ignores_stream_fields_in_the_body() {
+        let p = Arc::new(MockMessagesProvider::ok());
+        let st = state(MockCompletionStore::empty());
+        let body = cacheable_body();
+
+        // seed, then confirm a repeat is a hit
+        complete_messages(&st, req(&p, OWNER_A, &body, MessageHeaders::default()))
+            .await
+            .unwrap();
+        complete_messages(&st, req(&p, OWNER_A, &body, MessageHeaders::default()))
+            .await
+            .unwrap();
+        assert_eq!(p.count(), 1, "the seeded entry hits");
+
+        // a DELETE body carrying `stream: true` still targets the plain entry
+        let mut streamy = cacheable_body();
+        streamy["stream"] = json!(true);
+        delete_messages(
+            &st,
+            MessagesDeleteRequest {
+                provider: Arc::clone(&p) as Arc<dyn MessagesProvider>,
+                provider_name: "anthropic",
+                owner_id: OWNER_A,
+                model: "claude-opus-4-6",
+                body: &streamy,
+                headers: MessageHeaders::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let re_miss = complete_messages(&st, req(&p, OWNER_A, &body, MessageHeaders::default()))
+            .await
+            .unwrap();
+        assert!(!re_miss.hit);
+        assert_eq!(p.count(), 2, "the stream-carrying DELETE evicted the entry");
     }
 
     #[tokio::test]
