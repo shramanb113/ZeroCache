@@ -23,7 +23,7 @@ pub const DEFAULT_SEMANTIC_INDEX_MAXLEN: usize = 100_000;
 // connection surfaces as a fast error instead of hanging the caller (and,
 // via zerocache-http's own STORE_TIMEOUT wrapper, blocking that request's
 // response and the server's graceful-shutdown drain) indefinitely.
-const STORE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const STORE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Pooled, not a single shared connection behind a mutex: concurrent requests
 // each check out their own connection, so no lock serializes cache access.
@@ -32,6 +32,10 @@ const STORE_TIMEOUT: Duration = Duration::from_secs(5);
 // so a last-write-wins SET is not a correctness problem.
 pub struct RedisStore {
     pool: r2d2::Pool<redis::Client>,
+    // Kept alongside the pool so the semantic change-feed can open a dedicated
+    // connection for `XREAD BLOCK` -- a multi-second blocking read must not
+    // occupy a pooled connection or fight `apply_socket_timeouts`' 5s cap.
+    client: redis::Client,
     ttl: Option<Duration>,
     semantic_index_maxlen: usize,
 }
@@ -40,10 +44,11 @@ impl RedisStore {
     pub fn connect(redis_url: &str, ttl: Option<Duration>) -> Result<Self, StoreError> {
         let client = redis::Client::open(redis_url).map_err(|e| StoreError(e.to_string()))?;
         let pool = r2d2::Pool::builder()
-            .build(client)
+            .build(client.clone())
             .map_err(|e| StoreError(e.to_string()))?;
         Ok(Self {
             pool,
+            client,
             ttl,
             semantic_index_maxlen: DEFAULT_SEMANTIC_INDEX_MAXLEN,
         })

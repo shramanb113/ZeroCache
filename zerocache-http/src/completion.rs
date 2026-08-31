@@ -2596,6 +2596,13 @@ mod tests {
             ) -> Result<zerocache_ports::VectorChanges, StoreError> {
                 Ok(zerocache_ports::VectorChanges::default())
             }
+            fn changes_blocking(
+                &self,
+                _c: String,
+                _t: std::time::Duration,
+            ) -> Result<zerocache_ports::VectorChanges, StoreError> {
+                Ok(zerocache_ports::VectorChanges::default())
+            }
         }
 
         fn state_semantic(
@@ -2630,6 +2637,109 @@ mod tests {
                 {"role":"system","content":"support bot"},
                 {"role":"user","content": user}
             ],"temperature":0,"max_tokens": max_tokens})
+        }
+
+        /// Hands `changes_blocking` one queued batch, then parks briefly on
+        /// every later call the way a real `XREAD BLOCK` would when idle.
+        struct QueueVectorStore {
+            batches: Mutex<std::collections::VecDeque<zerocache_ports::VectorChanges>>,
+        }
+        impl zerocache_ports::CompletionVectorStore for QueueVectorStore {
+            fn insert(&self, _r: VectorRecord) -> Result<(), StoreError> {
+                Ok(())
+            }
+            fn delete(&self, _k: &CacheKey, _s: &[u8; 32]) -> Result<(), StoreError> {
+                Ok(())
+            }
+            fn load_all(&self) -> Result<Vec<VectorRecord>, StoreError> {
+                Ok(vec![])
+            }
+            fn changes_since(
+                &self,
+                _c: Option<String>,
+            ) -> Result<zerocache_ports::VectorChanges, StoreError> {
+                Ok(zerocache_ports::VectorChanges::default())
+            }
+            fn changes_blocking(
+                &self,
+                cursor: String,
+                timeout: std::time::Duration,
+            ) -> Result<zerocache_ports::VectorChanges, StoreError> {
+                if let Some(b) = self.batches.lock().unwrap().pop_front() {
+                    return Ok(b);
+                }
+                std::thread::sleep(timeout.min(std::time::Duration::from_millis(30)));
+                Ok(zerocache_ports::VectorChanges {
+                    upserts: vec![],
+                    deletes: vec![],
+                    cursor: Some(cursor),
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn the_poll_task_applies_a_batch_delivered_by_changes_blocking() {
+            let scope = crate::semantic::scope_key(&[9u8; 32], "openai", "s", "gpt-4o");
+            let mut qvec = vec![0f32; zerocache_semantic::EMBEDDING_DIM];
+            qvec[0] = 1.0;
+            let record = VectorRecord {
+                exact_key: CacheKey::from_bytes([77u8; 32]),
+                scope_hash: scope,
+                coarse_key_hash: [7u8; 32],
+                index_version: crate::semantic::SEMANTIC_INDEX_VERSION,
+                vector: qvec.clone(),
+            };
+            let vs = Arc::new(QueueVectorStore {
+                batches: Mutex::new(
+                    vec![zerocache_ports::VectorChanges {
+                        upserts: vec![record],
+                        deletes: vec![],
+                        cursor: Some("5-0".to_string()),
+                    }]
+                    .into(),
+                ),
+            });
+            let state = Arc::new(AppState {
+                store: Arc::new(NoopEmbeddingStore),
+                providers: HashMap::new(),
+                image_providers: HashMap::new(),
+                metrics: Metrics::new(),
+                in_flight: Mutex::new(HashMap::new()),
+                image_in_flight: Mutex::new(HashMap::new()),
+                completion_store: Arc::new(MockCompletionStore::empty()),
+                completion_providers: HashMap::new(),
+                completion_stream_providers: HashMap::new(),
+                completion_in_flight: Mutex::new(HashMap::new()),
+                coordinator: Arc::new(crate::coalesce::NoopCoordinator),
+                semantic: Some(SemanticState {
+                    embedder: Arc::new(ConstEmbedder(AtomicUsize::new(0))),
+                    index: Arc::new(SemanticIndex::new()),
+                    vector_store: vs,
+                    threshold: 0.97,
+                    match_unit: MatchUnit::LastUser,
+                }),
+            });
+
+            tokio::spawn(crate::semantic::run_semantic_poll_task(
+                Arc::clone(&state),
+                "0-0".to_string(),
+                std::time::Duration::from_millis(30),
+            ));
+
+            let index = &state.semantic.as_ref().unwrap().index;
+            let mut applied = false;
+            for _ in 0..100 {
+                if index.len(scope) == 1 {
+                    applied = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(applied, "the poll task should apply the delivered upsert");
+            assert!(state
+                .metrics
+                .encode()
+                .contains("zerocache_semantic_index_events_applied_total{op=\"upsert\"} 1"));
         }
 
         fn sreq<'a>(

@@ -209,26 +209,27 @@ fn apply_vector_changes(
     }
 }
 
-/// One background task per process (redis only). Polls `changes_since(cursor)`
-/// on `poll` interval via `spawn_blocking` and applies remote upserts/deletes
-/// to the local in-memory index. The query path never touches Redis; this is
-/// the only place the semantic tier reaches the network on the redis backend.
+/// One background task per process (redis only). Loops on
+/// `changes_blocking(cursor, block)` via `spawn_blocking`: the store parks in
+/// an `XREAD BLOCK` for up to `block` when the feed is idle and returns the
+/// instant a peer writes, so remote upserts/deletes reach the local in-memory
+/// index in about one round-trip instead of up to a full poll interval. The
+/// query path never touches Redis; this is the only place the semantic tier
+/// reaches the network on the redis backend. `block` also bounds how long a
+/// wedged read can go unnoticed, and paces the retry after a Redis error.
 pub async fn run_semantic_poll_task(
     state: Arc<AppState>,
     mut cursor: String,
-    poll: std::time::Duration,
+    block: std::time::Duration,
 ) {
-    let mut ticker = tokio::time::interval(poll);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut consecutive_errors: u32 = 0;
     loop {
-        ticker.tick().await;
         let Some(sem) = state.semantic.as_ref() else {
             return;
         };
         let vs = Arc::clone(&sem.vector_store);
         let cur = cursor.clone();
-        match tokio::task::spawn_blocking(move || vs.changes_since(Some(cur))).await {
+        match tokio::task::spawn_blocking(move || vs.changes_blocking(cur, block)).await {
             Ok(Ok(changes)) => {
                 consecutive_errors = 0;
                 apply_vector_changes(sem.index.as_ref(), &state.metrics, changes, &mut cursor);
@@ -240,12 +241,14 @@ pub async fn run_semantic_poll_task(
                         "semantic index poll failed ({consecutive_errors}x), keeping cursor {cursor}: {e} (the redis semantic index needs Redis >= 6.2 for exclusive XRANGE / XTRIM MINID)"
                     );
                 }
+                tokio::time::sleep(block).await;
             }
             Err(join) => {
                 consecutive_errors += 1;
                 if consecutive_errors == 1 || consecutive_errors.is_multiple_of(30) {
                     warn!("semantic index poll task join error ({consecutive_errors}x): {join}");
                 }
+                tokio::time::sleep(block).await;
             }
         }
     }
@@ -286,6 +289,13 @@ mod tests {
             Ok(self.0.lock().unwrap().clone())
         }
         fn changes_since(&self, _c: Option<String>) -> Result<VectorChanges, StoreError> {
+            Ok(VectorChanges::default())
+        }
+        fn changes_blocking(
+            &self,
+            _c: String,
+            _t: std::time::Duration,
+        ) -> Result<VectorChanges, StoreError> {
             Ok(VectorChanges::default())
         }
     }
@@ -499,6 +509,13 @@ mod tests {
             fn changes_since(
                 &self,
                 _c: Option<String>,
+            ) -> Result<VectorChanges, zerocache_ports::StoreError> {
+                Err(zerocache_ports::StoreError("redis down".into()))
+            }
+            fn changes_blocking(
+                &self,
+                _c: String,
+                _t: std::time::Duration,
             ) -> Result<VectorChanges, zerocache_ports::StoreError> {
                 Err(zerocache_ports::StoreError("redis down".into()))
             }

@@ -134,6 +134,15 @@ impl CompletionVectorStore for SledStore {
         Ok(VectorChanges::default())
     }
 
+    // No shared change-feed and no poll loop on sled -- defensive no-op.
+    fn changes_blocking(
+        &self,
+        _cursor: String,
+        _timeout: Duration,
+    ) -> Result<VectorChanges, StoreError> {
+        Ok(VectorChanges::default())
+    }
+
     fn load_all(&self) -> Result<Vec<VectorRecord>, StoreError> {
         let now = SystemTime::now();
         let mut out = Vec::new();
@@ -590,6 +599,26 @@ mod tests {
         let store = SledStore::open(&dir, None).unwrap();
         let c = CompletionVectorStore::changes_since(&store, None).unwrap();
         assert!(c.upserts.is_empty() && c.deletes.is_empty() && c.cursor.is_none());
+        drop(store);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn changes_blocking_returns_immediately_and_empty_on_sled() {
+        let dir = temp_dir();
+        let store = SledStore::open(&dir, None).unwrap();
+        let started = std::time::Instant::now();
+        let c = CompletionVectorStore::changes_blocking(
+            &store,
+            "0-0".to_string(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(c.upserts.is_empty() && c.deletes.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "sled changes_blocking must not actually block"
+        );
         drop(store);
         std::fs::remove_dir_all(dir).ok();
     }

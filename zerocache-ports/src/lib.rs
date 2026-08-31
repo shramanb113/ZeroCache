@@ -90,6 +90,20 @@ pub trait CompletionVectorStore: Send + Sync {
     /// `cursor: None` on a backend with no shared feed (sled), signalling the
     /// caller to skip the poll loop and rely on `load_all`.
     fn changes_since(&self, cursor: Option<String>) -> Result<VectorChanges, StoreError>;
+
+    /// Like `changes_since(Some(cursor))`, but a backend with a native blocking
+    /// read (redis `XREAD BLOCK`) waits up to `timeout` for the first entry
+    /// after `cursor` before returning, cutting change-feed propagation lag to
+    /// roughly one round-trip. On timeout with nothing new it returns empty
+    /// `upserts`/`deletes` and `cursor: Some(<unchanged cursor>)`. A backend
+    /// with no shared feed (sled) has no such primitive and returns
+    /// `VectorChanges::default()` immediately -- it never runs the poll loop
+    /// that calls this.
+    fn changes_blocking(
+        &self,
+        cursor: String,
+        timeout: std::time::Duration,
+    ) -> Result<VectorChanges, StoreError>;
 }
 
 /// Which side of a cross-replica single-flight this replica is on for one key.
@@ -327,6 +341,13 @@ mod tests {
         fn changes_since(&self, _cursor: Option<String>) -> Result<VectorChanges, StoreError> {
             Ok(VectorChanges::default())
         }
+        fn changes_blocking(
+            &self,
+            _cursor: String,
+            _timeout: std::time::Duration,
+        ) -> Result<VectorChanges, StoreError> {
+            Ok(VectorChanges::default())
+        }
     }
 
     #[test]
@@ -377,6 +398,16 @@ mod tests {
         assert!(changes.upserts.is_empty());
         assert!(changes.deletes.is_empty());
         assert!(changes.cursor.is_none());
+    }
+
+    #[test]
+    fn changes_blocking_is_object_safe_and_empty_on_a_feedless_store() {
+        let store: Box<dyn CompletionVectorStore> = Box::new(Mem(Default::default()));
+        let changes = store
+            .changes_blocking("0-0".to_string(), std::time::Duration::from_millis(1))
+            .unwrap();
+        assert!(changes.upserts.is_empty());
+        assert!(changes.deletes.is_empty());
     }
 
     #[tokio::test]

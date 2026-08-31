@@ -4,17 +4,44 @@
 //! `changes_since` -> `XRANGE` folded by `exact_key` (last op wins).
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use redis::streams::{StreamId, StreamRangeReply};
+use redis::streams::{StreamId, StreamRangeReply, StreamReadReply};
 use zerocache_core::CacheKey;
 use zerocache_ports::{CompletionVectorStore, StoreError, VectorChanges, VectorRecord};
 
-use crate::{apply_socket_timeouts, RedisStore};
+use crate::{apply_socket_timeouts, RedisStore, STORE_TIMEOUT};
 
 const SEMANTIC_STREAM_KEY: &str = "zerocache:semantic:events";
 const XRANGE_PAGE: usize = 1000;
+// `XREAD BLOCK` page size -- also the drain rate when `changes_blocking` is
+// catching up a backlog (each call returns one page, the poll loop calls
+// again immediately while entries remain, then blocks once caught up).
+const XREAD_PAGE: usize = 1000;
+// Socket read-timeout headroom over the requested block, so the OS-level
+// timeout never fires before Redis returns the `XREAD BLOCK`.
+const BLOCK_SOCKET_SLACK: Duration = Duration::from_secs(2);
+
+/// One key's latest state within a folded range: an upsert record, or a
+/// tombstone carrying the scope hash the delete must land on.
+enum Slot {
+    Up(VectorRecord),
+    Del([u8; 32]),
+}
+
+/// Drain a folded `exact_key -> Slot` map into the `VectorChanges` shape.
+fn drain_slots(slots: HashMap<CacheKey, Slot>) -> (Vec<VectorRecord>, Vec<(CacheKey, [u8; 32])>) {
+    let mut upserts = Vec::new();
+    let mut deletes = Vec::new();
+    for (key, slot) in slots {
+        match slot {
+            Slot::Up(r) => upserts.push(r),
+            Slot::Del(s) => deletes.push((key, s)),
+        }
+    }
+    (upserts, deletes)
+}
 
 fn to_hex(b: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
@@ -95,10 +122,6 @@ fn parse_entry(id: &StreamId) -> Option<Parsed> {
 
 impl RedisStore {
     fn xrange_fold(&self, cursor: Option<String>) -> Result<VectorChanges, StoreError> {
-        enum Slot {
-            Up(VectorRecord),
-            Del([u8; 32]),
-        }
         let mut conn = self.pool.get().map_err(|e| StoreError(e.to_string()))?;
         apply_socket_timeouts(&conn)?;
 
@@ -145,14 +168,7 @@ impl RedisStore {
             );
         }
 
-        let mut upserts = Vec::new();
-        let mut deletes = Vec::new();
-        for (key, slot) in slots {
-            match slot {
-                Slot::Up(r) => upserts.push(r),
-                Slot::Del(s) => deletes.push((key, s)),
-            }
-        }
+        let (upserts, deletes) = drain_slots(slots);
         // Redis must always hand back a Some cursor so zerocache-http spawns
         // the poll task even on a cold/empty stream. "0-0" == "from the start".
         let out_cursor = last_seen.or(cursor).or_else(|| Some("0-0".to_string()));
@@ -160,6 +176,67 @@ impl RedisStore {
             upserts,
             deletes,
             cursor: out_cursor,
+        })
+    }
+
+    /// One `XREAD BLOCK` page after `cursor`, folded last-op-wins. Returns
+    /// immediately while a backlog remains (blocks only once caught up), so the
+    /// poll loop needs no interval ticker -- this call is the pacing.
+    fn xread_blocking(
+        &self,
+        cursor: String,
+        timeout: Duration,
+    ) -> Result<VectorChanges, StoreError> {
+        // A dedicated connection, not the r2d2 pool: this read parks for up to
+        // `timeout` (bounded to <= 60s by zerocache-http's clamp, so never the
+        // infinite `BLOCK 0`), and its socket timeout must outlast the block.
+        let mut conn = self
+            .client
+            .get_connection()
+            .map_err(|e| StoreError(e.to_string()))?;
+        conn.set_read_timeout(Some(timeout + BLOCK_SOCKET_SLACK))
+            .map_err(|e| StoreError(e.to_string()))?;
+        conn.set_write_timeout(Some(STORE_TIMEOUT))
+            .map_err(|e| StoreError(e.to_string()))?;
+
+        let reply: Option<StreamReadReply> = redis::cmd("XREAD")
+            .arg("BLOCK")
+            .arg(timeout.as_millis() as u64)
+            .arg("COUNT")
+            .arg(XREAD_PAGE)
+            .arg("STREAMS")
+            .arg(SEMANTIC_STREAM_KEY)
+            .arg(&cursor)
+            .query(&mut conn)
+            .map_err(|e| StoreError(e.to_string()))?;
+
+        let mut slots: HashMap<CacheKey, Slot> = HashMap::new();
+        let mut last_seen: Option<String> = None;
+        let mut malformed = 0usize;
+        for entry in reply.into_iter().flat_map(|r| r.keys).flat_map(|k| k.ids) {
+            last_seen = Some(entry.id.clone());
+            match parse_entry(&entry) {
+                Some(Parsed::Put(r)) => {
+                    slots.insert(r.exact_key, Slot::Up(r));
+                }
+                Some(Parsed::Del { key, scope }) => {
+                    slots.insert(key, Slot::Del(scope));
+                }
+                None => malformed += 1,
+            }
+        }
+        if malformed > 0 {
+            tracing::warn!(
+                "semantic index stream: skipped {malformed} malformed/unknown entr{} in one changes_blocking call",
+                if malformed == 1 { "y" } else { "ies" }
+            );
+        }
+
+        let (upserts, deletes) = drain_slots(slots);
+        Ok(VectorChanges {
+            upserts,
+            deletes,
+            cursor: Some(last_seen.unwrap_or(cursor)),
         })
     }
 }
@@ -234,6 +311,14 @@ impl CompletionVectorStore for RedisStore {
 
     fn changes_since(&self, cursor: Option<String>) -> Result<VectorChanges, StoreError> {
         self.xrange_fold(cursor)
+    }
+
+    fn changes_blocking(
+        &self,
+        cursor: String,
+        timeout: Duration,
+    ) -> Result<VectorChanges, StoreError> {
+        self.xread_blocking(cursor, timeout)
     }
 }
 
@@ -350,6 +435,79 @@ mod live_redis_tests {
             .query(&mut *conn)
             .unwrap();
         assert!(len < 400, "MAXLEN ~ should have trimmed; got {len}");
+    }
+
+    #[test]
+    #[ignore]
+    fn changes_blocking_wakes_for_an_entry_added_after_the_call_starts() {
+        let (_c, url) = start_redis();
+        let store = RedisStore::connect(&url, None).unwrap();
+        store.insert(rec(1, 1)).unwrap();
+        let cursor = store.changes_since(None).unwrap().cursor.unwrap();
+
+        let writer_url = url.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            RedisStore::connect(&writer_url, None)
+                .unwrap()
+                .insert(rec(2, 1))
+                .unwrap();
+        });
+
+        let started = std::time::Instant::now();
+        let out = store
+            .changes_blocking(cursor, std::time::Duration::from_secs(10))
+            .unwrap();
+        let waited = started.elapsed();
+        writer.join().unwrap();
+
+        assert_eq!(out.upserts.len(), 1);
+        assert_eq!(out.upserts[0].exact_key, CacheKey::from_bytes([2u8; 32]));
+        assert!(
+            waited >= std::time::Duration::from_millis(250),
+            "must have blocked until the writer inserted, waited {waited:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(9),
+            "must have returned on the entry, not the timeout, waited {waited:?}"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn changes_blocking_times_out_empty_with_the_cursor_unchanged() {
+        let (_c, url) = start_redis();
+        let store = RedisStore::connect(&url, None).unwrap();
+        store.insert(rec(1, 1)).unwrap();
+        let cursor = store.changes_since(None).unwrap().cursor.unwrap();
+
+        let started = std::time::Instant::now();
+        let out = store
+            .changes_blocking(cursor.clone(), std::time::Duration::from_millis(400))
+            .unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(350));
+        assert!(out.upserts.is_empty() && out.deletes.is_empty());
+        assert_eq!(out.cursor, Some(cursor));
+    }
+
+    #[test]
+    #[ignore]
+    fn changes_blocking_from_zero_drains_the_backlog_without_blocking() {
+        let (_c, url) = start_redis();
+        let store = RedisStore::connect(&url, None).unwrap();
+        for i in 1..=3u8 {
+            store.insert(rec(i, 1)).unwrap();
+        }
+        let started = std::time::Instant::now();
+        let out = store
+            .changes_blocking("0-0".to_string(), std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "existing entries must return immediately, not after the block"
+        );
+        assert_eq!(out.upserts.len(), 3);
+        assert!(out.cursor.is_some() && out.cursor.as_deref() != Some("0-0"));
     }
 
     #[test]
