@@ -150,7 +150,7 @@ pub struct CompletionUsage {
     pub total_tokens: u32,
 }
 
-/// One upstream chat-completion result. `status` is the HTTP status the
+/// One upstream chat-completion or Anthropic-message result. `status` is the HTTP status the
 /// provider returned: the proxy forwards a non-2xx body to the caller
 /// verbatim and never caches it, so the adapter surfaces it as `Ok` with
 /// the real status rather than `Err`. `Err(ProviderError)` is reserved for
@@ -214,6 +214,55 @@ pub trait StreamingChatCompletionProvider: Send + Sync {
     fn version(&self) -> &'static str;
 
     /// See `ChatCompletionProvider::cache_scope`.
+    fn cache_scope(&self, model: &str) -> Result<String, ProviderError>;
+}
+
+/// Extra request headers the Messages proxy forwards to Anthropic verbatim.
+/// `anthropic_beta` is additionally folded into the cache key by the
+/// orchestrator (`zerocache-http/src/messages.rs`) — a beta feature can
+/// change the response shape.
+#[derive(Debug, Clone, Default)]
+pub struct MessageHeaders {
+    pub anthropic_version: Option<String>,
+    pub anthropic_beta: Option<String>,
+}
+
+/// Anthropic native `/v1/messages` proxy. A separate trait from
+/// `ChatCompletionProvider` (not an extension) because the wire shape is
+/// different on both sides — Anthropic's request/response JSON and its
+/// `x-api-key` auth — and callers using the Anthropic SDK expect their exact
+/// bytes back. Reuses `ChatCompletionResponse` (structurally wire-neutral)
+/// with the adapter mapping `input_tokens` -> `prompt_tokens`, `output_tokens`
+/// -> `completion_tokens`, and their sum -> `total_tokens`.
+#[async_trait::async_trait]
+pub trait MessagesProvider: Send + Sync {
+    /// Forwards `request` (a full Anthropic `/v1/messages` body) upstream with
+    /// the caller's `api_key` as `x-api-key`. Non-2xx -> `Ok` with the real
+    /// status (forwarded verbatim, never cached); `Err` = transport failure.
+    async fn messages(
+        &self,
+        api_key: &str,
+        request: &serde_json::Value,
+        headers: &MessageHeaders,
+    ) -> Result<ChatCompletionResponse, ProviderError>;
+
+    /// Raw byte pipe for `stream: true` — no framing, no store, no metrics.
+    /// `Err` = transport failure before any bytes. `Ok((status, stream))`
+    /// carries the upstream HTTP status; a non-2xx status means the stream
+    /// yields the error body, not SSE frames. Buffer-and-replay for
+    /// `/v1/messages` is deferred, so this is the whole streaming story here.
+    async fn messages_stream_passthrough(
+        &self,
+        api_key: &str,
+        request: &serde_json::Value,
+        headers: &MessageHeaders,
+    ) -> Result<(u16, SseByteStream), ProviderError>;
+
+    /// See `ChatCompletionProvider::version`.
+    fn version(&self) -> &'static str;
+
+    /// See `ChatCompletionProvider::cache_scope`. For the Anthropic adapter
+    /// this is just the configured base URL.
     fn cache_scope(&self, model: &str) -> Result<String, ProviderError>;
 }
 
@@ -448,5 +497,52 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, 2);
+    }
+
+    #[tokio::test]
+    async fn messages_provider_is_object_safe_and_headers_default_all_none() {
+        struct Fake;
+
+        #[async_trait::async_trait]
+        impl MessagesProvider for Fake {
+            async fn messages(
+                &self,
+                _api_key: &str,
+                _request: &serde_json::Value,
+                _headers: &MessageHeaders,
+            ) -> Result<ChatCompletionResponse, ProviderError> {
+                Ok(ChatCompletionResponse {
+                    status: 200,
+                    body: serde_json::json!({"type": "message"}),
+                    usage: CompletionUsage::default(),
+                })
+            }
+            async fn messages_stream_passthrough(
+                &self,
+                _api_key: &str,
+                _request: &serde_json::Value,
+                _headers: &MessageHeaders,
+            ) -> Result<(u16, SseByteStream), ProviderError> {
+                let s = futures_util::stream::iter(vec![Ok(b"data: {}\n\n".to_vec())]);
+                Ok((200, Box::pin(s)))
+            }
+            fn version(&self) -> &'static str {
+                "fake-v1"
+            }
+            fn cache_scope(&self, _model: &str) -> Result<String, ProviderError> {
+                Ok("https://api.anthropic.com".into())
+            }
+        }
+
+        let p: Box<dyn MessagesProvider> = Box::new(Fake);
+        let resp = p
+            .messages("k", &serde_json::json!({}), &MessageHeaders::default())
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+
+        let h = MessageHeaders::default();
+        assert!(h.anthropic_version.is_none());
+        assert!(h.anthropic_beta.is_none());
     }
 }
