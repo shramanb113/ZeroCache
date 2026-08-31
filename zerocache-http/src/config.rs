@@ -39,6 +39,13 @@ const BUILTIN_CHAT_PROVIDERS: &[(&str, &str)] = &[
     ("fireworks", "https://api.fireworks.ai/inference/v1"),
 ];
 
+/// Built-in Anthropic `/v1/messages` providers, registered even when
+/// ZEROCACHE_MESSAGES_PROVIDERS is unset. Unlike BUILTIN_CHAT_PROVIDERS, each
+/// value is a **bare origin** — the adapter appends `/v1/messages` itself —
+/// matching the ZEROCACHE_*_BASE_URL embedding-var convention, not the chat
+/// "full prefix" one.
+const BUILTIN_MESSAGES_PROVIDERS: &[(&str, &str)] = &[("anthropic", "https://api.anthropic.com")];
+
 pub enum StorageBackend {
     // Embedded, single-process. Fine for local dev or a single-replica
     // deployment; cannot be shared across multiple Kubernetes pods.
@@ -62,6 +69,10 @@ pub struct Config {
     /// merged with any ZEROCACHE_CHAT_PROVIDERS overrides/additions. Order
     /// is unimportant -- main.rs only iterates it.
     pub chat_providers: Vec<(String, String)>,
+    /// `(name, bare_origin_url)` pairs: the built-in `anthropic` merged with
+    /// any ZEROCACHE_MESSAGES_PROVIDERS overrides/additions. main.rs iterates
+    /// it to build one `AnthropicMessagesProvider` per entry.
+    pub messages_providers: Vec<(String, String)>,
     /// Setting this is what registers the `azure` provider at all -- an Azure
     /// resource name *is* its hostname, so unlike every other provider there
     /// is no meaningful default to fall back to.
@@ -173,6 +184,11 @@ impl Config {
             ),
             chat_providers: parse_chat_providers(
                 std::env::var("ZEROCACHE_CHAT_PROVIDERS").ok().as_deref(),
+            ),
+            messages_providers: parse_messages_providers(
+                std::env::var("ZEROCACHE_MESSAGES_PROVIDERS")
+                    .ok()
+                    .as_deref(),
             ),
             azure_openai_base_url: optional_env(
                 std::env::var("ZEROCACHE_AZURE_OPENAI_BASE_URL")
@@ -385,6 +401,74 @@ fn parse_chat_providers(raw: Option<&str>) -> Vec<(String, String)> {
         if url.is_empty() {
             eprintln!(
                 "warning: ZEROCACHE_CHAT_PROVIDERS entry for '{name}' has an empty URL -- skipping"
+            );
+            continue;
+        }
+        match merged.iter_mut().find(|(n, _)| *n == name) {
+            Some(entry) => entry.1 = url,
+            None => merged.push((name, url)),
+        }
+    }
+
+    merged
+}
+
+/// Normalizes a Messages-provider URL to the bare origin the Anthropic
+/// adapter appends `/v1/messages` to. Forgiving: a bare origin, a trailing
+/// slash, or a full `/v1/messages` (or `/v1`) suffix pasted from docs all
+/// collapse to the same value. Not validated as a URL (same posture as the
+/// ZEROCACHE_*_BASE_URL values).
+fn normalize_messages_url(raw: &str) -> String {
+    let mut s: &str = raw.trim().trim_end_matches('/');
+    if let Some(stripped) = s.strip_suffix("/v1/messages") {
+        s = stripped.trim_end_matches('/');
+    } else if let Some(stripped) = s.strip_suffix("/v1") {
+        s = stripped.trim_end_matches('/');
+    }
+    s.to_string()
+}
+
+/// Parses ZEROCACHE_MESSAGES_PROVIDERS ("name=url,name=url") layered on top of
+/// BUILTIN_MESSAGES_PROVIDERS. A valid entry overrides a built-in's URL or
+/// adds a new provider; a malformed entry is skipped with a warning and never
+/// blocks boot. Pure (takes the raw value) for unit-testability — same
+/// pattern as parse_chat_providers.
+fn parse_messages_providers(raw: Option<&str>) -> Vec<(String, String)> {
+    let mut merged: Vec<(String, String)> = BUILTIN_MESSAGES_PROVIDERS
+        .iter()
+        .map(|(n, u)| (n.to_string(), normalize_messages_url(u)))
+        .collect();
+
+    let raw = match raw {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => return merged,
+    };
+
+    for piece in raw.split(',') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let (name, url) = match piece.split_once('=') {
+            Some(pair) => pair,
+            None => {
+                eprintln!(
+                    "warning: ZEROCACHE_MESSAGES_PROVIDERS entry '{piece}' has no '=' -- skipping"
+                );
+                continue;
+            }
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let url = normalize_messages_url(url);
+        if !chat_provider_name_is_valid(&name) {
+            eprintln!(
+                "warning: ZEROCACHE_MESSAGES_PROVIDERS name '{name}' is not a valid provider name (expected [a-z0-9][a-z0-9_-]*) -- skipping"
+            );
+            continue;
+        }
+        if url.is_empty() {
+            eprintln!(
+                "warning: ZEROCACHE_MESSAGES_PROVIDERS entry for '{name}' has an empty URL -- skipping"
             );
             continue;
         }
@@ -847,5 +931,82 @@ mod tests {
         assert!(!parse_cross_replica_coalescing(Some("")));
         assert!(!parse_cross_replica_coalescing(Some("on")));
         assert!(!parse_cross_replica_coalescing(None));
+    }
+
+    fn find_msg<'a>(list: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        list.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, u)| u.as_str())
+    }
+
+    #[test]
+    fn messages_providers_unset_yields_exactly_the_builtin() {
+        let list = parse_messages_providers(None);
+        assert_eq!(list.len(), BUILTIN_MESSAGES_PROVIDERS.len());
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            find_msg(&list, "anthropic"),
+            Some("https://api.anthropic.com")
+        );
+    }
+
+    #[test]
+    fn messages_providers_override_replaces_the_builtin_url() {
+        let list = parse_messages_providers(Some("anthropic=https://gw.internal/anthropic"));
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            find_msg(&list, "anthropic"),
+            Some("https://gw.internal/anthropic")
+        );
+    }
+
+    #[test]
+    fn messages_providers_adds_a_new_name() {
+        let list = parse_messages_providers(Some("selfhosted=https://llm.acme.internal"));
+        assert_eq!(list.len(), 2);
+        assert_eq!(
+            find_msg(&list, "selfhosted"),
+            Some("https://llm.acme.internal")
+        );
+    }
+
+    #[test]
+    fn messages_providers_skips_a_malformed_entry_and_keeps_the_rest() {
+        let list = parse_messages_providers(Some("garbage,ok=https://x.example"));
+        assert_eq!(list.len(), 2);
+        assert_eq!(find_msg(&list, "ok"), Some("https://x.example"));
+    }
+
+    #[test]
+    fn normalize_messages_url_trims_slash_v1_and_v1_messages() {
+        assert_eq!(
+            normalize_messages_url("https://api.anthropic.com/"),
+            "https://api.anthropic.com"
+        );
+        assert_eq!(
+            normalize_messages_url("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com"
+        );
+        assert_eq!(
+            normalize_messages_url("https://api.anthropic.com/v1/messages"),
+            "https://api.anthropic.com"
+        );
+        assert_eq!(
+            normalize_messages_url("  https://api.anthropic.com/v1/messages/  "),
+            "https://api.anthropic.com"
+        );
+    }
+
+    #[test]
+    fn builtin_messages_provider_table_has_exactly_one_normalized_entry() {
+        assert_eq!(BUILTIN_MESSAGES_PROVIDERS.len(), 1);
+        for (name, url) in BUILTIN_MESSAGES_PROVIDERS {
+            assert!(!url.is_empty(), "{name} has an empty URL");
+            assert_eq!(
+                &normalize_messages_url(url),
+                url,
+                "{name} URL not normalized"
+            );
+        }
     }
 }
