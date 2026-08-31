@@ -4,6 +4,7 @@ mod completion;
 mod config;
 mod dashboard;
 mod image;
+mod messages;
 mod otel;
 #[cfg(feature = "semantic")]
 mod semantic;
@@ -254,6 +255,7 @@ async fn main() {
         completion_store,
         completion_providers,
         completion_stream_providers,
+        messages_providers: HashMap::new(),
         completion_in_flight: std::sync::Mutex::new(HashMap::new()),
         coordinator,
         #[cfg(feature = "semantic")]

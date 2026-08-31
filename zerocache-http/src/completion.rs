@@ -33,11 +33,11 @@ use crate::coalesce::{
 /// tell the metrics layer exactly how many tokens the caller did not get
 /// billed for.
 #[derive(Debug, Serialize, Deserialize)]
-struct CachedCompletion {
-    body: serde_json::Value,
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    total_tokens: u32,
+pub(crate) struct CachedCompletion {
+    pub(crate) body: serde_json::Value,
+    pub(crate) prompt_tokens: u32,
+    pub(crate) completion_tokens: u32,
+    pub(crate) total_tokens: u32,
     /// Verbatim upstream SSE payload (minus a withheld injected usage chunk).
     /// `None` for an entry filled by a non-streaming miss -- a `stream:true`
     /// hit on such an entry re-chunks `body` instead.
@@ -48,7 +48,7 @@ struct CachedCompletion {
 impl CachedCompletion {
     /// The token counts this record carries, as the `CompletionUsage` the
     /// metrics layer wants.
-    fn usage_struct(&self) -> CompletionUsage {
+    pub(crate) fn usage_struct(&self) -> CompletionUsage {
         CompletionUsage {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
@@ -80,7 +80,7 @@ fn derive_completion_key(
     )
 }
 
-fn encode_cached(response: &ChatCompletionResponse) -> Vec<u8> {
+pub(crate) fn encode_cached(response: &ChatCompletionResponse) -> Vec<u8> {
     let record = CachedCompletion {
         body: response.body.clone(),
         prompt_tokens: response.usage.prompt_tokens,
@@ -1408,6 +1408,7 @@ mod tests {
             completion_store: Arc::new(store),
             completion_providers: HashMap::new(),
             completion_stream_providers: HashMap::new(),
+            messages_providers: HashMap::new(),
             completion_in_flight: Mutex::new(HashMap::new()),
             coordinator,
             #[cfg(feature = "semantic")]
@@ -2620,6 +2621,7 @@ mod tests {
                 completion_store: Arc::new(store),
                 completion_providers: HashMap::new(),
                 completion_stream_providers: HashMap::new(),
+                messages_providers: HashMap::new(),
                 completion_in_flight: Mutex::new(HashMap::new()),
                 coordinator: Arc::new(crate::coalesce::NoopCoordinator),
                 semantic: Some(SemanticState {
@@ -2709,6 +2711,7 @@ mod tests {
                 completion_store: Arc::new(MockCompletionStore::empty()),
                 completion_providers: HashMap::new(),
                 completion_stream_providers: HashMap::new(),
+                messages_providers: HashMap::new(),
                 completion_in_flight: Mutex::new(HashMap::new()),
                 coordinator: Arc::new(crate::coalesce::NoopCoordinator),
                 semantic: Some(SemanticState {

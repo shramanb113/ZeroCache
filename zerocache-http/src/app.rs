@@ -128,6 +128,10 @@ pub struct AppState {
     /// supports SSE). A `stream:true` request for a name absent here 404s.
     pub completion_stream_providers:
         HashMap<String, Arc<dyn zerocache_ports::StreamingChatCompletionProvider>>,
+    /// Anthropic /v1/messages providers, keyed by `{provider}` path segment.
+    /// Populated in main.rs from `config.messages_providers`; an unregistered
+    /// name 404s out of the missing key. Wired by a later task.
+    pub messages_providers: HashMap<String, Arc<dyn zerocache_ports::MessagesProvider>>,
     // The completion counterpart to `in_flight`: concurrent requests missing
     // on the exact same completion CacheKey share one upstream call. A
     // separate map for the same reason `image_in_flight` is separate --
@@ -1488,6 +1492,7 @@ mod tests {
             completion_store: Arc::new(NoopCompletionStore),
             completion_providers: StdHashMap::new(),
             completion_stream_providers: StdHashMap::new(),
+            messages_providers: StdHashMap::new(),
             completion_in_flight: Mutex::new(StdHashMap::new()),
             coordinator: Arc::new(crate::coalesce::NoopCoordinator),
             #[cfg(feature = "semantic")]
