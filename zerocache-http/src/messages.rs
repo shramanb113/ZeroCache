@@ -13,6 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::future::FutureExt;
+use tracing::Instrument;
 
 use zerocache_core::{canonicalize_messages_request, messages_request_is_cacheable, CacheKey};
 use zerocache_ports::{ChatCompletionResponse, MessageHeaders, MessagesProvider, ProviderError};
@@ -121,7 +122,9 @@ pub async fn complete_messages(
 
     let cached = {
         let store = Arc::clone(&state.completion_store);
-        run_store_task(move || store.get(&key).map_err(AppError::Store)).await?
+        run_store_task(move || store.get(&key).map_err(AppError::Store))
+            .instrument(tracing::info_span!("store_lookup"))
+            .await?
     };
 
     // A stored record that no longer deserializes is treated as a miss, not a
@@ -171,7 +174,9 @@ pub async fn complete_messages(
     if matches!(coalesced, Coalesced::Local) && (200..300).contains(&response.status) {
         let bytes = encode_cached(&response);
         let store = Arc::clone(&state.completion_store);
-        run_store_task(move || store.put(key, bytes).map_err(AppError::Store)).await?;
+        run_store_task(move || store.put(key, bytes).map_err(AppError::Store))
+            .instrument(tracing::info_span!("store_write_back"))
+            .await?;
     }
 
     state
@@ -249,8 +254,8 @@ async fn fetch_messages_coalesced(
             let coordinator = Arc::clone(&state.coordinator);
             let completion_store = Arc::clone(&state.completion_store);
 
-            let fut: Pin<Box<dyn Future<Output = SharedCompletionOutput> + Send>> =
-                Box::pin(async move {
+            let fut: Pin<Box<dyn Future<Output = SharedCompletionOutput> + Send>> = Box::pin(
+                async move {
                     let outcome = coalesce_cross_replica::<ChatCompletionResponse, _, _>(
                         &coordinator,
                         key,
@@ -309,7 +314,9 @@ async fn fetch_messages_coalesced(
                             "store error during coalesced messages fetch: {e}"
                         ))),
                     }
-                });
+                }
+                .instrument(tracing::info_span!("provider_call")),
+            );
             let shared: SharedCompletion = fut.shared();
             in_flight.insert(key, shared.clone());
             Claim::Owned(shared)
@@ -333,8 +340,6 @@ async fn fetch_messages_coalesced(
         }
     }
 }
-
-use tracing::Instrument;
 
 #[cfg(test)]
 mod tests {

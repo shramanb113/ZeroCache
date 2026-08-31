@@ -35,6 +35,7 @@ use config::{
 use wire::{
     DeleteResponse, EmbeddingObject, EmbeddingsRequest, EmbeddingsResponse, ErrorResponse, Usage,
 };
+use zerocache_adapters_anthropic::AnthropicMessagesProvider;
 use zerocache_adapters_azure::new_provider as new_azure_provider;
 use zerocache_adapters_bedrock::new_provider as new_bedrock_provider;
 use zerocache_adapters_gemini::GeminiProvider;
@@ -60,6 +61,7 @@ async fn main() {
     let config = Config::from_env();
     log_overridden_base_urls(&config);
     log_chat_providers(&config);
+    log_messages_providers(&config);
 
     #[cfg(not(feature = "semantic"))]
     if config.semantic_enabled {
@@ -230,6 +232,18 @@ async fn main() {
         );
     }
 
+    // Anthropic /v1/messages providers: one AnthropicMessagesProvider per
+    // entry in config.messages_providers (built-in `anthropic` + any
+    // ZEROCACHE_MESSAGES_PROVIDERS additions).
+    let mut messages_providers: HashMap<String, Arc<dyn zerocache_ports::MessagesProvider>> =
+        HashMap::new();
+    for (name, url) in &config.messages_providers {
+        messages_providers.insert(
+            name.clone(),
+            Arc::new(AnthropicMessagesProvider::new(url.clone())),
+        );
+    }
+
     #[cfg(feature = "semantic")]
     let (semantic, semantic_poll_cursor) = match completion_vector_store {
         Some(vs) => match semantic::build_semantic_state(&config, vs) {
@@ -255,7 +269,7 @@ async fn main() {
         completion_store,
         completion_providers,
         completion_stream_providers,
-        messages_providers: HashMap::new(),
+        messages_providers,
         completion_in_flight: std::sync::Mutex::new(HashMap::new()),
         coordinator,
         #[cfg(feature = "semantic")]
@@ -283,6 +297,10 @@ async fn main() {
         .route(
             "/:provider/v1/chat/completions",
             post(chat_completions_handler).delete(delete_chat_completions_handler),
+        )
+        .route(
+            "/:provider/v1/messages",
+            post(messages_handler).delete(delete_messages_handler),
         )
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
@@ -363,6 +381,15 @@ fn log_overridden_base_urls(config: &Config) {
 fn log_chat_providers(config: &Config) {
     for (name, url) in &config.chat_providers {
         tracing::info!("chat provider '{name}' -> {url}/chat/completions");
+    }
+}
+
+/// Logs the resolved Messages-provider registry so a typo in
+/// ZEROCACHE_MESSAGES_PROVIDERS shows at boot, not on first request. URLs
+/// carry no secrets (BYOK: the key is per-request).
+fn log_messages_providers(config: &Config) {
+    for (name, url) in &config.messages_providers {
+        tracing::info!("messages provider '{name}' -> {url}/v1/messages");
     }
 }
 
@@ -1044,6 +1071,258 @@ async fn stream_passthrough(
     Ok(response)
 }
 
+/// Builds the forwarded `MessageHeaders` from the incoming request headers.
+fn messages_headers_from(headers: &HeaderMap) -> zerocache_ports::MessageHeaders {
+    let get = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    zerocache_ports::MessageHeaders {
+        anthropic_version: get("anthropic-version"),
+        anthropic_beta: get("anthropic-beta"),
+    }
+}
+
+/// `POST /{provider}/v1/messages` -- the Anthropic native completion cache.
+/// The body is Anthropic's `/v1/messages` shape, forwarded verbatim upstream
+/// on a miss; a hit replays the stored body with a `200`. Only deterministic
+/// requests (`temperature: 0`, non-empty `messages`, no adaptive/enabled
+/// `thinking`) are cached -- anything else is a transparent passthrough.
+/// `stream: true` is a raw byte passthrough. See `crate::messages`.
+#[tracing::instrument(skip_all, fields(provider = %provider_name))]
+async fn messages_handler(
+    State(state): State<Arc<AppState>>,
+    Path(provider_name): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let Json(request_body) = body.map_err(json_rejection_to_error_response)?;
+
+    let api_key = extract_bearer_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "missing or malformed Authorization header (expected 'Bearer <key>')"
+                    .to_string(),
+            }),
+        )
+    })?;
+
+    let provider = state
+        .messages_providers
+        .get(&provider_name)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("unknown provider '{provider_name}'"),
+                }),
+            )
+        })?;
+
+    let model = request_body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ErrorResponse {
+                    error: "request body is missing a string 'model' field".to_string(),
+                }),
+            )
+        })?
+        .to_string();
+
+    let msg_headers = messages_headers_from(&headers);
+
+    let wants_stream = request_body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if wants_stream {
+        return messages_stream_passthrough(provider, api_key, request_body, msg_headers).await;
+    }
+
+    let owner_id = derive_owner_id(&api_key);
+    let outcome = messages::complete_messages(
+        &state,
+        messages::MessagesRequest {
+            provider,
+            provider_name: &provider_name,
+            api_key: &api_key,
+            owner_id,
+            model: &model,
+            body: &request_body,
+            headers: msg_headers,
+        },
+    )
+    .await
+    .map_err(|err| {
+        let status = match &err {
+            AppError::Provider(_) => StatusCode::BAD_GATEWAY,
+            AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (
+            status,
+            Json(ErrorResponse {
+                error: err.to_string(),
+            }),
+        )
+    })?;
+
+    // Forward the upstream status verbatim (a hit is 200); an out-of-range
+    // value can only come from a broken upstream -> 502.
+    let status = StatusCode::from_u16(outcome.response.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = (status, Json(outcome.response.body)).into_response();
+    response.headers_mut().insert(
+        "x-zerocache-completion-hit",
+        if outcome.hit { "true" } else { "false" }
+            .parse()
+            .expect("static ascii is a valid header value"),
+    );
+    if outcome.hit_kind.is_some() {
+        // v1 has only exact matches on this surface -- emit `exact` for
+        // symmetry with the chat handler.
+        response.headers_mut().insert(
+            "x-zerocache-completion-hit-kind",
+            "exact"
+                .parse()
+                .expect("static ascii is a valid header value"),
+        );
+    }
+    Ok(response)
+}
+
+/// `DELETE /{provider}/v1/messages` -- evict the entry a matching `POST`
+/// would hit, scoped to the caller's `owner_id`. Same validation ladder as
+/// the `POST`; `stream` is on the canonicalization denylist so a body
+/// carrying it targets the same entry. Response: `{"deleted": 1}`, idempotent.
+#[tracing::instrument(skip_all, fields(provider = %provider_name))]
+async fn delete_messages_handler(
+    State(state): State<Arc<AppState>>,
+    Path(provider_name): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Result<Json<DeleteResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let Json(request_body) = body.map_err(json_rejection_to_error_response)?;
+
+    let api_key = extract_bearer_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "missing or malformed Authorization header (expected 'Bearer <key>')"
+                    .to_string(),
+            }),
+        )
+    })?;
+
+    let provider = state
+        .messages_providers
+        .get(&provider_name)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("unknown provider '{provider_name}'"),
+                }),
+            )
+        })?;
+
+    let model = request_body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ErrorResponse {
+                    error: "request body is missing a string 'model' field".to_string(),
+                }),
+            )
+        })?
+        .to_string();
+
+    let owner_id = derive_owner_id(&api_key);
+
+    messages::delete_messages(
+        &state,
+        messages::MessagesDeleteRequest {
+            provider,
+            provider_name: &provider_name,
+            owner_id,
+            model: &model,
+            body: &request_body,
+            headers: messages_headers_from(&headers),
+        },
+    )
+    .await
+    .map_err(|err| {
+        let status = match &err {
+            AppError::Provider(_) => StatusCode::BAD_GATEWAY,
+            AppError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (
+            status,
+            Json(ErrorResponse {
+                error: err.to_string(),
+            }),
+        )
+    })?;
+
+    Ok(Json(DeleteResponse { deleted: 1 }))
+}
+
+/// Pipe an Anthropic `/v1/messages` SSE stream straight to the client with no
+/// caching, buffering, or metrics -- every `stream: true` request on this
+/// surface (buffer-and-replay is deferred). `text/event-stream` for a 2xx
+/// status, `application/json` otherwise (a non-2xx yields an error body).
+async fn messages_stream_passthrough(
+    provider: Arc<dyn zerocache_ports::MessagesProvider>,
+    api_key: String,
+    body: serde_json::Value,
+    headers: zerocache_ports::MessageHeaders,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let (status, upstream) = provider
+        .messages_stream_passthrough(&api_key, &body, &headers)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?;
+
+    let mapped = futures::StreamExt::map(upstream, |item| {
+        item.map(axum::body::Bytes::from)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    });
+    let is_2xx = (200..300).contains(&status);
+    let mut response = Response::builder()
+        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
+        .body(axum::body::Body::from_stream(mapped))
+        .expect("building a streaming response with a valid status cannot fail");
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        if is_2xx {
+            "text/event-stream"
+        } else {
+            "application/json"
+        }
+        .parse()
+        .expect("static ascii"),
+    );
+    response.headers_mut().insert(
+        "x-zerocache-completion-hit",
+        "false".parse().expect("static ascii"),
+    );
+    Ok(response)
+}
+
 /// Turns a `complete_streaming` outcome into the HTTP response: a
 /// `text/event-stream` body plus the same `X-Zerocache-Completion-Hit` /
 /// `-Hit-Kind` / `-Semantic-Score` headers the non-streaming handler sets, or
@@ -1221,5 +1500,225 @@ mod tests {
             String::from_utf8(buf).unwrap(),
             "data: {\"x\":1}\n\ndata: [DONE]\n\n"
         );
+    }
+
+    // --- Anthropic /v1/messages handlers ---
+
+    use std::collections::HashMap as StdHashMap;
+    use std::sync::Mutex as StdMutex;
+
+    use zerocache_ports::{
+        ChatCompletionResponse, CompletionStore, CompletionUsage, EmbeddingStore, MessageHeaders,
+        MessagesProvider, ProviderError, SseByteStream, StoreError,
+    };
+
+    struct MsgStore(StdMutex<StdHashMap<zerocache_core::CacheKey, Vec<u8>>>);
+    impl CompletionStore for MsgStore {
+        fn get(&self, k: &zerocache_core::CacheKey) -> Result<Option<Vec<u8>>, StoreError> {
+            Ok(self.0.lock().unwrap().get(k).cloned())
+        }
+        fn put(&self, k: zerocache_core::CacheKey, v: Vec<u8>) -> Result<(), StoreError> {
+            self.0.lock().unwrap().insert(k, v);
+            Ok(())
+        }
+        fn delete(&self, k: &zerocache_core::CacheKey) -> Result<(), StoreError> {
+            self.0.lock().unwrap().remove(k);
+            Ok(())
+        }
+    }
+
+    struct NoEmb;
+    impl EmbeddingStore for NoEmb {
+        fn get(&self, _k: &zerocache_core::CacheKey) -> Result<Option<Vec<f32>>, StoreError> {
+            Ok(None)
+        }
+        fn put(&self, _k: zerocache_core::CacheKey, _v: Vec<f32>) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn delete(&self, _k: &zerocache_core::CacheKey) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    struct MsgProvider(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl MessagesProvider for MsgProvider {
+        async fn messages(
+            &self,
+            _k: &str,
+            _r: &serde_json::Value,
+            _h: &MessageHeaders,
+        ) -> Result<ChatCompletionResponse, ProviderError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ChatCompletionResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "type": "message",
+                    "content": [{"type": "text", "text": "hi"}],
+                    "usage": {"input_tokens": 2, "output_tokens": 1}
+                }),
+                usage: CompletionUsage {
+                    prompt_tokens: 2,
+                    completion_tokens: 1,
+                    total_tokens: 3,
+                },
+            })
+        }
+        async fn messages_stream_passthrough(
+            &self,
+            _k: &str,
+            _r: &serde_json::Value,
+            _h: &MessageHeaders,
+        ) -> Result<(u16, SseByteStream), ProviderError> {
+            Ok((200, Box::pin(futures::stream::empty())))
+        }
+        fn version(&self) -> &'static str {
+            "p-v1"
+        }
+        fn cache_scope(&self, _m: &str) -> Result<String, ProviderError> {
+            Ok("https://api.anthropic.com".into())
+        }
+    }
+
+    fn messages_state() -> (Arc<AppState>, Arc<MsgProvider>) {
+        let p = Arc::new(MsgProvider(std::sync::atomic::AtomicUsize::new(0)));
+        let mut mp: StdHashMap<String, Arc<dyn MessagesProvider>> = StdHashMap::new();
+        mp.insert(
+            "anthropic".to_string(),
+            Arc::clone(&p) as Arc<dyn MessagesProvider>,
+        );
+        let state = Arc::new(AppState {
+            store: Arc::new(NoEmb),
+            providers: StdHashMap::new(),
+            image_providers: StdHashMap::new(),
+            metrics: Metrics::new(),
+            in_flight: StdMutex::new(StdHashMap::new()),
+            image_in_flight: StdMutex::new(StdHashMap::new()),
+            completion_store: Arc::new(MsgStore(StdMutex::new(StdHashMap::new()))),
+            completion_providers: StdHashMap::new(),
+            completion_stream_providers: StdHashMap::new(),
+            messages_providers: mp,
+            completion_in_flight: StdMutex::new(StdHashMap::new()),
+            coordinator: Arc::new(crate::coalesce::NoopCoordinator),
+            #[cfg(feature = "semantic")]
+            semantic: None,
+        });
+        (state, p)
+    }
+
+    fn bearer(key: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {key}").parse().unwrap(),
+        );
+        h
+    }
+
+    #[tokio::test]
+    async fn messages_handler_miss_then_hit_and_delete_re_miss() {
+        let (state, p) = messages_state();
+        let hdrs = bearer("sk-caller");
+        let body = serde_json::json!({
+            "model": "claude-opus-4-6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+            "temperature": 0
+        });
+
+        let call = |st: Arc<AppState>, h: HeaderMap, b: serde_json::Value| async move {
+            messages_handler(State(st), Path("anthropic".to_string()), h, Ok(Json(b))).await
+        };
+
+        // miss
+        let r1 = call(Arc::clone(&state), hdrs.clone(), body.clone())
+            .await
+            .unwrap_or_else(|(s, _)| panic!("miss errored: {s}"));
+        assert_eq!(
+            r1.headers().get("x-zerocache-completion-hit").unwrap(),
+            "false"
+        );
+        assert_eq!(p.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // hit
+        let r2 = call(Arc::clone(&state), hdrs.clone(), body.clone())
+            .await
+            .unwrap_or_else(|(s, _)| panic!("hit errored: {s}"));
+        assert_eq!(
+            r2.headers().get("x-zerocache-completion-hit").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            r2.headers().get("x-zerocache-completion-hit-kind").unwrap(),
+            "exact"
+        );
+        assert_eq!(p.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // delete, then re-miss
+        let del = delete_messages_handler(
+            State(Arc::clone(&state)),
+            Path("anthropic".to_string()),
+            hdrs.clone(),
+            Ok(Json(body.clone())),
+        )
+        .await
+        .unwrap_or_else(|(s, _)| panic!("delete errored: {s}"));
+        assert_eq!(del.0.deleted, 1);
+
+        let r3 = call(Arc::clone(&state), hdrs.clone(), body.clone())
+            .await
+            .unwrap_or_else(|(s, _)| panic!("re-miss errored: {s}"));
+        assert_eq!(
+            r3.headers().get("x-zerocache-completion-hit").unwrap(),
+            "false"
+        );
+        assert_eq!(p.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn messages_handler_unknown_provider_is_404_and_missing_auth_is_401_and_no_model_is_422()
+    {
+        let (state, _p) = messages_state();
+        let body = serde_json::json!({
+            "model": "claude-opus-4-6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0
+        });
+
+        // unknown provider, valid auth -> 404
+        let got = messages_handler(
+            State(Arc::clone(&state)),
+            Path("nope".to_string()),
+            bearer("sk-caller"),
+            Ok(Json(body.clone())),
+        )
+        .await
+        .err()
+        .map(|(s, _)| s);
+        assert_eq!(got, Some(StatusCode::NOT_FOUND));
+
+        // known provider, no Authorization header -> 401
+        let got = messages_handler(
+            State(Arc::clone(&state)),
+            Path("anthropic".to_string()),
+            HeaderMap::new(),
+            Ok(Json(body.clone())),
+        )
+        .await
+        .err()
+        .map(|(s, _)| s);
+        assert_eq!(got, Some(StatusCode::UNAUTHORIZED));
+
+        // known provider, valid auth, body with no string `model` -> 422
+        let got = messages_handler(
+            State(Arc::clone(&state)),
+            Path("anthropic".to_string()),
+            bearer("sk-caller"),
+            Ok(Json(serde_json::json!({"messages": []}))),
+        )
+        .await
+        .err()
+        .map(|(s, _)| s);
+        assert_eq!(got, Some(StatusCode::UNPROCESSABLE_ENTITY));
     }
 }

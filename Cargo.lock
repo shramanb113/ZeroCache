@@ -5437,6 +5437,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "zerocache-adapters-anthropic",
  "zerocache-adapters-azure",
  "zerocache-adapters-bedrock",
  "zerocache-adapters-gemini",

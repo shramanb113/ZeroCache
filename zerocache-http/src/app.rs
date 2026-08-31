@@ -129,8 +129,9 @@ pub struct AppState {
     pub completion_stream_providers:
         HashMap<String, Arc<dyn zerocache_ports::StreamingChatCompletionProvider>>,
     /// Anthropic /v1/messages providers, keyed by `{provider}` path segment.
-    /// Populated in main.rs from `config.messages_providers`; an unregistered
-    /// name 404s out of the missing key. Wired by a later task.
+    /// Populated in main.rs from `config.messages_providers` (built-in
+    /// `anthropic` plus any ZEROCACHE_MESSAGES_PROVIDERS additions); an
+    /// unregistered name 404s out of the missing key.
     pub messages_providers: HashMap<String, Arc<dyn zerocache_ports::MessagesProvider>>,
     // The completion counterpart to `in_flight`: concurrent requests missing
     // on the exact same completion CacheKey share one upstream call. A
