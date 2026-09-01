@@ -1,0 +1,114 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import CodeBlock from "../components/CodeBlock.astro";
+
+const surfaces = [
+  ["Retrieve", "Architect", "POST /openai/v1/embeddings · POST /gemini/v1/images/embeddings", "embeddings cache · image-embeddings cache"],
+  ["Plan", "Architect", "POST /openai/v1/chat/completions", "chat completions cache · multi-provider"],
+  ["Repo brief", "3× Coder (parallel)", "one identical POST /openai/v1/chat/completions, fired concurrently", "in-process coalescing (3 misses → 1 upstream call)"],
+  ["Implement", "3× Coder (parallel)", "POST /openai/v1/chat/completions", "chat completions cache"],
+  ["Review", "Reviewer", "POST /anthropic/v1/messages", "native Anthropic messages cache (exact-match)"],
+  ["Fix", "Fixer", "POST /openai/v1/chat/completions", "chat completions cache"],
+];
+
+const runIt = `git clone https://github.com/shramanb113/ZeroCache
+cd ZeroCache/demo/agent-showcase
+npm install
+cp .env.example .env          # OPENAI_API_KEY required; ANTHROPIC + GEMINI optional
+
+# in another shell — semantic build so the reworded run can hit
+ZEROCACHE_SEMANTIC=1 cargo run -p zerocache-http --features semantic
+
+npm run warm                  # pre-fills the cache (runs 1 → 2 → 3)
+npm run -- run --run=2        # the hero shot: identical task, fully cached
+npm run -- run --run=3        # the reworded task, semantic hits`;
+---
+
+<BaseLayout
+  title="Demo"
+  description="A multi-agent coding team ships a real feature, then re-runs the identical task served entirely from Zerocache's cache — byte-identical diffs, passing tests, zero upstream calls."
+>
+  <h1>Demo</h1>
+  <p>
+    <a href="https://github.com/shramanb113/ZeroCache/tree/master/demo/agent-showcase"><code>demo/agent-showcase/</code></a>
+    is a bespoke multi-agent coding team — an architect, three parallel coders, a Claude reviewer
+    over <code>/v1/messages</code>, a fixer — that ships a real rate-limiting feature to a sample
+    repo and proves it with <code>node --test</code>. It then runs the <strong>identical</strong>
+    task again, served entirely from Zerocache: same diffs, same passing tests,
+    <code>X-Zerocache-Completion-Hit: true</code> on every model call. A third run rewords the task
+    and is designed to still hit, through the opt-in semantic near-match tier.
+  </p>
+
+  <section class="section">
+    <h2>What a cached re-run looks like</h2>
+    <p>
+      Run 1 is cold — every model call is a real, billed upstream request. Run 2 is the same task,
+      unchanged: the cacheable chat-completion and <code>/v1/messages</code> calls return from the
+      store, the diffs applied to the sample repo are byte-identical, and <code>node --test</code>
+      passes exactly as it did on run 1. Run 3 rewords the brief; with a
+      <code>--features semantic</code> build and <code>ZEROCACHE_SEMANTIC=1</code>, the paraphrased
+      prompts match previously-served completions above the cosine threshold.
+    </p>
+    <p class="muted-note">
+      This demo is built to be run against your own keys for a live trace — it does not ship
+      pre-recorded numbers. For a measured result, see the support-triage agent suite on the
+      Benchmarks page: a second run was 100% cache hits, zero upstream calls, ~5.1k prompt + ~370
+      completion tokens saved per suite.
+    </p>
+  </section>
+
+  <section class="section">
+    <h2>What it exercises</h2>
+    <div style="overflow-x: auto;">
+      <table class="table">
+        <thead>
+          <tr><th>Stage</th><th>Agent</th><th>Route</th><th>Zerocache surface</th></tr>
+        </thead>
+        <tbody>
+          {surfaces.map(([stage, agent, route, surface]) => (
+            <tr>
+              <td>{stage}</td>
+              <td>{agent}</td>
+              <td><code>{route}</code></td>
+              <td>{surface}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Every request is BYOK — <code>Authorization: Bearer &lt;that provider's key&gt;</code>, never
+      a Zerocache key. <code>temperature: 0</code> throughout (also what the cache gate requires).
+    </p>
+  </section>
+
+  <section class="section">
+    <h2>Run it yourself</h2>
+    <CodeBlock code={runIt} lang="bash" />
+  </section>
+</BaseLayout>
+
+<style>
+  .muted-note {
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  .table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+  }
+  .table th,
+  .table td {
+    text-align: left;
+    padding: var(--space-2);
+    border-bottom: var(--hairline);
+    vertical-align: top;
+  }
+  .table th {
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-weight: 400;
+    font-size: 0.8rem;
+  }
+</style>

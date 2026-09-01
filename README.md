@@ -1,6 +1,6 @@
 # Zerocache
 
-**A self-hosted caching proxy for LLM and embedding APIs.** Point your existing OpenAI-compatible client at Zerocache instead of the provider, and repeated chat completions and embeddings come back in **~1 ms** instead of costing another API call.
+**A self-hosted caching proxy for LLM and embedding APIs.** Point your existing OpenAI- or Anthropic-compatible client at Zerocache instead of the provider, and repeated chat completions, `/v1/messages` calls, and embeddings come back in **~1 ms** instead of costing another API call.
 
 [![CI](https://github.com/shramanb113/ZeroCache/actions/workflows/ci.yml/badge.svg)](https://github.com/shramanb113/ZeroCache/actions/workflows/ci.yml)
 [![Docker Publish](https://github.com/shramanb113/ZeroCache/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/shramanb113/ZeroCache/actions/workflows/docker-publish.yml)
@@ -20,9 +20,12 @@ No SDK to install. No framework plugin. No server-side provider credentials for 
 
 ## Table of contents
 
+- [Demo](#demo)
 - [What it does](#what-it-does)
 - [Quickstart](#quickstart)
+- [Using Zerocache](#using-zerocache)
 - [Chat completions](#chat-completions)
+- [Anthropic Messages](#anthropic-messages)
 - [Embeddings](#embeddings)
 - [Live savings dashboard](#live-savings-dashboard)
 - [How the cache key works](#how-the-cache-key-works)
@@ -39,14 +42,34 @@ No SDK to install. No framework plugin. No server-side provider credentials for 
 
 ---
 
+## Demo
+
+**[`demo/agent-showcase/`](./demo/agent-showcase/)** is a bespoke multi-agent coding team — an architect, three parallel coders, a Claude reviewer over `/v1/messages`, a fixer — that ships a real rate-limiting feature to a sample repo and proves it with `node --test`. Then it runs the **identical** task again, served entirely from Zerocache:
+
+<!-- BEGIN agent-showcase numbers — regenerated from demo/agent-showcase/traces/ by Task A11 -->
+| | Run 1 — cold | Run 2 — cached | Run 3 — reworded |
+| --- | --- | --- | --- |
+| upstream calls | _TBD_ | **0** | _TBD_ |
+| wall time | _TBD_ | **~_TBD_ s** | _TBD_ |
+| est. cost | _TBD_ | **$0.00** | _TBD_ |
+| cache hit kind | — | exact | **semantic** |
+<!-- END agent-showcase numbers -->
+
+Same diffs, same passing tests, `X-Zerocache-*-Hit: true` on every call. A reworded third run still hits through the semantic near-match tier.
+
+> **Walkthrough video:** _coming soon_ &nbsp;·&nbsp; run it yourself: [`demo/agent-showcase/README.md`](./demo/agent-showcase/README.md)
+
+---
+
 ## What it does
 
 Zerocache is one process that sits between your app and every LLM / embedding provider you use.
 
 | Surface | What gets cached | Status |
 | --- | --- | --- |
-| **`POST /{provider}/v1/chat/completions`** | Whole chat completions, keyed by a canonicalized request body. A hit is 100 % off input **and** output tokens and returns in ~1 ms. | **Live** — exact-match, 9 built-in OpenAI-wire providers, non-streaming, deterministic requests only (`temperature: 0` or an explicit `seed`). Optional local-embedder semantic near-match tier (`--features semantic` + `ZEROCACHE_SEMANTIC=1`) — sled in-process, or across replicas on the redis backend via a Redis Stream change-feed. |
-| **`POST /{provider}/v1/embeddings`** | Embedding vectors, keyed by content + model + tenant. Identical text stops costing a second call. | **Live** — 7 providers, text + image, light text canonicalization (casing / Unicode / punctuation fold to one entry). |
+| **`POST /{provider}/v1/chat/completions`** | Whole chat completions, keyed by a canonicalized request body. A hit is 100 % off input **and** output tokens and returns in ~1 ms. | **Live** — exact-match, 9 built-in OpenAI-wire providers, **streaming (`stream: true`) buffered on a miss and replayed on a hit**, deterministic requests only (`temperature: 0` or an explicit `seed`). Optional local-embedder semantic near-match tier (`--features semantic` + `ZEROCACHE_SEMANTIC=1`) — sled in-process, or across replicas on the redis backend via a Redis Stream change-feed. `DELETE` evicts. |
+| **`POST /{provider}/v1/messages`** | Whole Anthropic `/v1/messages` completions — Claude's native wire shape, not an OpenAI-compat shim. | **Live** — exact-match, `temperature: 0`-only gate, `anthropic-version` / `anthropic-beta` folded into the key, built-in `anthropic` provider. `stream: true` is a raw passthrough (buffer-and-replay deferred). `DELETE` evicts. |
+| **`POST /{provider}/v1/embeddings`** | Embedding vectors, keyed by content + model + tenant. Identical text stops costing a second call. | **Live** — 7 providers, text + image, light text canonicalization (casing / Unicode / punctuation fold to one entry). `DELETE` evicts. |
 | **`GET /dashboard`** | — | **Live** — a browser dashboard that polls `/metrics` and shows hit rate, tokens not billed, and an estimated dollar figure, live, per provider. |
 
 Everything is **BYOK**: the caller sends `Authorization: Bearer <their own provider key>` on every request. Zerocache forwards that key upstream on a miss and never stores it — only a hash of it, to keep each caller's cache private.
@@ -89,6 +112,81 @@ cargo run -p zerocache-http    # dashboard at http://localhost:8080/dashboard
 
 ---
 
+## Using Zerocache
+
+An end-to-end path from zero to a measured cache hit.
+
+### 1. Run it
+
+```sh
+docker run -d --name zerocache -p 8080:8080 -v zerocache-data:/data ghcr.io/shramanb113/zerocache:latest
+# or:  cargo run -p zerocache-http
+# semantic near-match tier:  docker run ... ghcr.io/shramanb113/zerocache:semantic  (then set ZEROCACHE_SEMANTIC=1)
+```
+
+No provider key is needed to start it — you send one per request.
+
+### 2. Point your client — one line
+
+The only change is the base URL. Your key, your models, your SDK, unchanged.
+
+```python
+# OpenAI Python SDK — chat + embeddings
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8080/openai/v1", api_key="sk-your-real-key")
+```
+
+```ts
+// OpenAI TS SDK
+import OpenAI from "openai";
+const client = new OpenAI({ baseURL: "http://localhost:8080/openai/v1", apiKey: process.env.OPENAI_API_KEY });
+```
+
+```python
+# Anthropic Python SDK — /v1/messages
+from anthropic import Anthropic
+client = Anthropic(base_url="http://localhost:8080/anthropic", api_key="sk-ant-your-real-key")
+```
+
+```sh
+# plain curl
+curl http://localhost:8080/openai/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-real-key" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"temperature":0}'
+```
+
+Swap `openai` for any of `mistral`, `gemini`, `groq`, `deepseek`, `together`, `openrouter`, `xai`, `fireworks` — each takes that provider's own key.
+
+### 3. Chat completions
+
+Send the request twice. The second response carries `X-Zerocache-Completion-Hit: true`, returns in ~1 ms, and costs nothing. Only **deterministic** requests are cached — `temperature: 0` or an explicit `seed`. See [Chat completions](#chat-completions).
+
+### 4. Embeddings
+
+Same story on `/{provider}/v1/embeddings` — identical text (down to casing / Unicode / punctuation) stops costing a second call. `input` takes a string or an array. Image embeddings: `POST /gemini/v1/images/embeddings` with `data:` URIs. See [Embeddings](#embeddings).
+
+### 5. Anthropic Messages
+
+`POST /{provider}/v1/messages` with Claude's native shape — `Authorization: Bearer` is rewritten to `x-api-key` upstream, `temperature: 0` to be cacheable. See [Anthropic Messages](#anthropic-messages).
+
+### 6. Watch it work
+
+- **`GET /dashboard`** — live hit rate, tokens not billed, dollars saved, per provider. Screenshot this mid-run.
+- **`GET /metrics`** — Prometheus counters behind the dashboard.
+- Response headers on every call: `X-Zerocache-Hits` / `X-Zerocache-Misses` (embeddings), `X-Zerocache-Completion-Hit` / `-Hit-Kind` / `-Semantic-Score` (chat + messages).
+
+### 7. Deploy
+
+- Single instance: the default `sled` store + a persistent volume (`-v zerocache-data:/data`).
+- Multi-replica: `ZEROCACHE_STORAGE_BACKEND=redis` + `ZEROCACHE_REDIS_URL` so every pod shares one cache. Add `ZEROCACHE_CROSS_REPLICA_COALESCING=1` to also collapse concurrent identical single-key misses across replicas.
+- `/health` (liveness) and `/ready` (store probe) are your Kubernetes probes; scrape `/metrics` per pod and `sum()`.
+
+### 8. Invalidate
+
+`DELETE /{provider}/v1/{embeddings,images/embeddings,chat/completions,messages}` with the same body + `Authorization` evicts the entry a matching `POST` would hit — owner-scoped, idempotent, `{"deleted": <count>}`.
+
+---
+
 ## Chat completions
 
 ```
@@ -116,9 +214,44 @@ curl http://localhost:8080/openai/v1/chat/completions \
 - The cache key is the **canonicalized** request body: order-independent, and blind to `user` / `stream` / `metadata` / key order / number spelling. Two requests that differ only in those share an entry.
 - A **non-2xx** upstream response is forwarded with its real status and **never** cached. Only 2xx is stored.
 - Concurrent identical misses within one instance are **coalesced** into a single upstream call — and across replicas when `ZEROCACHE_CROSS_REPLICA_COALESCING=1` on the redis backend.
+- **`stream: true` works**: a miss streams the upstream SSE to you live while it's buffered, and on a clean finish stored; a hit replays the stored completion as SSE (`~3 ms` between frames). A `stream: true` and a `stream: false` request for the same deterministic body share one entry. A non-cacheable `stream: true` request is a pure passthrough.
+- `DELETE /{provider}/v1/chat/completions` (same body + `Authorization`) evicts the entry a matching `POST` would hit — owner-scoped, idempotent, `{"deleted": 1}`.
 - Per-caller namespaced (`owner_id`) and per-endpoint scoped (`cache_scope`), exactly like embeddings — two callers, or the same model string against two different upstreams, never collide.
 
-`X-Zerocache-Completion-Hit` tells you which path a response took. `/metrics` exposes `zerocache_completion_cache_hits_total` / `_misses_total` / `_prompt_tokens_saved_total` / `_completion_tokens_saved_total`, all `provider`-labeled.
+`X-Zerocache-Completion-Hit: true | false` tells you which path a response took; on a hit, `X-Zerocache-Completion-Hit-Kind: exact | semantic` (and `X-Zerocache-Semantic-Score` on a semantic hit). `/metrics` exposes `zerocache_completion_cache_hits_total` / `_misses_total` / `_prompt_tokens_saved_total` / `_completion_tokens_saved_total`, all `provider`- and `stream`-labeled.
+
+---
+
+## Anthropic Messages
+
+Claude's native wire shape, not an OpenAI-compat shim.
+
+```
+POST /{provider}/v1/messages
+Authorization: Bearer <your own Anthropic key>       # rewritten to x-api-key upstream
+
+{ "model": "...", "messages": [...], "temperature": 0 }   # Anthropic request, forwarded verbatim on a miss
+
+→ the upstream response body, unchanged                   # 200 on a cache hit, ~1 ms
+  X-Zerocache-Completion-Hit: true | false
+  X-Zerocache-Completion-Hit-Kind: exact                  # v1 has only exact matches on this surface
+```
+
+```sh
+# first call: real, billed. second identical call: free, instant.
+curl http://localhost:8080/anthropic/v1/messages \
+  -H "Authorization: Bearer sk-ant-your-real-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"claude-sonnet-5","max_tokens":512,"messages":[{"role":"user","content":"Summarize: ..."}],"temperature":0}'
+```
+
+- **`{provider}`** is `anthropic` by default (built-in → `https://api.anthropic.com`), plus anything added via `ZEROCACHE_MESSAGES_PROVIDERS="name=url,…"` (bare-origin values — the adapter appends `/v1/messages`). An unknown name → `404`.
+- **Auth**: `Authorization: Bearer <key>` on the way in is rewritten to `x-api-key: <key>` upstream.
+- **Headers folded into the cache key**: `anthropic-version` (default `2023-06-01`, folded unconditionally — an absent header and an explicit `2023-06-01` share an entry) and `anthropic-beta` (every value if the header repeats, comma-joined; folded only when present, so different beta names never collide).
+- **Cache gate**: `temperature: 0` **only** (Anthropic has no `seed`/`n`, and deprecated `temperature` for post-Opus-4.6 models to `1.0`-only), plus non-empty `messages` and `thinking` absent/`disabled`. Anything else is a transparent passthrough.
+- A **non-2xx** upstream response is forwarded with its real status and **never** cached. Concurrent identical misses coalesce (in-process, and cross-replica with `ZEROCACHE_CROSS_REPLICA_COALESCING=1`).
+- `DELETE /{provider}/v1/messages` (same body + `Authorization`) evicts the entry a matching `POST` would hit — owner-scoped, idempotent, `{"deleted": 1}`.
+- **`stream: true` is a raw passthrough** — forwarded uncached, not counted. Buffer-and-replay and the semantic near-match tier for this surface are deferred.
 
 ---
 
@@ -188,17 +321,17 @@ flowchart TB
         nodeApp["orchestration: split hits/misses,<br/>call provider for misses only,<br/>coalesce, write back, reassemble in order"]
     end
     subgraph layerPorts["Ports"]
-        nodePorts["EmbeddingStore · EmbeddingProvider · ImageEmbeddingProvider ·<br/>CompletionStore · ChatCompletionProvider"]
+        nodePorts["EmbeddingStore · EmbeddingProvider · ImageEmbeddingProvider · CompletionStore ·<br/>ChatCompletionProvider · StreamingChatCompletionProvider · MessagesProvider ·<br/>CoalescingCoordinator · CompletionVectorStore"]
     end
     subgraph layerAdapters["Adapters"]
         nodeStore["Store adapters<br/>sled · redis"]
-        nodeProvider["Provider adapters<br/>openai · mistral · gemini · huggingface · bedrock · vertexai · azure<br/>+ OpenAiWireChatProvider (9 chat endpoints)"]
+        nodeProvider["Provider adapters<br/>openai · mistral · gemini · huggingface · bedrock · vertexai · azure · anthropic<br/>+ OpenAiWireChatProvider (9 chat endpoints)"]
     end
     subgraph layerCore["Core (domain)"]
         nodeKey["CacheKey (blake3) · reconciliation ·<br/>request canonicalization · determinism gate<br/>zero I/O, zero async runtime"]
     end
 
-    nodeClient(["Any OpenAI-compatible client"]) -->|"POST /{provider}/v1/{chat/completions,embeddings}"| nodeHttp
+    nodeClient(["Any OpenAI- or Anthropic-compatible client"]) -->|"POST /{provider}/v1/{chat/completions,messages,embeddings}"| nodeHttp
     nodeHttp --> nodeApp --> nodePorts
     nodePorts --> nodeStore
     nodePorts --> nodeProvider
@@ -210,13 +343,15 @@ flowchart TB
 | Crate | Responsibility |
 | --- | --- |
 | `zerocache-core` | Domain: cache-key derivation, hit/miss reconciliation, request canonicalization, the completion determinism gate. No I/O, no async, no framework awareness. |
-| `zerocache-ports` | Trait contracts: `EmbeddingStore` / `EmbeddingProvider` / `ImageEmbeddingProvider` / `CompletionStore` / `ChatCompletionProvider`. |
+| `zerocache-ports` | Trait contracts: `EmbeddingStore` / `EmbeddingProvider` / `ImageEmbeddingProvider` / `CompletionStore` / `ChatCompletionProvider` / `StreamingChatCompletionProvider` / `MessagesProvider` / `CoalescingCoordinator` / `CompletionVectorStore`. |
 | `zerocache-adapters-sled` | Embedded store (sled). Local dev / single instance. |
 | `zerocache-adapters-redis` | Shared store (Redis, pooled, no distributed lock). Any multi-replica deployment. |
 | `zerocache-adapters-openai` | OpenAI embeddings **+** `OpenAiWireChatProvider` — the generic OpenAI-wire chat proxy behind all 9 chat providers. |
 | `zerocache-adapters-{mistral,gemini,huggingface}` | Embedding providers (`gemini` also does image embeddings). |
 | `zerocache-adapters-cloud` | Shared kit for the three cloud adapters: transport driver + a `CloudRouter` / `TextWireStrategy` strategy pattern (each cloud fronts several model vendors). |
 | `zerocache-adapters-{bedrock,vertexai,azure}` | Embedding providers for Amazon Bedrock, GCP Vertex AI, Azure (OpenAI GA + Foundry). |
+| `zerocache-adapters-anthropic` | `MessagesProvider` — Claude's native `/v1/messages` wire shape. |
+| `zerocache-semantic` | The opt-in semantic near-match tier (candle + a bundled all-MiniLM-L6-v2). **Not** a `--workspace` member — pulled in only by `zerocache-http --features semantic`. |
 | `zerocache-http` | axum server, wire translation, provider registry, application wiring, the embedded dashboard. |
 
 ---
@@ -225,6 +360,9 @@ flowchart TB
 
 **Chat completions** (`/{provider}/v1/chat/completions`) — all OpenAI-wire, zero config:
 `openai` · `mistral` · `gemini` · `groq` · `deepseek` · `together` · `openrouter` · `xai` · `fireworks`, plus any name added via `ZEROCACHE_CHAT_PROVIDERS`.
+
+**Anthropic Messages** (`/{provider}/v1/messages`) — Claude's native wire shape:
+`anthropic` (built-in → `https://api.anthropic.com`), plus any name added via `ZEROCACHE_MESSAGES_PROVIDERS`.
 
 **Embeddings** (`/{provider}/v1/embeddings`):
 
@@ -255,11 +393,22 @@ Every setting is an environment variable — no config file. Everything is optio
 | `ZEROCACHE_TTL_SECONDS` | unset (never expires) | Per-entry expiry. `0` / unparseable → unset + startup warning. |
 | `ZEROCACHE_CROSS_REPLICA_COALESCING` | unset (off) | Opt-in (`1`/`true`/`yes`); **redis backend only** (set on sled → startup warning, no-op). Redis-lock single-flight so N replicas make one upstream call for the same single-key miss (any chat completion; a one-`input` embedding). A follower that waits and then still has to call upstream can take up to ~60 s (30 s wait + its own 30 s provider timeout). |
 
-**Chat providers**
+**Chat & messages providers**
 
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `ZEROCACHE_CHAT_PROVIDERS` | unset | `"name=url,name=url"` — override a built-in's URL or add a new provider. The URL is the prefix *up to but not including* `/chat/completions` (so Gemini's `…/v1beta/openai` works). Malformed entries are skipped with a warning, never blocking startup. Independent of `ZEROCACHE_OPENAI_BASE_URL`, which is embeddings-only. |
+| `ZEROCACHE_MESSAGES_PROVIDERS` | unset | `"name=url,name=url"` — override or add an Anthropic `/v1/messages` provider. Unlike the chat var, each URL is a **bare origin** — the adapter appends `/v1/messages` itself. |
+
+**Semantic tier** (`--features semantic` build only)
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `ZEROCACHE_SEMANTIC` | unset (off) | `1` enables the local-embedder near-match tier. Embedder-load failure with it on is fail-fast (`exit 1`). |
+| `ZEROCACHE_SEMANTIC_THRESHOLD` | `0.97` | Cosine acceptance threshold, clamped to `[0.5, 1.0]`. The threshold, not the embedder, bounds false positives. |
+| `ZEROCACHE_SEMANTIC_MATCH_UNIT` | `last-user` | Which span is fuzzy-matched: `last-user` \| `system-and-last-user` \| `full-conversation`. Everything else stays exact. |
+| `ZEROCACHE_SEMANTIC_POLL_MS` | `2000` | redis backend: `XREAD BLOCK` ceiling for the cross-replica index change-feed, clamped `[250, 60000]`. |
+| `ZEROCACHE_SEMANTIC_INDEX_MAXLEN` | `100000` | redis backend: `MAXLEN ~` cap on the `zerocache:semantic:events` stream. |
 
 **Embedding provider base URLs** — a bare origin (scheme + host + optional port), **no** `/v1`, **no** trailing slash:
 
@@ -284,11 +433,12 @@ Every setting is an environment variable — no config file. Everything is optio
 ```sh
 docker pull ghcr.io/shramanb113/zerocache:latest
 docker pull ghcr.io/shramanb113/zerocache:<commit-sha>
+docker pull ghcr.io/shramanb113/zerocache:semantic       # same image + the semantic tier compiled in
 ```
 
 **Kubernetes / multi-replica** — the default `sled` store is per-process, so replicas don't share hits. Set `ZEROCACHE_STORAGE_BACKEND=redis` + `ZEROCACHE_REDIS_URL` for a shared cache (no distributed lock needed for correctness — content-addressed keys make last-write-wins safe; set `ZEROCACHE_CROSS_REPLICA_COALESCING=1` to also dedupe concurrent identical single-key misses across replicas, saving the duplicate upstream calls). `/health` + `/ready` are standard liveness/readiness probes; scrape `/metrics` per pod and `sum()`.
 
-**CI/CD** — `ci.yml` runs `build` / `test` / `test-redis` / `build-musl` / `clippy -D warnings` / `fmt` / `dashboard` on every push and PR to `master`; `docker-publish.yml` builds and pushes the image after CI passes on a genuine push (not on fork PRs).
+**CI/CD** — `ci.yml` runs `build` / `test` / `test-redis` / `build-musl` / `build-semantic` / `clippy -D warnings` / `fmt` / `dashboard` on every push and PR to `master`; `docker-publish.yml` builds and pushes the `:latest` and `:semantic` images after CI passes on a genuine push (not on fork PRs).
 
 ---
 
@@ -307,8 +457,8 @@ The features that make the completion cache a general LLM gateway, roughly in or
 
 1. **Semantic completion cache** — ✅ **Live (opt-in).** A local candle embedder (all-MiniLM-L6-v2, compiled in) generates a prompt vector; on an exact-match miss a hit is a cosine match above a conservative threshold *and* a byte-for-byte match of the rest of the request. Turns a near-zero hit rate on paraphrased chatbot/agent traffic into a useful one. Build with `--features semantic`, enable with `ZEROCACHE_SEMANTIC=1`. Works on both backends: sled in-process, or a Redis Stream change-feed across replicas — set `ZEROCACHE_STORAGE_BACKEND=redis` (needs Redis ≥ 6.2); ~2 s cross-replica propagation lag, tune with `ZEROCACHE_SEMANTIC_POLL_MS`, size the feed with `ZEROCACHE_SEMANTIC_INDEX_MAXLEN`. The threshold, not the embedder, bounds false positives.
 2. **Cross-replica request coalescing** — ✅ **Live (opt-in).** With `ZEROCACHE_CROSS_REPLICA_COALESCING=1` on the redis backend, two replicas missing on the same single `CacheKey` (any chat completion, or a one-`input` embedding request) share one upstream call via a Redis lock. Multi-item embedding batches and images stay in-process only.
-3. **Streaming** — `stream: true`: buffer the SSE on a miss, replay it on a hit.
-4. **Anthropic `/v1/messages`** — a native adapter for Claude's wire shape, so Claude-based agents are cacheable.
+3. **Streaming** — ✅ **Live.** `stream: true` on the OpenAI-wire chat surface: the SSE is buffered on a miss (streamed to the caller live meanwhile) and replayed frame-by-frame on a hit. One entry serves both `stream: true` and `stream: false`. Anthropic `/v1/messages` streaming is still a raw passthrough.
+4. **Anthropic `/v1/messages`** — ✅ **Live.** A native adapter for Claude's wire shape (`POST` / `DELETE /{provider}/v1/messages`), `temperature: 0`-only cache gate, `anthropic-version` / `anthropic-beta` folded into the key. Non-streaming; the `--features semantic` near-match tier for this surface is deferred.
 5. **Budgets & rate limits** — per-key monthly spend caps (`429` when exceeded) and per-key RPS limits, with a cost-by-team view in the dashboard.
 6. **Multi-provider failover** — retry a failed request on a second configured provider (the adapters already exist; only the routing policy is missing).
 7. **Request log + replay** (opt-in) — persist request/response pairs, browse them, replay one, diff the result.
@@ -318,8 +468,8 @@ The features that make the completion cache a general LLM gateway, roughly in or
 
 ## What Zerocache is *not* (yet)
 
-- **Semantic chat caching is opt-in** — a `--features semantic` build plus `ZEROCACHE_SEMANTIC=1` adds a local-embedder near-match tier; the default build is still exact-match on a canonicalized body. On the redis backend it propagates across replicas via a Redis Stream change-feed (~2 s lag); the RediSearch-native KNN path and push propagation are still deferred.
-- **No streaming, no Anthropic `/v1/messages`** — roadmap items 3–4. Non-streaming OpenAI-wire only, today.
+- **Semantic chat caching is opt-in** — a `--features semantic` build plus `ZEROCACHE_SEMANTIC=1` adds a local-embedder near-match tier; the default build is still exact-match on a canonicalized body. On the redis backend it propagates across replicas via a Redis Stream change-feed with a blocking (`XREAD BLOCK`) reader; the RediSearch-native KNN path is still deferred. The semantic tier does not cover the Anthropic `/v1/messages` surface or image embeddings.
+- **Anthropic `/v1/messages` streaming is a raw passthrough** — `stream: true` on that surface is forwarded uncached; buffer-and-replay (which the OpenAI-wire chat surface has) is deferred.
 - **No budgets, rate limiting, or failover** — roadmap items 5–6.
 - **No fuzzy similarity on embedding vectors** — and it never will do that: finding a near neighbour requires computing the very embedding you're trying to avoid. Text canonicalization (casing/punctuation fold) is the only near-match on the embedding path.
 - **No quantization / eviction** — deferred until a real hit-rate number justifies the work.
@@ -330,7 +480,7 @@ The features that make the completion cache a general LLM gateway, roughly in or
 
 ## Testing
 
-323 tests across 13 crates + 26 `#[ignore]`d real-Redis integration tests (ephemeral container via `testcontainers`), zero `clippy -D warnings` findings.
+450+ tests across the 14 workspace crates and the opt-in `zerocache-semantic` crate, plus a 30-test `#[ignore]`d real-Redis integration suite (ephemeral container via `testcontainers`), zero `clippy -D warnings` findings.
 
 1. **Core** — pure unit tests: key derivation, owner/provider/scope isolation, image domain-separation, the completion canonicalizer + determinism gate.
 2. **Application** — orchestration against mock ports: hit/miss splitting, ordering, coalescing (text, image, completion), within-batch dedup, cache-scope isolation, failure propagation.

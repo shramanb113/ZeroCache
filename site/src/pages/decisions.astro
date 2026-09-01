@@ -103,12 +103,57 @@ const decisions = [
     why: "Closes the last gap the original image-embedding launch had explicitly deferred.",
     detail: "A second, separate in-flight map — kept apart from the text path's so a burst of image traffic can never contend the text path's lock.",
   },
+  {
+    title: "The completion cache caches whole chat completions, not embeddings",
+    why: "A full hit is 100% off input and output — versus provider-side prompt caching's input-only discount on a request that still runs the model.",
+    detail: "The savings come from repeated runs (CI/eval loops, re-asks), the short auxiliary LLM calls agents fire constantly, retry storms, and multi-agent fan-out. Only deterministic requests (temperature 0 or a seed) are cached; the key is an order-independent canonicalization of the output-affecting fields.",
+  },
+  {
+    title: "One generic OpenAI-wire chat adapter behind nine built-in providers",
+    why: "Item 21 shipped with one chat provider hardcoded; every OpenAI-wire endpoint is the same wire shape with a different base URL.",
+    detail: "openai, mistral, gemini, groq, deepseek, together, openrouter, xai, fireworks register with zero config; ZEROCACHE_CHAT_PROVIDERS adds or repoints one. The configured value is the full prefix up to /chat/completions — not the embeddings 'bare origin' rule, because that can't express Gemini's /v1beta/openai compat prefix.",
+  },
+  {
+    title: "The live savings dashboard is a real framework SPA embedded in the binary",
+    why: "The ask was for a real charting library, not hand-rolled HTML — and it must ship with the single static binary.",
+    detail: "Astro + React islands + Recharts, built to a committed dist/ that include_dir! embeds at compile time, served at /dashboard on the same origin as /metrics. cargo build needs no Node; only rebuilding the dashboard does. Completion savings are exact (from the stored usage block); embedding savings are estimated.",
+  },
+  {
+    title: "The semantic near-match tier is a non-workspace crate, compile-time gated",
+    why: "candle + a bundled model must never be in the path of cargo build --workspace / cargo test --workspace.",
+    detail: "zerocache-semantic is excluded from the workspace; it builds only via zerocache-http --features semantic. The default image is byte-identical to before. Runtime opt-in on top of that (ZEROCACHE_SEMANTIC=1). The cosine threshold, not the embedder, bounds false positives — a small MiniLM-class model works for every chat provider, adds no second key, adds no per-request latency.",
+  },
+  {
+    title: "The multi-replica semantic index propagates over a Redis Stream, poll then push",
+    why: "The tier shipped sled-only; on redis it used to fall back to exact-match. N replicas each keep an in-memory HNSW graph and need to learn each other's writes.",
+    detail: "One global stream zerocache:semantic:events; each replica folds the backlog at boot, then a background task tails it. First via a polled changes_since, then (item 29) via a blocking XREAD BLOCK so propagation lag drops to one round-trip and an idle feed makes zero calls. A not-yet-propagated vector is just a semantic miss that falls through — absent, never wrong.",
+  },
+  {
+    title: "Cross-replica request coalescing is opt-in and single-key only",
+    why: "In-process coalescing still lets N replicas behind a load balancer each pay the provider once for the same miss.",
+    detail: "ZEROCACHE_CROSS_REPLICA_COALESCING=1 on redis adds a SET NX PX lock + pub/sub wake so the same single CacheKey (any chat completion, a one-input embedding) resolves to one upstream call. Multi-item batches and images stay in-process. Any Redis error degrades to today's per-replica behaviour — never a failed request; a non-2xx upstream is never stored.",
+  },
+  {
+    title: "Streaming completions: buffer on a miss, replay SSE on a hit",
+    why: "stream: true used to be parsed as JSON, fail, and get cached as an error object.",
+    detail: "A miss streams upstream frames to the client live while a background task buffers, assembles, and (on a clean finish) stores the record — with raw_sse alongside the assembled body. A stream:true and stream:false request for the same deterministic body share one entry. A hit replays raw_sse frame-by-frame; a non-cacheable stream:true request is a pure passthrough.",
+  },
+  {
+    title: "DELETE /{provider}/v1/chat/completions is the eviction counterpart the completion cache lacked",
+    why: "The completion and messages caches could store but not explicitly evict a single entry — the embedding path already had DELETE.",
+    detail: "Same body shape, same Authorization requirement, same 401/404/422 ladder as the chat POST; response { \"deleted\": 1 }, owner- and cache_scope-scoped, idempotent (count is keys requested, not found). One shared key-derivation helper now backs POST, streaming POST, and DELETE so they can't drift. With the semantic tier on, it also drops the request's vector record and HNSW node.",
+  },
+  {
+    title: "Anthropic /v1/messages is a native surface, not an OpenAI-compat shim",
+    why: "Claude-based agents send Anthropic's wire shape; forcing it through the OpenAI path would lose fields and mangle the response.",
+    detail: "New zerocache-adapters-anthropic + a messages orchestrator that reuses CompletionStore, the completion metrics, and the coalescing machinery unchanged. Auth is Bearer in / x-api-key upstream; anthropic-version and anthropic-beta fold into the cache key. Cache gate is temperature 0 only — Anthropic has no seed/n. stream: true is a raw passthrough; the semantic tier for this surface is deferred.",
+  },
 ];
 ---
 
 <BaseLayout
   title="Engineering Decisions"
-  description="20 real tradeoffs and deviations from Zerocache's own spec, with the reasoning behind each — including what's deliberately not built yet."
+  description="Real tradeoffs and deviations from Zerocache's own spec, with the reasoning behind each — including what's deliberately not built yet."
 >
   <h1>Engineering decisions</h1>
   <p>

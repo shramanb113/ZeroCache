@@ -35,31 +35,71 @@ const providers = [
     grammar: "[foundry:]<deployment>[#<input_type>]",
   },
 ];
+
+const chatProviders = [
+  "openai", "mistral", "gemini", "groq", "deepseek",
+  "together", "openrouter", "xai", "fireworks",
+];
 ---
 
 <BaseLayout
   title="Providers"
-  description="All 7 embedding providers Zerocache supports, with auth style, text/image support, and model-string grammar."
+  description="Every provider Zerocache supports: 9 OpenAI-wire chat endpoints, Anthropic /v1/messages, and 7 embedding providers (text + image)."
 >
   <h1>Providers</h1>
   <p>
     Every request is bring-your-own-key: Zerocache never holds a provider credential beyond the
     duration of one request. <code>{"{provider}"}</code> in the URL path selects which adapter
-    handles the request; the three cloud providers encode routing coordinates (region, project,
-    input type) into the <code>model</code> string itself rather than a new wire field, since
-    <code>model</code> is already free-form per-request and already lands in the cache key.
+    handles the request; the three cloud embedding providers encode routing coordinates (region,
+    project, input type) into the <code>model</code> string itself rather than a new wire field,
+    since <code>model</code> is already free-form per-request and already lands in the cache key.
   </p>
-  <div class="provider-grid">
-    {providers.map((p) => (
-      <ProviderCard
-        name={p.name}
-        auth={p.auth}
-        text={p.text}
-        image={p.image}
-        grammar={p.grammar}
-      />
-    ))}
-  </div>
+
+  <section class="section">
+    <h2>Chat completions</h2>
+    <p>
+      <code>POST /{"{provider}"}/v1/chat/completions</code> — nine hosted OpenAI-wire endpoints,
+      registered with zero config. Add or repoint one (self-hosted vLLM / Ollama, an internal
+      gateway) with <code>ZEROCACHE_CHAT_PROVIDERS="name=url,…"</code>, where the URL is the prefix
+      up to but not including <code>/chat/completions</code>.
+    </p>
+    <p class="chip-row">
+      {chatProviders.map((n) => <code class="chip">{n}</code>)}
+    </p>
+  </section>
+
+  <section class="section">
+    <h2>Anthropic Messages</h2>
+    <p>
+      <code>POST /{"{provider}"}/v1/messages</code> — Claude's native wire shape. Built-in
+      <code>anthropic</code> &rarr; <code>https://api.anthropic.com</code>; add or repoint with
+      <code>ZEROCACHE_MESSAGES_PROVIDERS="name=url,…"</code> (bare-origin values — the adapter
+      appends <code>/v1/messages</code>). <code>Authorization: Bearer</code> is rewritten to
+      <code>x-api-key</code> upstream.
+    </p>
+  </section>
+
+  <section class="section">
+    <h2>Embeddings</h2>
+    <div class="provider-grid">
+      {providers.map((p) => (
+        <ProviderCard
+          name={p.name}
+          auth={p.auth}
+          text={p.text}
+          image={p.image}
+          grammar={p.grammar}
+        />
+      ))}
+    </div>
+    <ul class="notes">
+      <li><strong>Gemini</strong> is the only provider with image embeddings, and never reports token usage — <code>usage</code> is always zero on its responses.</li>
+      <li><strong>Bedrock</strong> authenticates with an Amazon bearer API key — no AWS SigV4. Titan and Cohere sit behind one router.</li>
+      <li><strong>Vertex AI</strong> uses a GCP OAuth2 access token, which lives about an hour; since <code>owner_id</code> is a hash of that credential, a Vertex caller's cache namespace rotates when the token does — fine for one long ingestion run, not across days.</li>
+      <li><strong>Azure</strong> registers as a provider only once <code>ZEROCACHE_AZURE_OPENAI_BASE_URL</code> or <code>ZEROCACHE_AZURE_FOUNDRY_BASE_URL</code> is set; with neither, <code>/azure/v1/embeddings</code> 404s. It covers the Azure OpenAI GA path and Foundry Models.</li>
+      <li><strong>OpenAI</strong> and <strong>Mistral</strong> take a configurable base URL, so a self-hosted wire-compatible endpoint (vLLM, LM Studio, TGI) works too. The cloud adapters are mock-tested only — no live-key smoke test in this environment.</li>
+    </ul>
+  </section>
 </BaseLayout>
 
 <style>
@@ -67,6 +107,29 @@ const providers = [
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
     gap: var(--space-3);
+    margin-top: var(--space-3);
+  }
+  .chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+  .chip {
+    background: var(--surface);
+    border: var(--hairline);
+    padding: 2px 8px;
+  }
+  .notes {
     margin-top: var(--space-4);
+    max-width: 64ch;
+    padding-left: 1.2em;
+    font-size: 0.9rem;
+    color: var(--muted);
+  }
+  .notes li {
+    margin-bottom: var(--space-2);
+  }
+  .notes strong {
+    color: var(--paper);
   }
 </style>

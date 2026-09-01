@@ -1,0 +1,26 @@
+{
+  "name": "zerocache-agent-showcase",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test --import tsx \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "run": "tsx run.ts",
+    "warm": "tsx warm.ts",
+    "check": "tsx run.ts --run=2 --check",
+    "render:demo": "tsx src/render.ts --demo",
+    "smoke": "node scripts/stub-zerocache.mjs & sleep 1 && ZEROCACHE_BASE_URL=http://127.0.0.1:8791 OPENAI_API_KEY=stub ANTHROPIC_API_KEY=stub GEMINI_API_KEY=stub tsx run.ts --run=1"
+  },
+  "dependencies": {
+    "diff": "^7.0.0",
+    "dotenv": "^16.4.5",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/diff": "^7.0.0",
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}

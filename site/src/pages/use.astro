@@ -1,0 +1,144 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import CodeBlock from "../components/CodeBlock.astro";
+
+const rawBase = import.meta.env.BASE_URL;
+const base = rawBase.endsWith("/") ? rawBase : `${rawBase}/`;
+
+const run = `docker run -d --name zerocache -p 8080:8080 \\
+  -v zerocache-data:/data ghcr.io/shramanb113/zerocache:latest
+# or:  cargo run -p zerocache-http
+# semantic near-match tier:  ghcr.io/shramanb113/zerocache:semantic  (then set ZEROCACHE_SEMANTIC=1)`;
+
+const pyOpenai = `from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/openai/v1",
+    api_key="sk-your-real-key",
+)`;
+
+const tsOpenai = `import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "http://localhost:8080/openai/v1",
+  apiKey: process.env.OPENAI_API_KEY,
+});`;
+
+const pyAnthropic = `from anthropic import Anthropic
+
+client = Anthropic(
+    base_url="http://localhost:8080/anthropic",
+    api_key="sk-ant-your-real-key",
+)`;
+
+const curlChat = `curl http://localhost:8080/openai/v1/chat/completions \\
+  -H "Authorization: Bearer sk-your-real-key" \\
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"temperature":0}'
+# send it twice — the second response has X-Zerocache-Completion-Hit: true, ~1 ms, $0`;
+
+const deleteAll = `DELETE /{provider}/v1/{embeddings,images/embeddings,chat/completions,messages}
+Authorization: Bearer <caller's own key>
+<same body a matching POST would send>
+
+→ { "deleted": <count> }`;
+---
+
+<BaseLayout
+  title="Using Zerocache"
+  description="Zero to a measured cache hit: run it, point your client at one new base URL, and watch the savings on /dashboard."
+>
+  <h1>Using Zerocache</h1>
+  <p>
+    The only change to your app is the base URL. Your key, your models, your SDK, unchanged —
+    Zerocache forwards your key upstream on a miss and stores only a hash of it.
+  </p>
+
+  <section class="section">
+    <h2>Run it</h2>
+    <CodeBlock code={run} lang="bash" />
+    <p>No provider key is needed to start it — you send one per request.</p>
+  </section>
+
+  <section class="section">
+    <h2>Point your client — one line</h2>
+    <p>OpenAI Python SDK (chat + embeddings):</p>
+    <CodeBlock code={pyOpenai} lang="python" />
+    <p>OpenAI TS SDK:</p>
+    <CodeBlock code={tsOpenai} lang="ts" />
+    <p>Anthropic Python SDK (<code>/v1/messages</code>):</p>
+    <CodeBlock code={pyAnthropic} lang="python" />
+    <p>
+      Swap <code>openai</code> for any of <code>mistral</code>, <code>gemini</code>,
+      <code>groq</code>, <code>deepseek</code>, <code>together</code>, <code>openrouter</code>,
+      <code>xai</code>, <code>fireworks</code> — each takes that provider's own key.
+    </p>
+  </section>
+
+  <section class="section">
+    <h2>Chat completions</h2>
+    <CodeBlock code={curlChat} lang="bash" />
+    <p>
+      Only <strong>deterministic</strong> requests are cached — <code>temperature: 0</code> or an
+      explicit <code>seed</code>. <code>stream: true</code> works: buffered on a miss, replayed
+      frame-by-frame on a hit. Full contract on the <a href={`${base}api/`}>API page</a>.
+    </p>
+  </section>
+
+  <section class="section">
+    <h2>Embeddings</h2>
+    <p>
+      Same story on <code>/{"{provider}"}/v1/embeddings</code> — identical text (down to casing,
+      Unicode form, and punctuation) stops costing a second call. <code>input</code> takes a string
+      or an array. Image embeddings: <code>POST /gemini/v1/images/embeddings</code> with
+      <code>data:</code> URIs.
+    </p>
+  </section>
+
+  <section class="section">
+    <h2>Anthropic Messages</h2>
+    <p>
+      <code>POST /{"{provider}"}/v1/messages</code> with Claude's native shape.
+      <code>Authorization: Bearer</code> is rewritten to <code>x-api-key</code> upstream;
+      <code>temperature: 0</code> to be cacheable. <code>anthropic-version</code> and
+      <code>anthropic-beta</code> fold into the cache key.
+    </p>
+  </section>
+
+  <section class="section">
+    <h2>Watch it work</h2>
+    <ul>
+      <li><code>GET /dashboard</code> — live hit rate, tokens not billed, dollars saved, per provider. Screenshot this mid-run.</li>
+      <li><code>GET /metrics</code> — the Prometheus counters behind the dashboard.</li>
+      <li>
+        Response headers: <code>X-Zerocache-Hits</code> / <code>X-Zerocache-Misses</code>
+        (embeddings), <code>X-Zerocache-Completion-Hit</code> / <code>-Hit-Kind</code> /
+        <code>-Semantic-Score</code> (chat + messages).
+      </li>
+    </ul>
+  </section>
+
+  <section class="section">
+    <h2>Deploy</h2>
+    <ul>
+      <li>Single instance: the default <code>sled</code> store + a persistent volume (<code>-v zerocache-data:/data</code>).</li>
+      <li>Multi-replica: <code>ZEROCACHE_STORAGE_BACKEND=redis</code> + <code>ZEROCACHE_REDIS_URL</code> so every pod shares one cache. Add <code>ZEROCACHE_CROSS_REPLICA_COALESCING=1</code> to collapse concurrent identical single-key misses across replicas.</li>
+      <li><code>/health</code> and <code>/ready</code> are your Kubernetes probes; scrape <code>/metrics</code> per pod and <code>sum()</code>.</li>
+    </ul>
+  </section>
+
+  <section class="section">
+    <h2>Invalidate</h2>
+    <CodeBlock code={deleteAll} lang="http" />
+    <p>Owner-scoped, idempotent — the count is keys requested, not keys found.</p>
+  </section>
+</BaseLayout>
+
+<style>
+  ul {
+    max-width: 62ch;
+    padding-left: 1.2em;
+  }
+  li {
+    margin-bottom: var(--space-2);
+  }
+</style>
