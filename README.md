@@ -22,7 +22,9 @@ No SDK to install. No framework plugin. No server-side provider credentials for 
 
 - [What it does](#what-it-does)
 - [Quickstart](#quickstart)
+- [Using Zerocache](#using-zerocache)
 - [Chat completions](#chat-completions)
+- [Anthropic Messages](#anthropic-messages)
 - [Embeddings](#embeddings)
 - [Live savings dashboard](#live-savings-dashboard)
 - [How the cache key works](#how-the-cache-key-works)
@@ -122,6 +124,39 @@ curl http://localhost:8080/openai/v1/chat/completions \
 - Per-caller namespaced (`owner_id`) and per-endpoint scoped (`cache_scope`), exactly like embeddings — two callers, or the same model string against two different upstreams, never collide.
 
 `X-Zerocache-Completion-Hit: true | false` tells you which path a response took; on a hit, `X-Zerocache-Completion-Hit-Kind: exact | semantic` (and `X-Zerocache-Semantic-Score` on a semantic hit). `/metrics` exposes `zerocache_completion_cache_hits_total` / `_misses_total` / `_prompt_tokens_saved_total` / `_completion_tokens_saved_total`, all `provider`- and `stream`-labeled.
+
+---
+
+## Anthropic Messages
+
+Claude's native wire shape, not an OpenAI-compat shim.
+
+```
+POST /{provider}/v1/messages
+Authorization: Bearer <your own Anthropic key>       # rewritten to x-api-key upstream
+
+{ "model": "...", "messages": [...], "temperature": 0 }   # Anthropic request, forwarded verbatim on a miss
+
+→ the upstream response body, unchanged                   # 200 on a cache hit, ~1 ms
+  X-Zerocache-Completion-Hit: true | false
+  X-Zerocache-Completion-Hit-Kind: exact                  # v1 has only exact matches on this surface
+```
+
+```sh
+# first call: real, billed. second identical call: free, instant.
+curl http://localhost:8080/anthropic/v1/messages \
+  -H "Authorization: Bearer sk-ant-your-real-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"claude-sonnet-5","max_tokens":512,"messages":[{"role":"user","content":"Summarize: ..."}],"temperature":0}'
+```
+
+- **`{provider}`** is `anthropic` by default (built-in → `https://api.anthropic.com`), plus anything added via `ZEROCACHE_MESSAGES_PROVIDERS="name=url,…"` (bare-origin values — the adapter appends `/v1/messages`). An unknown name → `404`.
+- **Auth**: `Authorization: Bearer <key>` on the way in is rewritten to `x-api-key: <key>` upstream.
+- **Headers folded into the cache key**: `anthropic-version` (default `2023-06-01`, folded unconditionally — an absent header and an explicit `2023-06-01` share an entry) and `anthropic-beta` (every value if the header repeats, comma-joined; folded only when present, so different beta names never collide).
+- **Cache gate**: `temperature: 0` **only** (Anthropic has no `seed`/`n`, and deprecated `temperature` for post-Opus-4.6 models to `1.0`-only), plus non-empty `messages` and `thinking` absent/`disabled`. Anything else is a transparent passthrough.
+- A **non-2xx** upstream response is forwarded with its real status and **never** cached. Concurrent identical misses coalesce (in-process, and cross-replica with `ZEROCACHE_CROSS_REPLICA_COALESCING=1`).
+- `DELETE /{provider}/v1/messages` (same body + `Authorization`) evicts the entry a matching `POST` would hit — owner-scoped, idempotent, `{"deleted": 1}`.
+- **`stream: true` is a raw passthrough** — forwarded uncached, not counted. Buffer-and-replay and the semantic near-match tier for this surface are deferred.
 
 ---
 
