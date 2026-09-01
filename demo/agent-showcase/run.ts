@@ -194,20 +194,16 @@ async function main(): Promise<void> {
 
   if (flags.run === 3 && !(await semanticEnabled())) {
     console.log(
-      "\nsemantic tier not enabled on this Zerocache instance.\n" +
-        "Start it with:  cargo run -p zerocache-http --features semantic\n" +
-        "and set        ZEROCACHE_SEMANTIC=1\n",
+      "\nnote: this instance's /metrics does not (yet) expose the semantic\n" +
+        "counter. If it is not a `--features semantic` build with\n" +
+        "ZEROCACHE_SEMANTIC=1, run 3 will show exact-match misses on the\n" +
+        "reworded task instead of semantic hits. Proceeding anyway.\n",
     );
-    process.exit(0);
   }
 
   const runs: (1 | 2 | 3)[] = flags.record ? [1, 2, 3] : [flags.run];
   let lastResult: OrchestratorResult | undefined;
   for (const run of runs) {
-    if (run === 3 && !(await semanticEnabled())) {
-      console.log("\n(skipping run 3 — semantic tier not enabled)\n");
-      break;
-    }
     const { result, tracePath } = await executeRun({ ...flags, run });
     lastResult = result;
 
