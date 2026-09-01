@@ -77,6 +77,7 @@ test("orchestrate runs every stage and fires 3 concurrent brief calls", async ()
   const res = await orchestrate(RATE_LIMIT_TASK, {
     gateway: gw as never,
     keys: { openai: "sk-x", anthropic: "sk-ant-x" },
+    providers: { chat: "openai", embed: "openai" },
     models: {
       chat: "gpt-4o-mini",
       review: "claude-sonnet-5",

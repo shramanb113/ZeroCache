@@ -48,6 +48,8 @@ export interface LlmGateway {
 export interface OrchestratorDeps {
   gateway: LlmGateway;
   keys: { openai: string; anthropic?: string; gemini?: string };
+  /** Which registered Zerocache providers to route through. Default openai. */
+  providers: { chat: string; embed: string };
   models: { chat: string; review: string; embed: string; image: string };
   workDir: string;
   trace: Trace;
@@ -138,7 +140,7 @@ export async function orchestrate(
   task: Task,
   deps: OrchestratorDeps,
 ): Promise<OrchestratorResult> {
-  const { gateway, keys, models, workDir, ledger, onFrame } = deps;
+  const { gateway, keys, providers, models, workDir, ledger, onFrame } = deps;
   const stages: StageOutcome[] = [];
   const degraded: string[] = [];
   const record = (r: ZcResult<unknown>) =>
@@ -158,7 +160,7 @@ export async function orchestrate(
     chunks.push(...chunkFile(rel, text));
   }
   const embedRes = await gateway.embed(
-    "openai",
+    providers.embed,
     keys.openai,
     models.embed,
     chunks.map((c) => c.text),
@@ -191,7 +193,7 @@ export async function orchestrate(
   }
 
   const queryRes = await gateway.embed(
-    "openai",
+    providers.embed,
     keys.openai,
     models.embed,
     [`${task.title}\n${task.brief}`],
@@ -209,7 +211,7 @@ export async function orchestrate(
 
   // ---- Stage 2: plan --------------------------------------------------
   const planRes = await gateway.chat(
-    "openai",
+    providers.chat,
     keys.openai,
     architectPlanBody(models.chat, task, top.map((t) => t.chunk)),
     { stage: "plan" },
@@ -233,7 +235,7 @@ export async function orchestrate(
   const briefResults = await Promise.all(
     [0, 1, 2].map((i) =>
       gateway.chat(
-        "openai",
+        providers.chat,
         keys.openai,
         repoBriefBody(models.chat, conventionsText),
         { stage: "brief", coalesced: i !== 0 },
@@ -269,7 +271,7 @@ export async function orchestrate(
           current,
           attempt === 1 ? plan : `${plan}\n\nPREVIOUS ATTEMPT FAILED: ${lastErr}`,
         );
-        const res = await gateway.chat("openai", keys.openai, body, {
+        const res = await gateway.chat(providers.chat, keys.openai, body, {
           stage: "implement",
         });
         record(res);
@@ -330,7 +332,7 @@ export async function orchestrate(
         }
       ).messages[0]?.content ?? "Review this change.";
     const rev = await gateway.chat(
-      "openai",
+      providers.chat,
       keys.openai,
       {
         model: models.chat,
@@ -346,7 +348,7 @@ export async function orchestrate(
     deps.trace.add({
       stage: "review",
       type: "note",
-      provider: "openai",
+      provider: providers.chat,
       model: models.chat,
       surface: null,
       hit: false,
@@ -376,7 +378,7 @@ export async function orchestrate(
       const current = readFileOrEmpty(workDir, rel);
       if (current === "") continue;
       const res = await gateway.chat(
-        "openai",
+        providers.chat,
         keys.openai,
         fixerBody(models.chat, task, rel, current, reviewText),
         { stage: "fix" },

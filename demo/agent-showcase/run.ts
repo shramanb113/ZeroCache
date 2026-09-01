@@ -106,9 +106,14 @@ export async function executeRun(
   const ledger = new Ledger();
 
   const keys = {
-    openai: process.env.OPENAI_API_KEY ?? "",
+    openai:
+      process.env.SHOWCASE_API_KEY || process.env.OPENAI_API_KEY || "",
     anthropic: process.env.ANTHROPIC_API_KEY || undefined,
     gemini: process.env.GEMINI_API_KEY || undefined,
+  };
+  const routeProviders = {
+    chat: process.env.SHOWCASE_CHAT_PROVIDER ?? "openai",
+    embed: process.env.SHOWCASE_EMBED_PROVIDER ?? "openai",
   };
   const models = {
     chat: process.env.SHOWCASE_CHAT_MODEL ?? "gpt-4o-mini",
@@ -120,9 +125,14 @@ export async function executeRun(
   const client = new ZerocacheClient({ baseUrl: BASE, trace });
   const task = flags.run === 3 ? RATE_LIMIT_TASK_PARAPHRASED : RATE_LIMIT_TASK;
 
-  const providers = ["openai", keys.anthropic ? "anthropic" : null, keys.gemini ? "gemini" : null].filter(
-    Boolean,
-  ) as string[];
+  const providers = [
+    ...new Set([
+      routeProviders.chat,
+      routeProviders.embed,
+      keys.anthropic ? "anthropic" : null,
+      keys.gemini ? "gemini" : null,
+    ]),
+  ].filter(Boolean) as string[];
   const coldTrace = join(TRACES, "run-cold.jsonl");
   const run1View =
     flags.run !== 1 && existsSync(coldTrace) ? summarize(coldTrace) : undefined;
@@ -145,6 +155,7 @@ export async function executeRun(
   const result = await orchestrate(task, {
     gateway: client,
     keys,
+    providers: routeProviders,
     models,
     workDir,
     trace,
@@ -168,12 +179,14 @@ export async function executeRun(
 async function main(): Promise<void> {
   const flags = parseFlags(process.argv.slice(2));
 
-  if (!process.env.OPENAI_API_KEY) {
+  if (!process.env.SHOWCASE_API_KEY && !process.env.OPENAI_API_KEY) {
     if (flags.check) {
       console.log("check skipped (no OPENAI_API_KEY)");
       process.exit(0);
     }
-    console.error("OPENAI_API_KEY is required (see .env.example).");
+    console.error(
+      "OPENAI_API_KEY (or SHOWCASE_API_KEY) is required (see .env.example).",
+    );
     process.exit(1);
   }
 

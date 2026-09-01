@@ -15,8 +15,10 @@ async function semanticEnabled(): Promise<boolean> {
 }
 
 async function main(): Promise<void> {
-  if (!process.env.OPENAI_API_KEY) {
-    console.error("OPENAI_API_KEY is required (see .env.example).");
+  if (!process.env.SHOWCASE_API_KEY && !process.env.OPENAI_API_KEY) {
+    console.error(
+      "OPENAI_API_KEY (or SHOWCASE_API_KEY) is required (see .env.example).",
+    );
     process.exit(1);
   }
   try {
