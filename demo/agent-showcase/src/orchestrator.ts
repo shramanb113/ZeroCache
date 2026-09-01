@@ -1,0 +1,440 @@
+import { readdirSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { join, dirname, relative, sep } from "node:path";
+import type { Trace } from "./trace.ts";
+import type { Ledger } from "./ledger.ts";
+import type { ZcResult } from "./zerocache.ts";
+import { VectorIndex, chunkFile, type Chunk } from "./rag.ts";
+import { applyUnifiedDiff, DiffApplyError } from "./diffapply.ts";
+import { runNodeTests } from "./verify.ts";
+import {
+  architectPlanBody,
+  repoBriefBody,
+  coderBody,
+  reviewerMessagesBody,
+  fixerBody,
+  type Task,
+} from "./agents.ts";
+
+export interface LlmGateway {
+  chat(
+    provider: string,
+    apiKey: string,
+    body: object,
+    meta: { stage: string; coalesced?: boolean },
+  ): Promise<ZcResult<Record<string, unknown>>>;
+  messagesStream(
+    provider: string,
+    apiKey: string,
+    body: object,
+    onDelta: (text: string) => void,
+    meta: { stage: string },
+  ): Promise<ZcResult<{ text: string; raw: unknown }>>;
+  embed(
+    provider: string,
+    apiKey: string,
+    model: string,
+    input: string[],
+    meta: { stage: string },
+  ): Promise<ZcResult<number[][]>>;
+  embedImages(
+    provider: string,
+    apiKey: string,
+    model: string,
+    dataUris: string[],
+    meta: { stage: string },
+  ): Promise<ZcResult<number[][]>>;
+}
+
+export interface OrchestratorDeps {
+  gateway: LlmGateway;
+  keys: { openai: string; anthropic?: string; gemini?: string };
+  models: { chat: string; review: string; embed: string; image: string };
+  workDir: string;
+  trace: Trace;
+  ledger: Ledger;
+  onFrame: (streamText?: string) => void;
+  run: 1 | 2 | 3;
+}
+
+export interface StageOutcome {
+  name: string;
+  status: "done" | "hit" | "failed";
+  detail: string;
+}
+
+export interface OrchestratorResult {
+  testPass: boolean;
+  testsPassed: number;
+  testsFailed: number;
+  stages: StageOutcome[];
+  workDir: string;
+  reviewText: string;
+  degraded: string[];
+}
+
+const SOURCE_EXT = [".ts", ".md"];
+
+function walkSources(root: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(root, { recursive: true, withFileTypes: true })) {
+    if (!entry.isFile()) continue;
+    const dir = (entry as unknown as { parentPath?: string; path?: string }).parentPath ??
+      (entry as unknown as { path: string }).path;
+    const full = join(dir, entry.name);
+    const rel = relative(root, full).split(sep).join("/");
+    if (rel.startsWith("node_modules/")) continue;
+    if (!SOURCE_EXT.some((e) => rel.endsWith(e))) continue;
+    out.push(rel);
+  }
+  return out.sort();
+}
+
+function stripFences(s: string): string {
+  const m = /^```(?:diff|ts|typescript)?\n([\s\S]*?)\n```$/m.exec(s.trim());
+  return (m?.[1] ?? s).trim();
+}
+
+function looksLikeDiff(s: string): boolean {
+  return s.includes("@@") || s.startsWith("--- ") || s.startsWith("diff --git");
+}
+
+/** Apply a coder/fixer response to a file's current content, tolerantly. */
+function applyCoderOutput(current: string, raw: string): string {
+  const cleaned = stripFences(raw);
+  if (looksLikeDiff(cleaned)) {
+    try {
+      return applyUnifiedDiff(current, cleaned);
+    } catch (e) {
+      if (current === "") {
+        const added = cleaned
+          .split("\n")
+          .filter((l) => l.startsWith("+") && !l.startsWith("+++"))
+          .map((l) => l.slice(1))
+          .join("\n");
+        if (added.trim().length > 0) return added + "\n";
+      }
+      throw e;
+    }
+  }
+  // The model returned a full file body instead of a diff.
+  if (/\b(export|import|function|const|class)\b/.test(cleaned)) {
+    return cleaned.endsWith("\n") ? cleaned : cleaned + "\n";
+  }
+  throw new DiffApplyError("response was neither a diff nor a file body", "");
+}
+
+function readFileOrEmpty(root: string, rel: string): string {
+  const full = join(root, rel);
+  return existsSync(full) ? readFileSync(full, "utf8") : "";
+}
+
+function writeFileRel(root: string, rel: string, content: string): void {
+  const full = join(root, rel);
+  mkdirSync(dirname(full), { recursive: true });
+  writeFileSync(full, content);
+}
+
+export async function orchestrate(
+  task: Task,
+  deps: OrchestratorDeps,
+): Promise<OrchestratorResult> {
+  const { gateway, keys, models, workDir, ledger, onFrame } = deps;
+  const stages: StageOutcome[] = [];
+  const degraded: string[] = [];
+  const record = (r: ZcResult<unknown>) =>
+    ledger.addEvent({
+      billedPromptTokens: 0,
+      billedCompletionTokens: 0,
+      usd: 0,
+      hit: r.hit,
+      coalesced: false,
+    });
+
+  // ---- Stage 1: retrieve ------------------------------------------------
+  const files = walkSources(workDir);
+  const chunks: Chunk[] = [];
+  for (const rel of files) {
+    const text = readFileSync(join(workDir, rel), "utf8");
+    chunks.push(...chunkFile(rel, text));
+  }
+  const embedRes = await gateway.embed(
+    "openai",
+    keys.openai,
+    models.embed,
+    chunks.map((c) => c.text),
+    { stage: "retrieve" },
+  );
+  record(embedRes);
+  const index = new VectorIndex();
+  index.add(chunks, embedRes.data);
+
+  let sawImage = false;
+  if (keys.gemini && existsSync(join(workDir, "docs/architecture.png"))) {
+    try {
+      const b64 = readFileSync(join(workDir, "docs/architecture.png")).toString(
+        "base64",
+      );
+      const imgRes = await gateway.embedImages(
+        "gemini",
+        keys.gemini,
+        models.image,
+        [`data:image/png;base64,${b64}`],
+        { stage: "retrieve" },
+      );
+      record(imgRes);
+      sawImage = true;
+    } catch {
+      degraded.push("image step skipped");
+    }
+  } else if (!keys.gemini) {
+    degraded.push("image step skipped (no GEMINI_API_KEY)");
+  }
+
+  const queryRes = await gateway.embed(
+    "openai",
+    keys.openai,
+    models.embed,
+    [`${task.title}\n${task.brief}`],
+    { stage: "retrieve" },
+  );
+  record(queryRes);
+  const top = index.query(queryRes.data[0] ?? [], 8);
+  const allHit = embedRes.hit && queryRes.hit;
+  stages.push({
+    name: "RETRIEVE",
+    status: allHit ? "hit" : "done",
+    detail: `${index.size} chunks · ${sawImage ? "arch.png" : "no image"}`,
+  });
+  onFrame();
+
+  // ---- Stage 2: plan --------------------------------------------------
+  const planRes = await gateway.chat(
+    "openai",
+    keys.openai,
+    architectPlanBody(models.chat, task, top.map((t) => t.chunk)),
+    { stage: "plan" },
+  );
+  record(planRes);
+  const plan =
+    ((planRes.data.choices as { message: { content: string } }[] | undefined)?.[0]
+      ?.message.content) ?? "(no plan)";
+  stages.push({
+    name: "PLAN",
+    status: planRes.hit ? "hit" : "done",
+    detail: planRes.hit ? "exact · 0 ms billed" : `${planRes.latencyMs} ms`,
+  });
+  onFrame();
+
+  // ---- Stage 3: brief (3 concurrent identical calls -> coalesced) -----
+  const conventionsText = top
+    .slice(0, 3)
+    .map((t) => `// ${t.chunk.path}\n${t.chunk.text}`)
+    .join("\n\n");
+  const briefResults = await Promise.all(
+    [0, 1, 2].map((i) =>
+      gateway.chat(
+        "openai",
+        keys.openai,
+        repoBriefBody(models.chat, conventionsText),
+        { stage: "brief", coalesced: i !== 0 },
+      ),
+    ),
+  );
+  briefResults.forEach(record);
+  const briefHits = briefResults.filter((r) => r.hit).length;
+  stages.push({
+    name: "BRIEF",
+    status: briefHits === 3 ? "hit" : "done",
+    detail:
+      briefHits === 3
+        ? "3 workers · all cached"
+        : "3 workers → 1 upstream call (coalesced)",
+  });
+  onFrame();
+
+  // ---- Stage 4: implement (parallel workers, one file each) ----------
+  let implemented = 0;
+  const failedFiles: string[] = [];
+  await Promise.all(
+    task.targetFiles.map(async (rel) => {
+      const current = readFileOrEmpty(workDir, rel);
+      let attempt = 0;
+      let lastErr = "";
+      while (attempt < 2) {
+        attempt++;
+        const body = coderBody(
+          models.chat,
+          task,
+          rel,
+          current,
+          attempt === 1 ? plan : `${plan}\n\nPREVIOUS ATTEMPT FAILED: ${lastErr}`,
+        );
+        const res = await gateway.chat("openai", keys.openai, body, {
+          stage: "implement",
+        });
+        record(res);
+        const diff =
+          ((res.data.choices as { message: { content: string } }[] | undefined)?.[0]
+            ?.message.content) ?? "";
+        try {
+          writeFileRel(workDir, rel, applyCoderOutput(current, diff));
+          implemented++;
+          return;
+        } catch (e) {
+          lastErr = (e as Error).message;
+        }
+      }
+      failedFiles.push(rel);
+    }),
+  );
+  stages.push({
+    name: "IMPLEMENT",
+    status: failedFiles.length === 0 ? "done" : "failed",
+    detail:
+      failedFiles.length === 0
+        ? `${implemented}/${task.targetFiles.length} files`
+        : `failed: ${failedFiles.join(", ")}`,
+  });
+  onFrame();
+
+  // ---- Stage 5: review (Claude via /v1/messages, streaming) ---------
+  const currentDiffs = task.targetFiles.map((rel) => ({
+    path: rel,
+    unifiedDiff: readFileOrEmpty(workDir, rel).slice(0, 4000),
+  }));
+  let reviewText = "";
+  if (keys.anthropic) {
+    const rev = await gateway.messagesStream(
+      "anthropic",
+      keys.anthropic,
+      reviewerMessagesBody(models.review, task, currentDiffs),
+      (t) => {
+        reviewText += t;
+        onFrame(t);
+      },
+      { stage: "review" },
+    );
+    record(rev);
+    reviewText = rev.data.text || reviewText;
+    stages.push({
+      name: "REVIEW",
+      status: rev.hit ? "hit" : "done",
+      detail: rev.hit ? "replayed from cache" : `${rev.latencyMs} ms streamed`,
+    });
+  } else {
+    degraded.push("anthropic→openai");
+    const reviewPrompt =
+      (
+        reviewerMessagesBody(models.chat, task, currentDiffs) as {
+          messages: { content: string }[];
+        }
+      ).messages[0]?.content ?? "Review this change.";
+    const rev = await gateway.chat(
+      "openai",
+      keys.openai,
+      {
+        model: models.chat,
+        temperature: 0,
+        messages: [{ role: "user", content: reviewPrompt }],
+      },
+      { stage: "review" },
+    );
+    record(rev);
+    reviewText =
+      ((rev.data.choices as { message: { content: string } }[] | undefined)?.[0]
+        ?.message.content) ?? "APPROVED";
+    deps.trace.add({
+      stage: "review",
+      type: "note",
+      provider: "openai",
+      model: models.chat,
+      surface: null,
+      hit: false,
+      hitKind: null,
+      semanticScore: null,
+      promptTokens: 0,
+      completionTokens: 0,
+      billedPromptTokens: 0,
+      billedCompletionTokens: 0,
+      latencyMs: 0,
+      usd: 0,
+      coalesced: false,
+      note: "degraded: anthropic->openai",
+    });
+    stages.push({
+      name: "REVIEW",
+      status: rev.hit ? "hit" : "done",
+      detail: "openai fallback",
+    });
+  }
+  onFrame();
+
+  // ---- Stage 6: fix -------------------------------------------------
+  const approved = /^\s*APPROVED\s*$/im.test(reviewText.trim());
+  if (!approved && failedFiles.length < task.targetFiles.length) {
+    for (const rel of task.targetFiles) {
+      const current = readFileOrEmpty(workDir, rel);
+      if (current === "") continue;
+      const res = await gateway.chat(
+        "openai",
+        keys.openai,
+        fixerBody(models.chat, task, rel, current, reviewText),
+        { stage: "fix" },
+      );
+      record(res);
+      const diff =
+        ((res.data.choices as { message: { content: string } }[] | undefined)?.[0]
+          ?.message.content) ?? "";
+      try {
+        writeFileRel(workDir, rel, applyCoderOutput(current, diff));
+      } catch {
+        /* keep the pre-fix version */
+      }
+    }
+    stages.push({ name: "FIX", status: "done", detail: "review applied" });
+  } else {
+    stages.push({
+      name: "FIX",
+      status: "done",
+      detail: approved ? "approved, no changes" : "skipped",
+    });
+  }
+  onFrame();
+
+  // ---- Stage 7: verify -------------------------------------------
+  const tests = await runNodeTests(workDir);
+  stages.push({
+    name: "VERIFY",
+    status: tests.ok ? "done" : "failed",
+    detail: `${tests.passed} passed, ${tests.failed} failed`,
+  });
+  deps.trace.add({
+    stage: "verify",
+    type: "test",
+    provider: "",
+    model: "",
+    surface: null,
+    hit: false,
+    hitKind: null,
+    semanticScore: null,
+    promptTokens: 0,
+    completionTokens: 0,
+    billedPromptTokens: 0,
+    billedCompletionTokens: 0,
+    latencyMs: 0,
+    usd: 0,
+    coalesced: false,
+    note: `tests ${tests.passed}/${tests.passed + tests.failed}`,
+  });
+  onFrame();
+
+  return {
+    testPass: tests.ok,
+    testsPassed: tests.passed,
+    testsFailed: tests.failed,
+    stages,
+    workDir,
+    reviewText,
+    degraded,
+  };
+}
