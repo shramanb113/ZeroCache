@@ -9,22 +9,39 @@
 > **Runtime:** ~6:00 main cut. A 90-second cut is at the bottom, plus two
 > optional appendices (cross-replica coalescing; the tamper test).
 >
-> **Numbers:** every `⟦TOKEN⟧` below is filled from the committed trace files
-> (`traces/run-{cold,warm,semantic}.jsonl`) via `src/trace.ts` `compare()`.
-> Do not hand-type them. The table at the very bottom is the single source of
-> truth; fill it once, then find/replace the tokens in this script.
->
 > **Format:** each beat is `VOICEOVER` (what you say) + `ON SCREEN` (what the
 > viewer sees). Keep the terminal at ~110 cols, large font, dark theme. Colour
 > is on (`COLOR=1`, a real TTY).
 
 ---
 
+## BEFORE YOU RECORD — two things that must be true
+
+1. **The reviewer must call `/v1/messages` non-streaming.** Zerocache treats
+   `stream: true` on `/v1/messages` as an *uncached passthrough* (buffer-and-
+   replay for that surface is deferred — see `CLAUDE.md` deviations item 30). If
+   the reviewer streams, the REVIEW stage re-bills on every warm run and
+   `run --run=2 --check` fails. Send the reviewer request with `stream` omitted
+   / `false` so the completion is cached and replays for `$0` on run 2. The
+   OpenAI-wire chat surface *does* cache streaming, so if you want a visible
+   token-by-token effect on screen, put it on an OpenAI-wire model, not on
+   `/v1/messages`. This script assumes a **non-streaming** reviewer.
+
+2. **The numbers are filled from a real pass, not hand-typed.** Every
+   `⟦TOKEN⟧` below comes from `traces/run-{cold,warm,semantic}.jsonl`, which you
+   generate with `npm run -- run --record` (runs 1 → 2 → 3 and writes the
+   traces). `src/trace.ts` `compare()` prints them as the SAVINGS REPORT. Fill
+   the table at the very bottom once, then find/replace the tokens. Until you
+   have a recorded pass, the *shape* of every beat still holds: warm run =
+   **0 upstream calls · $0.00 · byte-identical tree**, guaranteed by `--check`.
+
+---
+
 ## Reference run (what to expect on screen)
 
-Measured on the reference pass — `gpt-4o-mini` coders/architect/fixer,
-`claude-sonnet-5` reviewer on native `/v1/messages`, `text-embedding-3-small`
-retrieval, OpenAI + Anthropic keys, image step off:
+Illustrative pass — `gpt-4o-mini` architect / coders / fixer,
+`claude-sonnet-5` reviewer on native `/v1/messages` (non-streaming),
+`text-embedding-3-small` retrieval, OpenAI + Anthropic keys, image step off:
 
 | | Run 1 (cold) | Run 2 (warm) | Run 3 (reworded) |
 | --- | --- | --- | --- |
@@ -38,10 +55,11 @@ retrieval, OpenAI + Anthropic keys, image step off:
 | coalesced calls | `⟦COALESCED⟧` | — | — |
 | `node --test` | `⟦COLD_TESTS⟧` passed | same, byte-identical | same |
 
-> An earlier pass run entirely through **Gemini** (`gemini-2.5-flash`) showed the
-> same *shape*: cold ≈ 13 upstream calls / ≈ 23k tokens / ≈ 24 s, warm = 0 / 0 /
-> ~0.2 s, byte-identical, `CHECK PASSED`. Use the OpenAI+Anthropic numbers above
-> for the video so the dollar figure is real.
+> A separate pass run entirely through **Gemini** (`gemini-2.5-flash`, reviewer
+> degraded to the OpenAI-wire path) showed the same *shape*: cold ≈ 13 upstream
+> calls / ≈ 23k tokens / ≈ 24 s, warm = 0 / 0 / ~0.2 s, byte-identical,
+> `CHECK PASSED`. Use an OpenAI + Anthropic pass for the video so the dollar
+> figure is real.
 
 ---
 
@@ -55,7 +73,7 @@ request, write the code across four files, have Claude review it, fix what
 Claude flags, and run the tests — for real, with real API calls. Watch."
 
 **ON SCREEN:**
-- Black screen, one line of text fades in: **"Run it once. Every run after that is free."**
+- Black screen, one line fades in: **"Run it once. Every run after that is free."**
 - Cut straight to the terminal. `npm run -- run --run=1` already typed. Hit enter.
 - The board renders: header (`ZEROCACHE · agent showcase`, `run 1 of 3 · cold ·
   providers: openai · anthropic`), seven stage rows all `·` pending.
@@ -92,12 +110,12 @@ again. Today, you are."
 "You'd think this is solved. It isn't.
 
 Provider-side prompt caching — OpenAI's automatic discount, Anthropic's
-cache_control — only discounts the *input* tokens. The request still runs, you
+`cache_control` — only discounts the *input* tokens. The request still runs, you
 still pay for every output token, and it evicts in five to sixty minutes. It
 does nothing for a run you do tomorrow.
 
-Framework caches — LangChain's, LlamaIndex's — live inside one Python process,
-match only byte-identical strings, and die when the process dies.
+Framework caches — LangChain's, LlamaIndex's — live inside one process, match
+only byte-identical strings, and die when the process dies.
 
 And the hosted semantic-cache products mean your prompts and your completions
 leave your infrastructure and land in someone else's database. For most of the
@@ -121,16 +139,17 @@ one-line change and no SDK."
 ### 1:45 — What Zerocache is
 
 **VOICEOVER:**
-"Zerocache is a caching proxy written in Rust. It ships as one 15-megabyte
-static binary — no runtime, no libc, nothing. You point your existing OpenAI or
-Anthropic client at it by changing the base URL. That's the entire integration.
+"Zerocache is a caching proxy written in Rust. It ships as one static binary —
+about fourteen megabytes, `FROM scratch`, no runtime, no libc, no CA bundle.
+You point your existing OpenAI or Anthropic client at it by changing the base
+URL. That's the entire integration.
 
 Every request carries your own provider key — Zerocache never holds a
 credential, it just hashes the key so one caller's cache is never another
-caller's. It caches chat completions, Anthropic messages, and embeddings; it
-handles streaming; and with one flag it also matches requests that mean the
-same thing but aren't worded identically. All of that is what this demo
-exercises."
+caller's. It caches chat completions, Anthropic messages, and embeddings; on
+the OpenAI-wire chat surface it also handles streaming; and with one flag it
+matches requests that mean the same thing but aren't worded identically. All of
+that is what this demo exercises."
 
 **ON SCREEN:**
 - One diagram: `your agent ──base_url──▶ Zerocache ──BYOK──▶ OpenAI / Anthropic / Gemini`
@@ -157,8 +176,7 @@ IMPLEMENT — the coders write `rateLimit.ts`, wire it into the routes, add the
 config knob, write the tests. Four files.
 
 REVIEW — this goes to Claude, on its *native* messages API, not an OpenAI-shaped
-shim — and it's streamed. You're watching the review token-by-token as it
-arrives.
+shim. The review comes back and gets stored.
 
 FIX — the fixer takes Claude's feedback and rewrites the files it flagged.
 
@@ -167,8 +185,8 @@ VERIFY — `node --test`, in the work tree, for real."
 **ON SCREEN:**
 - Each stage flips `·` → `●` → `✓` as narrated. On BRIEF, the detail reads
   **`3 workers → 1 upstream call (coalesced)`** — pause on it.
-- On REVIEW, the streaming review text scrolls in the lower panel. Let a couple
-  of real sentences land.
+- On REVIEW, the review text lands in the lower panel. Let a couple of real
+  sentences show.
 - On VERIFY: **`⟦COLD_TESTS⟧ passed, 0 failed`** in green.
 - LEDGER panel settles: `upstream calls ⟦COLD_CALLS⟧ · prompt tokens
   ⟦COLD_PROMPT_TOK⟧ · completion ⟦COLD_COMPL_TOK⟧ · wall ⟦COLD_WALL⟧ · est. cost
@@ -190,7 +208,7 @@ markers."
 - Type `npm run -- run --run=2`. Enter.
 - Every stage resolves to **`⚡`** almost instantly. Details read `exact · 0 ms
   billed`, `replayed from cache`. BRIEF reads `3 workers · all cached`.
-- The REVIEW panel replays the *same* Claude review as a stream — visibly fast.
+- The REVIEW panel shows the *same* Claude review, printed instantly.
 - VERIFY: **`⟦COLD_TESTS⟧ passed, 0 failed`** — same numbers.
 - Then the CHECK line: **`CHECK PASSED: warm run was all hits and byte-identical.`**
 - SAVINGS REPORT table renders: `upstream calls ⟦COLD_CALLS⟧ → 0`, `est. cost
@@ -200,7 +218,7 @@ markers."
 "Zero upstream calls. Zero dollars. `⟦WARM_WALL⟧` instead of `⟦COLD_WALL⟧`. And
 the working tree it produced is byte-for-byte identical to run one — the
 `--check` flag asserts that and fails the run if it's off by a character.
-Including the streamed Claude review, which replayed from cache as a stream.
+Including Claude's review, served straight from the store.
 
 This is what 'the second run is free' actually means. Your CI eval loop, your
 prompt-tuning iteration, your re-run after a flaky test — the repeat is
@@ -233,7 +251,10 @@ by a small embedding model running *inside* Zerocache. No extra API call, no
 second key, and not one byte of your prompt leaves the box. It's gated by a
 deliberately conservative threshold, so it errs toward a miss — toward doing
 the real call — rather than toward a confident wrong answer. And a matched
-completion is still a real, previously-served completion, never a paraphrase."
+completion is still a real, previously-served completion, never a paraphrase.
+
+This tier is opt-in — a `--features semantic` build and one environment
+variable. The exact-match cache in runs one and two is the default."
 
 ---
 
@@ -294,9 +315,10 @@ iteration, multi-agent fan-out, retries. Provider prompt caching only discounts
 input tokens and expires in minutes. Framework caches die with the process.
 Hosted ones take your prompts off your infra." *(4-row table)*
 
-**0:30** — "Zerocache: a Rust proxy, one static binary, one base-URL change.
-Run one, cold — `⟦COLD_CALLS⟧` calls, `⟦COLD_USD⟧`, `⟦COLD_WALL⟧`, tests green.
-Note BRIEF: three concurrent identical calls collapsed to one." *(ledger)*
+**0:30** — "Zerocache: a Rust proxy, one ~14 MB static binary, one base-URL
+change. Run one, cold — `⟦COLD_CALLS⟧` calls, `⟦COLD_USD⟧`, `⟦COLD_WALL⟧`,
+tests green. Note BRIEF: three concurrent identical calls collapsed to one."
+*(ledger)*
 
 **0:52** — "Run two, same task: every stage a cache hit, byte-identical output,
 `$0.00`, `⟦WARM_WALL⟧`. The `--check` flag fails the run if it's off by a
@@ -317,13 +339,15 @@ provable. Rust, open, link below."
    unbroken session so the cache state is honest.
 2. Before recording run 2, do **not** clear the store. Before run 3, restart on
    `--features semantic` with `ZEROCACHE_SEMANTIC=1` (mention this cut or hide it).
-3. **Grab stills** of: the BRIEF `3 → 1 coalesced` line; the streaming REVIEW
-   panel mid-stream; the `CHECK PASSED` line; the SAVINGS REPORT.
-4. **Browser**: `/dashboard` with real traffic already through it; one live
+3. Confirm the reviewer is **non-streaming** (see "Before you record") — otherwise
+   run 2's REVIEW stage shows a real call and `--check` fails on screen.
+4. **Grab stills** of: the BRIEF `3 → 1 coalesced` line; the REVIEW panel with
+   real review text; the `CHECK PASSED` line; the SAVINGS REPORT.
+5. **Browser**: `/dashboard` with real traffic already through it; one live
    price edit.
-5. **Side-by-side briefs** (run 1 vs run 3) as a static graphic — pull the exact
+6. **Side-by-side briefs** (run 1 vs run 3) as a static graphic — pull the exact
    strings from `src/agents.ts` (`RATE_LIMIT_TASK.brief` / `RATE_LIMIT_TASK_PARAPHRASED.brief`).
-6. Optional B-roll: `ls -la target/release/zerocache-http` showing the ~15 MB
+7. Optional B-roll: `ls -la target/release/zerocache-http` showing the ~14.7 MB
    size; `docker images` showing the `FROM scratch` image.
 
 ---
