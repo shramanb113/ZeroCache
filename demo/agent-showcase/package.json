@@ -1,0 +1,24 @@
+{
+  "name": "zerocache-agent-showcase",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test --import tsx \"test/**/*.test.ts\"",
+    "run": "tsx run.ts",
+    "warm": "tsx warm.ts",
+    "check": "tsx run.ts --run=2 --check",
+    "render:demo": "tsx src/render.ts --demo"
+  },
+  "dependencies": {
+    "diff": "^7.0.0",
+    "dotenv": "^16.4.5",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/diff": "^7.0.0",
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}
