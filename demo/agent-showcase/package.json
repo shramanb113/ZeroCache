@@ -5,6 +5,7 @@
   "engines": { "node": ">=22" },
   "scripts": {
     "test": "node --test --import tsx \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
     "run": "tsx run.ts",
     "warm": "tsx warm.ts",
     "check": "tsx run.ts --run=2 --check",
