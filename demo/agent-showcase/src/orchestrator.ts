@@ -255,6 +255,10 @@ export async function orchestrate(
   onFrame(stages);
 
   // ---- Stage 4: implement (parallel workers, one file each) ----------
+  const repoSnapshot = task.targetFiles.map((rel) => ({
+    path: rel,
+    content: readFileOrEmpty(workDir, rel),
+  }));
   let implemented = 0;
   const failedFiles: string[] = [];
   await Promise.all(
@@ -270,6 +274,7 @@ export async function orchestrate(
           rel,
           current,
           attempt === 1 ? plan : `${plan}\n\nPREVIOUS ATTEMPT FAILED: ${lastErr}`,
+          repoSnapshot,
         );
         const res = await gateway.chat(providers.chat, keys.openai, body, {
           stage: "implement",
@@ -372,15 +377,19 @@ export async function orchestrate(
   onFrame(stages);
 
   // ---- Stage 6: fix -------------------------------------------------
-  const approved = /^\s*APPROVED\s*$/im.test(reviewText.trim());
-  if (!approved && failedFiles.length < task.targetFiles.length) {
+  const approved =
+    /^\s*APPROVED\s*$/im.test(reviewText.trim()) && failedFiles.length === 0;
+  if (!approved) {
+    const fixSnapshot = task.targetFiles.map((rel) => ({
+      path: rel,
+      content: readFileOrEmpty(workDir, rel),
+    }));
     for (const rel of task.targetFiles) {
       const current = readFileOrEmpty(workDir, rel);
-      if (current === "") continue;
       const res = await gateway.chat(
         providers.chat,
         keys.openai,
-        fixerBody(models.chat, task, rel, current, reviewText),
+        fixerBody(models.chat, task, rel, current, reviewText, fixSnapshot),
         { stage: "fix" },
       );
       record(res);
@@ -388,7 +397,8 @@ export async function orchestrate(
         ((res.data.choices as { message: { content: string } }[] | undefined)?.[0]
           ?.message.content) ?? "";
       try {
-        writeFileRel(workDir, rel, applyCoderOutput(current, diff));
+        const next = applyCoderOutput(current, diff);
+        if (next.trim().length > 0) writeFileRel(workDir, rel, next);
       } catch {
         /* keep the pre-fix version */
       }

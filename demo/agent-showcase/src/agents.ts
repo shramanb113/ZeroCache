@@ -33,15 +33,39 @@ export const RATE_LIMIT_TASK_PARAPHRASED: Task = {
   targetFiles: TARGET_FILES,
 };
 
-const DIFF_ONLY_SYSTEM =
-  "You are a senior TypeScript engineer. Return ONLY a unified diff " +
-  "(--- / +++ / @@ hunks). No prose, no fences, no explanation.";
+const CODER_SYSTEM =
+  "You are a senior TypeScript engineer. You will be assigned exactly ONE " +
+  "file. Reply with the COMPLETE new contents of that file and nothing else " +
+  "— no prose, no markdown fences, no diff. Hard rules for this repo: every " +
+  "relative import MUST end in an explicit `.ts` extension (the repo runs " +
+  "`node --experimental-strip-types`); no external dependencies (Node built-ins " +
+  "only); the result must pass `node --experimental-strip-types --test`. Keep " +
+  "field and function names consistent with the other files shown to you.";
 
 function contextBlock(context: Chunk[]): string {
   if (context.length === 0) return "(no repository context retrieved)";
   return context
     .map((c) => `// ${c.path}\n${c.text}`)
     .join("\n\n---\n\n");
+}
+
+export interface RepoFile {
+  path: string;
+  content: string;
+}
+
+function repoSnapshotBlock(files: RepoFile[]): string {
+  if (files.length === 0) return "";
+  return (
+    "\nCURRENT CONTENTS OF THE FILES IN SCOPE (keep names consistent):\n" +
+    files
+      .map(
+        (f) =>
+          `--- ${f.path} ---\n${f.content.trim() || "(does not exist yet — create it)"}`,
+      )
+      .join("\n\n") +
+    "\n"
+  );
 }
 
 export function architectPlanBody(
@@ -92,24 +116,24 @@ export function coderBody(
   file: string,
   currentContent: string,
   plan: string,
+  repoSnapshot: RepoFile[] = [],
 ): object {
   return {
     model,
     temperature: 0,
     messages: [
-      { role: "system", content: DIFF_ONLY_SYSTEM },
+      { role: "system", content: CODER_SYSTEM },
       {
         role: "user",
         content:
           `TASK: ${task.title}\n${task.brief}\n\n` +
-          `PLAN:\n${plan}\n\n` +
-          `You are editing exactly one file: ${file}\n` +
-          `Its current content (empty means create it):\n` +
-          "```\n" +
-          currentContent +
-          "\n```\n\n" +
-          `Return a unified diff for ${file} only. Use \`--- a/${file}\` / ` +
-          `\`+++ b/${file}\` headers and correct @@ line numbers.`,
+          `PLAN:\n${plan}\n` +
+          repoSnapshotBlock(repoSnapshot) +
+          `\nYou are assigned exactly one file: ${file}\n` +
+          (currentContent.trim()
+            ? `Its current content:\n${currentContent}\n`
+            : `It does not exist yet — create it.\n`) +
+          `\nReply with the complete new contents of ${file}. Nothing else.`,
       },
     ],
   };
@@ -148,23 +172,22 @@ export function fixerBody(
   file: string,
   currentContent: string,
   review: string,
+  repoSnapshot: RepoFile[] = [],
 ): object {
   return {
     model,
     temperature: 0,
     messages: [
-      { role: "system", content: DIFF_ONLY_SYSTEM },
+      { role: "system", content: CODER_SYSTEM },
       {
         role: "user",
         content:
           `TASK: ${task.title}\n${task.brief}\n\n` +
-          `REVIEW FEEDBACK:\n${review}\n\n` +
-          `You are editing exactly one file: ${file}\n` +
-          `Its current content:\n` +
-          "```\n" +
-          currentContent +
-          "\n```\n\n" +
-          `Return a unified diff for ${file} only that addresses the feedback.`,
+          `REVIEW FEEDBACK:\n${review}\n` +
+          repoSnapshotBlock(repoSnapshot) +
+          `\nYou are assigned exactly one file: ${file}\n` +
+          `Its current content:\n${currentContent}\n\n` +
+          `Reply with the complete corrected contents of ${file}. Nothing else.`,
       },
     ],
   };
