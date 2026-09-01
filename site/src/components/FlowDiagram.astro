@@ -28,6 +28,9 @@
     <line x1="132" y1="87" x2="243" y2="87" class="flow__line flow__line--always" marker-end="url(#flow-arrow)" />
     <line x1="387" y1="87" x2="468" y2="87" class="flow__line flow__line--conditional" marker-end="url(#flow-arrow)" />
 
+    <text x="187" y="76" text-anchor="middle" class="flow__timing flow__timing--fast">≈1 ms</text>
+    <text x="427" y="76" text-anchor="middle" class="flow__timing flow__timing--slow">200 ms – 20 s</text>
+
     <g filter="url(#flow-glow)">
       <rect x="245" y="52" width="140" height="70" rx="12" class="flow__node-bg flow__node-bg--focus" />
     </g>
@@ -127,6 +130,20 @@
     font-size: 0.85rem;
     color: var(--muted);
     margin: 0;
+  }
+  .flow__timing {
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+  .flow__timing--fast {
+    fill: var(--hit);
+  }
+  .flow__timing--slow {
+    fill: var(--miss);
+    transition: opacity var(--duration-fast, 150ms) ease;
+  }
+  .flow[data-state="hit"] .flow__timing--slow {
+    opacity: 0.15;
   }
 </style>
 
