@@ -7,15 +7,15 @@ const layers = [
   { name: "Application", role: "Orchestrates end-to-end cache flow via ports", ioAware: false },
   { name: "Ports", role: "Trait contracts for storage, provider, wire-shape access", ioAware: false },
   { name: "Adapters", role: "Concrete implementations of ports", ioAware: true },
-  { name: "Core (domain)", role: "Cache key derivation, hit/miss reconciliation", ioAware: false },
+  { name: "Core (domain)", role: "Cache key derivation, hit/miss reconciliation, request canonicalization, determinism gates", ioAware: false },
 ];
 
 const crates = [
-  ["zerocache-core", "Domain: CacheKey, owner_id derivation, reconciliation — no dependencies"],
-  ["zerocache-ports", "Trait definitions (incl. StoreError/ProviderError/ProviderUsage)"],
-  ["zerocache-adapters-sled", "EmbeddingStore impl, embedded/single-instance"],
-  ["zerocache-adapters-redis", "EmbeddingStore impl, shared/multi-instance"],
-  ["zerocache-adapters-openai", "EmbeddingProvider impl (OpenAI)"],
+  ["zerocache-core", "Domain: CacheKey, owner_id derivation, reconciliation, request canonicalization, the completion/messages determinism gates — no dependencies"],
+  ["zerocache-ports", "Trait definitions: EmbeddingStore, EmbeddingProvider, ImageEmbeddingProvider, CompletionStore, ChatCompletionProvider, StreamingChatCompletionProvider, MessagesProvider, CoalescingCoordinator, CompletionVectorStore"],
+  ["zerocache-adapters-sled", "EmbeddingStore + CompletionStore + CompletionVectorStore impl, embedded/single-instance"],
+  ["zerocache-adapters-redis", "Same store traits, shared/multi-instance; RedisCoordinator (cross-replica single-flight) and the semantic-index Redis Stream change-feed"],
+  ["zerocache-adapters-openai", "EmbeddingProvider (OpenAI) + OpenAiWireChatProvider — the generic OpenAI-wire chat proxy behind all 9 chat providers, streaming included"],
   ["zerocache-adapters-mistral", "EmbeddingProvider impl (Mistral)"],
   ["zerocache-adapters-gemini", "EmbeddingProvider + ImageEmbeddingProvider impl (Gemini)"],
   ["zerocache-adapters-huggingface", "EmbeddingProvider impl (HuggingFace)"],
@@ -23,18 +23,25 @@ const crates = [
   ["zerocache-adapters-azure", "EmbeddingProvider impl (Azure OpenAI + Foundry Models)"],
   ["zerocache-adapters-bedrock", "EmbeddingProvider impl (Amazon Bedrock: Titan, Cohere)"],
   ["zerocache-adapters-vertexai", "EmbeddingProvider impl (GCP Vertex AI :predict)"],
-  ["zerocache-http", "axum transport, wire-shape translation, provider registry, application wiring"],
+  ["zerocache-adapters-anthropic", "MessagesProvider impl — Claude's native /v1/messages wire shape"],
+  ["zerocache-semantic", "Opt-in semantic near-match tier (candle + bundled all-MiniLM-L6-v2). Not a --workspace member; pulled in only by zerocache-http --features semantic"],
+  ["zerocache-http", "axum transport, wire-shape translation, provider registry, application wiring, the embedded dashboard"],
 ];
 
 const principles = [
-  ["Content-addressed keys", "CacheKey = blake3(owner_id + provider + cache_scope + model + model_version + text). Model identity is included deliberately, so a model/version upgrade can't silently return a stale-but-plausible vector."],
+  ["Content-addressed keys", "Embeddings: blake3(owner_id + provider + cache_scope + model + model_version + canonicalize_text(text)). Chat/messages: owner_id + provider + cache_scope + model + adapter_version + canonicalized request body, domain-separated per surface. Model identity is in the key deliberately, so a model or adapter upgrade can't silently return a stale-but-plausible response."],
   ["Owner-scoped, not globally shared", "Two callers embedding identical text under the same model and same forwarded key share a hit for free; two different callers never do — cost fairness and to avoid a cache-timing existence-leak risk."],
   ["Cache scope", "A hash-derived scope component so a self-hosted or region-specific upstream can never silently reuse a vector computed by a different upstream behind the same model string."],
-  ["In-process request coalescing", "Concurrent misses on the exact same key share one provider call instead of each paying for it independently — proven with 5 concurrent misses producing exactly 1 real provider call. In-process only, today: two replicas behind a load balancer each keep their own independent in-flight map, so the same miss can still be fetched once per replica."],
+  ["In-process request coalescing", "Concurrent misses on the exact same key share one provider call instead of each paying for it independently — proven with 5 concurrent misses producing exactly 1 real provider call. Covers embeddings, images, and completions."],
+  ["Cross-replica request coalescing (opt-in)", "ZEROCACHE_CROSS_REPLICA_COALESCING=1 on the redis backend adds a Redis-lock single-flight so N replicas make one upstream call for the same single-key miss (any chat completion, or a one-input embedding). Multi-item batches and images stay in-process only. Any Redis error degrades to today's per-replica behaviour, never a failed request."],
+  ["Completion & messages cache", "POST /{provider}/v1/chat/completions and /v1/messages cache whole responses keyed by a canonicalized request body (an order-independent serialization with a denylist of non-output-affecting fields). Only deterministic requests — temperature 0 (or a seed, for chat). A hit is 100% off input and output. Streaming works on the chat surface: buffered on a miss, replayed frame-by-frame on a hit."],
+  ["Semantic near-match tier (opt-in)", "A --features semantic build plus ZEROCACHE_SEMANTIC=1 adds a local candle embedder (all-MiniLM-L6-v2, compiled in) + an in-memory HNSW index. On an exact-match miss, a hit needs both a coarse-key byte match of the rest of the request and cosine similarity above a conservative threshold. The threshold, not the embedder, bounds false positives. sled in-process, or across replicas on redis via a Redis Stream change-feed with a blocking (XREAD BLOCK) reader."],
 ];
 
 const roadmap = [
-  ["Cross-replica request coalescing", "Coalescing today only dedupes concurrent misses within one Zerocache process. Two replicas behind a load balancer each fetch the same miss independently. Closing this needs a distributed coordination mechanism — a Redis-backed lock is the leading candidate, since zerocache-adapters-redis is already the multi-replica storage backend. Planned, not yet built."],
+  ["Budgets & rate limits", "Per-key monthly spend caps (429 when exceeded) and per-key RPS limits, with a cost-by-team view in the dashboard."],
+  ["Multi-provider failover", "Retry a failed request on a second configured provider. The adapters already exist; only the routing policy is missing."],
+  ["Anthropic /v1/messages streaming & semantic tier", "The OpenAI-wire chat surface has streaming buffer-and-replay and the semantic near-match tier; the /v1/messages surface has neither yet."],
 ];
 ---
 

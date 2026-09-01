@@ -26,6 +26,33 @@ Authorization: Bearer <caller's real provider API key>
 
 → { "deleted": 2 }`;
 
+const chatRequest = `POST /{provider}/v1/chat/completions
+Authorization: Bearer <caller's own key for that provider>
+
+{ "model": "...", "messages": [...], "temperature": 0 }   # OpenAI chat shape, forwarded verbatim on a miss
+
+→ the upstream response body, unchanged      # 200 on a cache hit, ~1 ms
+  X-Zerocache-Completion-Hit: true | false
+  X-Zerocache-Completion-Hit-Kind: exact | semantic     # on a hit
+  X-Zerocache-Semantic-Score: 0.982                      # on a semantic hit`;
+
+const messagesRequest = `POST /{provider}/v1/messages
+Authorization: Bearer <caller's own Anthropic key>       # rewritten to x-api-key upstream
+anthropic-version: 2023-06-01                             # optional; folded into the cache key
+
+{ "model": "...", "max_tokens": 512, "messages": [...], "temperature": 0 }
+
+→ the upstream response body, unchanged
+  X-Zerocache-Completion-Hit: true | false
+  X-Zerocache-Completion-Hit-Kind: exact`;
+
+const chatDelete = `DELETE /{provider}/v1/{chat/completions,messages}
+Authorization: Bearer <caller's own key>
+
+{ "model": "...", "messages": [...] }
+
+→ { "deleted": 1 }`;
+
 const errorShapes = [
   ["401", "Missing or malformed Authorization header"],
   ["404", "Unknown {provider}, or a provider that doesn't support images/embeddings on this route"],
@@ -36,7 +63,8 @@ const errorShapes = [
 const operational = [
   ["GET /health", "Liveness. Zero I/O — proves only that the process/router is up."],
   ["GET /ready", "Readiness. 503 on a store-level error; a cache miss on the sentinel key is healthy."],
-  ["GET /metrics", "Prometheus text format: cache hits/misses and provider prompt tokens, labeled by provider and content_type."],
+  ["GET /metrics", "Prometheus text: embedding hits/misses/tokens (provider + content_type labels); completion hits/misses/tokens-saved (provider + stream labels); cross-replica coalesced counts; semantic index events."],
+  ["GET /dashboard", "The live savings SPA, embedded in the binary, polling /metrics."],
 ];
 ---
 
@@ -49,6 +77,42 @@ const operational = [
     Every request carries the caller's own provider API key. Two different callers' identical
     requests never share a cache entry — the cache key is owner-scoped, not just content-addressed.
   </p>
+
+  <section class="section">
+    <h2>Chat completions</h2>
+    <CodeBlock code={chatRequest} lang="http" />
+    <p>
+      Only <strong>deterministic</strong> requests are cached: <code>temperature: 0</code> or an
+      explicit <code>seed</code>, with <code>n</code> absent or <code>1</code>. Anything else is a
+      transparent passthrough — forwarded, nothing stored, nothing counted. A non-2xx upstream
+      response is forwarded with its real status and never cached. The cache key is the
+      canonicalized body: blind to <code>user</code> / <code>stream</code> / <code>metadata</code> /
+      key order / number spelling.
+    </p>
+    <p>
+      <code>stream: true</code> works — the SSE is buffered on a miss (streamed to the caller live
+      meanwhile) and replayed frame-by-frame on a hit. One entry serves both streaming and
+      non-streaming callers.
+    </p>
+    <p>
+      <code>{"{provider}"}</code> is any of <code>openai</code>, <code>mistral</code>,
+      <code>gemini</code>, <code>groq</code>, <code>deepseek</code>, <code>together</code>,
+      <code>openrouter</code>, <code>xai</code>, <code>fireworks</code>, plus anything added via
+      <code>ZEROCACHE_CHAT_PROVIDERS</code>.
+    </p>
+  </section>
+
+  <section class="section">
+    <h2>Anthropic Messages</h2>
+    <CodeBlock code={messagesRequest} lang="http" />
+    <p>
+      Claude's native <code>/v1/messages</code> shape. Cache gate is <code>temperature: 0</code>
+      <strong>only</strong> (Anthropic has no <code>seed</code> / <code>n</code>), plus non-empty
+      <code>messages</code> and <code>thinking</code> absent or disabled.
+      <code>anthropic-version</code> (default <code>2023-06-01</code>) and <code>anthropic-beta</code>
+      are folded into the cache key. <code>stream: true</code> is a raw passthrough.
+    </p>
+  </section>
 
   <section class="section">
     <h2>Text embeddings</h2>
@@ -74,7 +138,12 @@ const operational = [
   <section class="section">
     <h2>Deleting cache entries</h2>
     <CodeBlock code={deleteExample} lang="http" />
-    <p>The count reflects how many keys were requested for deletion, not how many actually existed — deletion is idempotent.</p>
+    <p>Chat completions and messages have matching <code>DELETE</code> routes:</p>
+    <CodeBlock code={chatDelete} lang="http" />
+    <p>
+      The count reflects how many keys were requested for deletion, not how many actually existed —
+      deletion is idempotent and owner-scoped.
+    </p>
   </section>
 
   <section class="section">
@@ -93,10 +162,15 @@ const operational = [
   <section class="section">
     <h2>Response headers</h2>
     <p>
-      <code>X-Zerocache-Hits</code> / <code>X-Zerocache-Misses</code> accompany every response.
-      <code>usage</code> reflects only tokens actually billed for this request's misses — 0 for an
-      all-hit batch, 0 for a coalesced request that piggybacked, and always 0 for Gemini, which
-      never reports usage.
+      <strong>Embeddings:</strong> <code>X-Zerocache-Hits</code> / <code>X-Zerocache-Misses</code>
+      on every response. <code>usage</code> reflects only tokens actually billed for this request's
+      misses — 0 for an all-hit batch, 0 for a coalesced request that piggybacked, and always 0 for
+      Gemini, which never reports usage.
+    </p>
+    <p>
+      <strong>Chat &amp; messages:</strong> <code>X-Zerocache-Completion-Hit: true | false</code>;
+      on a hit, <code>X-Zerocache-Completion-Hit-Kind: exact | semantic</code>, and on a semantic
+      hit, <code>X-Zerocache-Semantic-Score</code>.
     </p>
   </section>
 

@@ -2,9 +2,13 @@
 import BaseLayout from "../layouts/BaseLayout.astro";
 import CodeBlock from "../components/CodeBlock.astro";
 
-const dockerRun = `docker run -p 8080:8080 \\
-  -e ZEROCACHE_STORAGE_BACKEND=sled \\
-  ghcr.io/shramanb113/zerocache:latest`;
+const dockerRun = `docker run -d -p 8080:8080 \\
+  -v zerocache-data:/data \\
+  ghcr.io/shramanb113/zerocache:latest
+
+# semantic near-match tier: same image, tier compiled in
+docker run -d -p 8080:8080 -e ZEROCACHE_SEMANTIC=1 \\
+  ghcr.io/shramanb113/zerocache:semantic`;
 
 const composeSnippet = `services:
   zerocache:
@@ -18,9 +22,15 @@ const composeSnippet = `services:
     image: redis:7-alpine`;
 
 const envVars = [
+  ["ZEROCACHE_PORT", "Listen port (default 8080), binds 0.0.0.0"],
   ["ZEROCACHE_STORAGE_BACKEND", "sled (default) or redis"],
+  ["ZEROCACHE_STORAGE_PATH / ZEROCACHE_REDIS_URL", "sled data dir (./data, /data in Docker) / Redis URL (redis://127.0.0.1:6379)"],
   ["ZEROCACHE_TTL_SECONDS", "Unset by default — entries never expire. 0 or unparseable is treated as unset."],
-  ["ZEROCACHE_OPENAI_BASE_URL / _MISTRAL_ / _GEMINI_ / _HUGGINGFACE_BASE_URL", "Override for self-hosted, wire-compatible endpoints"],
+  ["ZEROCACHE_CROSS_REPLICA_COALESCING", "Opt-in (1/true/yes), redis backend only. Redis-lock single-flight so N replicas make one upstream call for the same single-key miss."],
+  ["ZEROCACHE_SEMANTIC", "1 enables the local-embedder near-match tier (--features semantic / :semantic image only). Fail-fast on embedder-load failure."],
+  ["ZEROCACHE_SEMANTIC_THRESHOLD / _MATCH_UNIT / _POLL_MS / _INDEX_MAXLEN", "Semantic tier: cosine threshold (0.97), fuzzy span (last-user), redis change-feed XREAD BLOCK ceiling (2000ms), stream cap (100000)"],
+  ["ZEROCACHE_CHAT_PROVIDERS / ZEROCACHE_MESSAGES_PROVIDERS", "Add or repoint chat / messages providers: \"name=url,…\""],
+  ["ZEROCACHE_OPENAI_BASE_URL / _MISTRAL_ / _GEMINI_ / _HUGGINGFACE_BASE_URL", "Override embeddings for self-hosted, wire-compatible endpoints"],
   ["ZEROCACHE_AZURE_OPENAI_BASE_URL / _AZURE_FOUNDRY_BASE_URL", "Azure resource hostnames — azure only registers as a provider once one of these is set"],
   ["ZEROCACHE_AZURE_AUTH_MODE", "bearer (Entra token, default) or api-key"],
   ["ZEROCACHE_BEDROCK_REGION", "Default AWS region for Bedrock requests that don't specify one"],
@@ -50,10 +60,13 @@ const envVars = [
     <p>
       Set <code>ZEROCACHE_STORAGE_BACKEND=redis</code> so every replica shares one store. Redis
       writes are last-write-wins with no distributed lock — content-addressing means two replicas
-      racing to fill the same key both compute the same value, so this is safe. <code>GET /metrics</code>
-      is Prometheus text format specifically so a scrape-and-<code>sum()</code> aggregates hits and
-      misses across pods; a single pod's own counters aren't meaningful on their own once there's
-      more than one replica.
+      racing to fill the same key both compute the same value, so this is safe. Add
+      <code>ZEROCACHE_CROSS_REPLICA_COALESCING=1</code> to also collapse concurrent identical
+      single-key misses across replicas via a Redis lock, saving the duplicate upstream calls. The
+      semantic tier works multi-replica on redis too, via a Redis Stream change-feed (needs Redis
+      &ge; 6.2). <code>/health</code> and <code>/ready</code> are your liveness/readiness probes;
+      <code>GET /metrics</code> is Prometheus text specifically so a scrape-and-<code>sum()</code>
+      aggregates across pods.
     </p>
   </section>
 
@@ -72,9 +85,12 @@ const envVars = [
   <section class="section">
     <h2>CI/CD</h2>
     <p>
-      Every push runs the full workspace test suite and clippy with warnings denied. On a push to
-      <code>master</code>, a separate workflow builds and publishes a multi-stage Docker image to
-      GHCR after CI passes.
+      Every push runs <code>build</code> / <code>test</code> / <code>test-redis</code> /
+      <code>build-musl</code> / <code>build-semantic</code> / <code>clippy -D warnings</code> /
+      <code>fmt</code> / <code>dashboard</code>. On a push to <code>master</code>, a separate
+      workflow builds and publishes the <code>:latest</code> and <code>:semantic</code> images to
+      GHCR after CI passes. The <code>:latest</code> image is <code>FROM scratch</code> plus one
+      static musl binary — ~14.7 MB, no shell, no libc, no CA bundle.
     </p>
   </section>
 </BaseLayout>
