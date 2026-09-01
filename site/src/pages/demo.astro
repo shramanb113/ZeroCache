@@ -1,0 +1,145 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import CodeBlock from "../components/CodeBlock.astro";
+import StatCallout from "../components/StatCallout.astro";
+
+const surfaces = [
+  ["Retrieve", "Architect", "POST /openai/v1/embeddings · POST /gemini/v1/images/embeddings", "embeddings cache · image-embeddings cache"],
+  ["Plan", "Architect", "POST /openai/v1/chat/completions", "chat completions cache · multi-provider"],
+  ["Repo brief", "3× Coder (parallel)", "one identical POST /openai/v1/chat/completions, fired concurrently", "in-process coalescing (3 misses → 1 upstream call)"],
+  ["Implement", "3× Coder (parallel)", "POST /openai/v1/chat/completions", "chat completions cache"],
+  ["Review", "Reviewer", "POST /anthropic/v1/messages (streaming)", "native Anthropic messages cache · streaming replay"],
+  ["Fix", "Fixer", "POST /openai/v1/chat/completions", "chat completions cache"],
+];
+
+const runIt = `git clone https://github.com/shramanb113/ZeroCache
+cd ZeroCache/demo/agent-showcase
+npm install
+cp .env.example .env          # OPENAI_API_KEY required; ANTHROPIC + GEMINI optional
+
+# in another shell — semantic build so Run 3 works
+ZEROCACHE_SEMANTIC=1 cargo run -p zerocache-http --features semantic
+
+npm run warm                  # pre-fills the cache (runs 1 → 2 → 3)
+npm run -- run --run=2        # the hero shot: identical task, fully cached
+npm run -- run --run=3        # the reworded task, semantic hits`;
+---
+
+<BaseLayout
+  title="Demo"
+  description="A complex multi-agent coding team ships a real feature, then re-runs it served entirely from Zerocache's cache — byte-identical, ~$0, seconds."
+>
+  <h1>Demo</h1>
+  <p>
+    <a href="https://github.com/shramanb113/ZeroCache/tree/master/demo/agent-showcase"><code>demo/agent-showcase/</code></a>
+    is a bespoke multi-agent coding team — an architect, three parallel coders, a Claude reviewer
+    over <code>/v1/messages</code>, a fixer — that ships a real rate-limiting feature to a sample
+    repo and proves it with <code>node --test</code>. Then it runs the <strong>identical</strong>
+    task again, served entirely from Zerocache: same diffs, same passing tests,
+    <code>X-Zerocache-*-Hit: true</code> on every call. A reworded third run still hits, through the
+    semantic near-match tier.
+  </p>
+
+  <section class="section">
+    <h2>Walkthrough</h2>
+    <div class="video-embed" role="img" aria-label="Walkthrough video placeholder">
+      <span>walkthrough video — coming soon</span>
+    </div>
+    <!-- Replace .video-embed with an <iframe>/<video> once the recording is ready. -->
+  </section>
+
+  <section class="section">
+    <h2>The result</h2>
+    <!-- BEGIN agent-showcase numbers — fill from demo/agent-showcase/traces/ -->
+    <div class="stat-row">
+      <StatCallout value="0" label="upstream calls on the cached re-run" tone="hit" />
+      <StatCallout value="$0.00" label="cost of the cached re-run" tone="hit" />
+      <StatCallout value="exact + semantic" label="hit kinds across runs 2 and 3" tone="hit" />
+    </div>
+    <p class="muted-note">
+      Full run 1 vs run 2 vs run 3 figures land here from the committed trace once the live pass is
+      recorded.
+    </p>
+    <!-- END agent-showcase numbers -->
+  </section>
+
+  <section class="section">
+    <h2>What it exercises</h2>
+    <div style="overflow-x: auto;">
+      <table class="table">
+        <thead>
+          <tr><th>Stage</th><th>Agent</th><th>Route</th><th>Zerocache surface</th></tr>
+        </thead>
+        <tbody>
+          {surfaces.map(([stage, agent, route, surface]) => (
+            <tr>
+              <td>{stage}</td>
+              <td>{agent}</td>
+              <td><code>{route}</code></td>
+              <td>{surface}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Every request is BYOK — <code>Authorization: Bearer &lt;that provider's key&gt;</code>, never
+      a Zerocache key. <code>temperature: 0</code> throughout (also what the cache gate requires).
+    </p>
+  </section>
+
+  <section class="section">
+    <h2>Run it yourself</h2>
+    <CodeBlock code={runIt} lang="bash" />
+  </section>
+</BaseLayout>
+
+<style>
+  .video-embed {
+    aspect-ratio: 16 / 9;
+    width: 100%;
+    max-width: 760px;
+    display: grid;
+    place-items: center;
+    border: var(--hairline);
+    border-radius: var(--radius);
+    background:
+      repeating-linear-gradient(
+        45deg,
+        rgba(196, 98, 47, 0.05) 0 12px,
+        transparent 12px 24px
+      ),
+      var(--surface);
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+  }
+  .stat-row {
+    display: flex;
+    gap: var(--space-5);
+    flex-wrap: wrap;
+    margin: var(--space-3) 0;
+  }
+  .muted-note {
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  .table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+  }
+  .table th,
+  .table td {
+    text-align: left;
+    padding: var(--space-2);
+    border-bottom: var(--hairline);
+    vertical-align: top;
+  }
+  .table th {
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-weight: 400;
+    font-size: 0.8rem;
+  }
+</style>

@@ -7,6 +7,8 @@ const rawBase = import.meta.env.BASE_URL;
 const base = rawBase.endsWith("/") ? rawBase : `${rawBase}/`;
 const { pathname } = Astro.url;
 const links = [
+  { href: `${base}use/`, label: "use" },
+  { href: `${base}demo/`, label: "demo" },
   { href: `${base}architecture/`, label: "architecture" },
   { href: `${base}providers/`, label: "providers" },
   { href: `${base}api/`, label: "api" },
