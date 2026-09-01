@@ -52,7 +52,7 @@ export interface OrchestratorDeps {
   workDir: string;
   trace: Trace;
   ledger: Ledger;
-  onFrame: (streamText?: string) => void;
+  onFrame: (stages: StageOutcome[], streamText?: string) => void;
   run: 1 | 2 | 3;
 }
 
@@ -143,11 +143,11 @@ export async function orchestrate(
   const degraded: string[] = [];
   const record = (r: ZcResult<unknown>) =>
     ledger.addEvent({
-      billedPromptTokens: 0,
-      billedCompletionTokens: 0,
-      usd: 0,
+      billedPromptTokens: r.billedPromptTokens,
+      billedCompletionTokens: r.billedCompletionTokens,
+      usd: r.usd,
       hit: r.hit,
-      coalesced: false,
+      coalesced: r.coalesced,
     });
 
   // ---- Stage 1: retrieve ------------------------------------------------
@@ -205,7 +205,7 @@ export async function orchestrate(
     status: allHit ? "hit" : "done",
     detail: `${index.size} chunks · ${sawImage ? "arch.png" : "no image"}`,
   });
-  onFrame();
+  onFrame(stages);
 
   // ---- Stage 2: plan --------------------------------------------------
   const planRes = await gateway.chat(
@@ -223,7 +223,7 @@ export async function orchestrate(
     status: planRes.hit ? "hit" : "done",
     detail: planRes.hit ? "exact · 0 ms billed" : `${planRes.latencyMs} ms`,
   });
-  onFrame();
+  onFrame(stages);
 
   // ---- Stage 3: brief (3 concurrent identical calls -> coalesced) -----
   const conventionsText = top
@@ -250,7 +250,7 @@ export async function orchestrate(
         ? "3 workers · all cached"
         : "3 workers → 1 upstream call (coalesced)",
   });
-  onFrame();
+  onFrame(stages);
 
   // ---- Stage 4: implement (parallel workers, one file each) ----------
   let implemented = 0;
@@ -295,7 +295,7 @@ export async function orchestrate(
         ? `${implemented}/${task.targetFiles.length} files`
         : `failed: ${failedFiles.join(", ")}`,
   });
-  onFrame();
+  onFrame(stages);
 
   // ---- Stage 5: review (Claude via /v1/messages, streaming) ---------
   const currentDiffs = task.targetFiles.map((rel) => ({
@@ -310,7 +310,7 @@ export async function orchestrate(
       reviewerMessagesBody(models.review, task, currentDiffs),
       (t) => {
         reviewText += t;
-        onFrame(t);
+        onFrame(stages, t);
       },
       { stage: "review" },
     );
@@ -367,7 +367,7 @@ export async function orchestrate(
       detail: "openai fallback",
     });
   }
-  onFrame();
+  onFrame(stages);
 
   // ---- Stage 6: fix -------------------------------------------------
   const approved = /^\s*APPROVED\s*$/im.test(reviewText.trim());
@@ -399,7 +399,7 @@ export async function orchestrate(
       detail: approved ? "approved, no changes" : "skipped",
     });
   }
-  onFrame();
+  onFrame(stages);
 
   // ---- Stage 7: verify -------------------------------------------
   const tests = await runNodeTests(workDir);
@@ -426,7 +426,7 @@ export async function orchestrate(
     coalesced: false,
     note: `tests ${tests.passed}/${tests.passed + tests.failed}`,
   });
-  onFrame();
+  onFrame(stages);
 
   return {
     testPass: tests.ok,

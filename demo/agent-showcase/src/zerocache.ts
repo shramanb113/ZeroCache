@@ -8,6 +8,10 @@ export interface ZcResult<T> {
   hitsHeader: number | null;
   missesHeader: number | null;
   latencyMs: number;
+  billedPromptTokens: number;
+  billedCompletionTokens: number;
+  usd: number;
+  coalesced: boolean;
 }
 
 interface CallMeta {
@@ -66,7 +70,8 @@ export class ZerocacheClient {
       completion_tokens?: number;
     };
     const model = (body as { model?: string }).model ?? "";
-    this.record({
+    const coalesced = meta.coalesced ?? false;
+    const billed = this.record({
       stage: meta.stage,
       type: "chat",
       surface: "chat_completions",
@@ -77,7 +82,7 @@ export class ZerocacheClient {
       semanticScore,
       rawPrompt: usage.prompt_tokens ?? 0,
       rawCompletion: usage.completion_tokens ?? 0,
-      coalesced: meta.coalesced ?? false,
+      coalesced,
       latencyMs,
     });
     return {
@@ -88,6 +93,8 @@ export class ZerocacheClient {
       hitsHeader: null,
       missesHeader: null,
       latencyMs,
+      ...billed,
+      coalesced,
     };
   }
 
@@ -159,7 +166,8 @@ export class ZerocacheClient {
     }
     const latencyMs = Math.round(performance.now() - t0);
     const model = (body as { model?: string }).model ?? "";
-    this.record({
+    const coalesced = meta.coalesced ?? false;
+    const billed = this.record({
       stage: meta.stage,
       type: "messages",
       surface: "messages",
@@ -170,7 +178,7 @@ export class ZerocacheClient {
       semanticScore,
       rawPrompt: inputTokens,
       rawCompletion: outputTokens,
-      coalesced: meta.coalesced ?? false,
+      coalesced,
       latencyMs,
     });
     return {
@@ -181,6 +189,8 @@ export class ZerocacheClient {
       hitsHeader: null,
       missesHeader: null,
       latencyMs,
+      ...billed,
+      coalesced,
     };
   }
 
@@ -247,7 +257,8 @@ export class ZerocacheClient {
       .map((d) => d.embedding);
     const surface: Surface =
       path === "images/embeddings" ? "image_embeddings" : "embeddings";
-    this.record({
+    const coalesced = meta.coalesced ?? false;
+    const billed = this.record({
       stage: meta.stage,
       type: surface === "image_embeddings" ? "image_embeddings" : "embeddings",
       surface,
@@ -258,7 +269,7 @@ export class ZerocacheClient {
       semanticScore: null,
       rawPrompt: json.usage?.prompt_tokens ?? 0,
       rawCompletion: 0,
-      coalesced: meta.coalesced ?? false,
+      coalesced,
       latencyMs,
     });
     return {
@@ -269,6 +280,8 @@ export class ZerocacheClient {
       hitsHeader,
       missesHeader,
       latencyMs,
+      ...billed,
+      coalesced,
     };
   }
 
@@ -285,10 +298,11 @@ export class ZerocacheClient {
     rawCompletion: number;
     coalesced: boolean;
     latencyMs: number;
-  }): void {
+  }): { billedPromptTokens: number; billedCompletionTokens: number; usd: number } {
     const free = r.hit || r.coalesced;
     const billedPromptTokens = free ? 0 : r.rawPrompt;
     const billedCompletionTokens = free ? 0 : r.rawCompletion;
+    const usd = priceUsd(r.model, billedPromptTokens, billedCompletionTokens);
     this.trace.add({
       stage: r.stage,
       type: r.type,
@@ -303,9 +317,10 @@ export class ZerocacheClient {
       billedPromptTokens,
       billedCompletionTokens,
       latencyMs: r.latencyMs,
-      usd: priceUsd(r.model, billedPromptTokens, billedCompletionTokens),
+      usd,
       coalesced: r.coalesced,
       note: "",
     });
+    return { billedPromptTokens, billedCompletionTokens, usd };
   }
 }

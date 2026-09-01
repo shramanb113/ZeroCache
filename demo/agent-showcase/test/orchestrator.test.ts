@@ -18,6 +18,10 @@ function fakeGateway() {
     hitsHeader: null,
     missesHeader: null,
     latencyMs: 1,
+    billedPromptTokens: 5,
+    billedCompletionTokens: 5,
+    usd: 0,
+    coalesced: false,
   };
   return {
     calls,
