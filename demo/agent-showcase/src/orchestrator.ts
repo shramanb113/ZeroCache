@@ -210,11 +210,12 @@ export async function orchestrate(
       record(imgRes);
       sawImage = true;
     } catch {
-      degraded.push("image step skipped");
+      degraded.push("image step failed");
     }
-  } else if (!keys.gemini) {
-    degraded.push("image step skipped (no GEMINI_API_KEY)");
   }
+  // No GEMINI_API_KEY is the default: the image-embeddings surface is optional
+  // multimodal breadth, not part of the hero path, so its absence is not a
+  // degradation.
 
   const queryRes = await gateway.embed(
     providers.embed,
