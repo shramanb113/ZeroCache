@@ -34,7 +34,7 @@ function TooltipBody({ active, payload }: { active?: boolean; payload?: { payloa
         completions {usd(r.completion)}
       </div>
       <div className="rc-row">
-        <span className="rc-key" style={{ background: "var(--deemph)" }} />
+        <span className="rc-key" style={{ background: "var(--signal-soft)" }} />
         embeddings {usd(r.embedding)}
       </div>
     </div>
@@ -56,22 +56,37 @@ export default function SavingsChart({ history }: Props) {
   }, [history]);
 
   return (
-    <div className="card">
-      <h2>Cost avoided over this session</h2>
-      <div className="h2sub">
+    <div className="panel card">
+      <div className="eyebrow">Cost avoided · session</div>
+      <div className="sub">
         cumulative, since the page loaded &middot;{" "}
-        <a role="button" tabIndex={0} onClick={() => setAsTable((v) => !v)} onKeyDown={(e) => e.key === "Enter" && setAsTable((v) => !v)}>
+        <a
+          role="button"
+          tabIndex={0}
+          onClick={() => setAsTable((v) => !v)}
+          onKeyDown={(e) => e.key === "Enter" && setAsTable((v) => !v)}
+        >
           {asTable ? "chart" : "table"}
         </a>
       </div>
 
       {rows.length < 2 ? (
-        <div style={{ height: 200, display: "grid", placeItems: "center", color: "var(--muted)", fontSize: 12 }}>
+        <div
+          style={{
+            height: 200,
+            display: "grid",
+            placeItems: "center",
+            color: "var(--muted)",
+            fontSize: 12,
+            fontFamily: "var(--font-num)",
+          }}
+        >
           collecting samples…
         </div>
       ) : asTable ? (
         <div className="tablewrap">
           <table className="grid">
+            <caption className="sr-only">Cost avoided over the session, sampled</caption>
             <thead>
               <tr>
                 <th className="name">Elapsed</th>
@@ -96,12 +111,6 @@ export default function SavingsChart({ history }: Props) {
         <div style={{ width: "100%", height: 200 }}>
           <ResponsiveContainer>
             <AreaChart data={rows} margin={{ top: 12, right: 16, bottom: 4, left: 4 }}>
-              <defs>
-                <linearGradient id="savingsFill" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="var(--series)" stopOpacity={0.22} />
-                  <stop offset="100%" stopColor="var(--series)" stopOpacity={0.02} />
-                </linearGradient>
-              </defs>
               <CartesianGrid vertical={false} />
               <XAxis
                 dataKey="elapsed"
@@ -121,16 +130,24 @@ export default function SavingsChart({ history }: Props) {
                 tickLine={false}
                 axisLine={false}
               />
-              <Tooltip content={<TooltipBody />} cursor={{ stroke: "var(--axis)", strokeWidth: 1 }} />
+              <Tooltip
+                content={<TooltipBody />}
+                cursor={{ stroke: "var(--axis)", strokeWidth: 1 }}
+              />
               <Area
                 type="monotone"
                 dataKey="total"
-                stroke="var(--series)"
+                stroke="var(--signal)"
                 strokeWidth={2}
-                fill="url(#savingsFill)"
+                fill="var(--signal-wash)"
                 isAnimationActive={false}
                 dot={false}
-                activeDot={{ r: 4, fill: "var(--series)", stroke: "var(--surface)", strokeWidth: 2 }}
+                activeDot={{
+                  r: 4,
+                  fill: "var(--signal)",
+                  stroke: "var(--panel)",
+                  strokeWidth: 2,
+                }}
               />
             </AreaChart>
           </ResponsiveContainer>

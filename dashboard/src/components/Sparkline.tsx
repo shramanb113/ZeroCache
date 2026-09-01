@@ -4,7 +4,7 @@ interface Props {
   values: (number | null)[];
 }
 
-/** A bare 12-point trend for a stat tile: de-emphasis line, no axes, no tooltip.
+/** A bare 12-point trend for a stat cell: de-emphasis line, no axes, no tooltip.
  *  The number beside it carries the actual value. */
 export default function Sparkline({ values }: Props) {
   const clean = values.filter((v): v is number => v !== null && Number.isFinite(v));
@@ -19,9 +19,9 @@ export default function Sparkline({ values }: Props) {
           <Area
             type="monotone"
             dataKey="v"
-            stroke="var(--deemph)"
+            stroke="var(--signal-soft)"
             strokeWidth={2}
-            fill="var(--deemph)"
+            fill="var(--signal-soft)"
             fillOpacity={0.14}
             isAnimationActive={false}
             dot={false}

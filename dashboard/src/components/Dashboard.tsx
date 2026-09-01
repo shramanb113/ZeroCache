@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMetrics } from "../lib/useMetrics";
-import { compact, pct, usd } from "../lib/format";
+import { useCountUp } from "../lib/useCountUp";
+import { compact, pct, usd2 } from "../lib/format";
 import { loadTheme, saveTheme, type Theme } from "../lib/prices";
 import SavingsChart from "./SavingsChart";
 import Sparkline from "./Sparkline";
@@ -32,6 +33,15 @@ export default function Dashboard() {
 
   const s = m.snapshot;
   const since = s && m.baseline !== null ? Math.max(0, s.totalUsd - m.baseline) : 0;
+  const total = useCountUp(s?.totalUsd ?? 0);
+
+  // split the (animated) total by the real measured/estimated proportion,
+  // rounding in cents so the two rows always sum to the hero figure exactly
+  const measuredShare = s && s.totalUsd > 0 ? s.completionUsd / s.totalUsd : 0;
+  const totalCents = Math.round(total * 100);
+  const measuredCents = Math.round(totalCents * measuredShare);
+  const measuredUsd = measuredCents / 100;
+  const estimatedUsd = (totalCents - measuredCents) / 100;
 
   const usdSeries = useMemo(() => m.history.map((h) => h.totalUsd), [m.history]);
   const rateSeries = useMemo(
@@ -49,21 +59,28 @@ export default function Dashboard() {
     return a !== null && b !== null ? (b - a) * 100 : null;
   }, [m.history]);
 
-  const statusText =
-    m.paused
-      ? "paused"
-      : m.status === "error"
-        ? "disconnected"
-        : m.lastUpdated
-          ? "updated " + new Date(m.lastUpdated).toLocaleTimeString()
-          : "starting…";
+  const startedAt = useMemo(
+    () => (m.history.length ? new Date(m.history[0].t) : null),
+    [m.history],
+  );
+
+  const statusText = m.paused
+    ? "paused"
+    : m.status === "error"
+      ? "disconnected"
+      : m.lastUpdated
+        ? new Date(m.lastUpdated).toLocaleTimeString(undefined, {
+            hour12: false,
+          })
+        : "starting…";
   const statusKind = m.paused ? "stale" : m.status === "error" ? "error" : "ok";
 
   return (
     <>
       <header className="bar">
-        <h1>Zerocache</h1>
-        <span className="sub">cache savings, live</span>
+        <h1>zerocache</h1>
+        <span className="rule" />
+        <span className="sub">savings monitor</span>
         <span className="spacer" />
         <div className="controls">
           <span className="dot" data-kind={statusKind} />
@@ -84,57 +101,80 @@ export default function Dashboard() {
       )}
 
       <div className="stack" data-stale={m.status === "error"}>
-        <section className="hero">
-          <div className="label">Estimated cost avoided since this Zerocache started</div>
-          <div className="fig">{usd(s?.totalUsd ?? 0)}</div>
-          <div className="delta">
-            {m.history.length >= 2 ? `+${usd(since)} since this page loaded` : "collecting…"}
+        <section className="panel hero reveal">
+          <div className="eyebrow">
+            Cost avoided
+            <span className="trailing">
+              {startedAt
+                ? "since " + startedAt.toLocaleString(undefined, { hour12: false })
+                : "since this instance started"}
+            </span>
           </div>
-          <div className="caption">
-            {usd(s?.completionUsd ?? 0)} completions (measured
-            {s && s.completionSemanticHits > 0
-              ? `, ${compact(s.completionSemanticHits)} via semantic match`
-              : ""}
-            ) · {usd(s?.embeddingUsd ?? 0)} embeddings (estimated)
+
+          <div className="readout">
+            <div className="fig">{usd2(total)}</div>
+            <div className="delta" data-up={since > 0}>
+              {m.history.length >= 2 ? `▲ +${usd2(since)} this session` : "collecting…"}
+            </div>
           </div>
+
+          <div className="split">
+            <div className="srow">
+              <span>
+                <span className="tag">measured</span> completions
+              </span>
+              <b>{usd2(measuredUsd)}</b>
+            </div>
+            <div className="sbar">
+              <div className="sfill" style={{ transform: `scaleX(${measuredShare})` }} />
+            </div>
+            <div className="srow">
+              <span>
+                <span className="tag">estimated</span> embeddings
+              </span>
+              <b>{usd2(estimatedUsd)}</b>
+            </div>
+          </div>
+
+          {s && s.completionSemanticHits > 0 && (
+            <div className="caption">
+              {compact(s.completionSemanticHits)} completion hits matched via the semantic tier
+            </div>
+          )}
         </section>
 
-        <section className="kpis">
-          <Tile
-            label="Requests served from cache"
+        <section className="panel cluster reveal">
+          <Cell
+            label="Served from cache"
             value={compact(s?.servedFromCache ?? 0)}
             spark={usdSeries}
-            delta={m.history.length >= 2 ? `+${usd(since)} value since page load` : "collecting…"}
+            delta={m.history.length >= 2 ? `+${usd2(since)} value` : "collecting…"}
             up={since > 0}
           />
-          <Tile
+          <Cell
             label="Overall hit rate"
             value={pct(s?.overallHitRate ?? null)}
             spark={rateSeries}
             delta={
-              rateDelta === null
+              rateDelta === null || Math.abs(rateDelta) < 0.05
                 ? "since page load"
-                : `${rateDelta >= 0 ? "+" : ""}${rateDelta.toFixed(1)} pts since page load`
+                : `${rateDelta >= 0 ? "+" : ""}${rateDelta.toFixed(1)} pts`
             }
             up={rateDelta !== null && rateDelta > 0.05}
           />
-          <Tile
+          <Cell
             label="Completion tokens saved"
             value={compact(s?.completionTokensSaved ?? 0)}
-            spark={usdSeries}
-            delta="measured from stored responses"
-            up={(s?.completionTokensSaved ?? 0) > 0}
+            caption="measured from stored responses"
           />
-          <Tile
+          <Cell
             label="Est. embedding tokens saved"
             value={compact(s?.embeddingTokensSaved ?? 0)}
-            spark={usdSeries}
-            delta="estimated · see assumptions"
-            up={false}
+            caption="estimated · see assumptions"
           />
         </section>
 
-        <section className="row2">
+        <section className="row2 reveal">
           <SavingsChart history={m.history} />
           <HitRate
             completionHitRate={s?.completionHitRate ?? null}
@@ -146,17 +186,21 @@ export default function Dashboard() {
           />
         </section>
 
-        <ProviderTable rows={s?.rows ?? []} />
+        <div className="reveal">
+          <ProviderTable rows={s?.rows ?? []} />
+        </div>
 
-        <PricingPanel
-          providersSeen={(s?.rows ?? []).map((r) => r.provider)}
-          overrides={m.overrides}
-          assumedEmbedTokens={m.assumedEmbedTokens}
-          onOverrides={m.setOverrides}
-          onAssumed={m.setAssumedEmbedTokens}
-        />
+        <div className="reveal">
+          <PricingPanel
+            providersSeen={(s?.rows ?? []).map((r) => r.provider)}
+            overrides={m.overrides}
+            assumedEmbedTokens={m.assumedEmbedTokens}
+            onOverrides={m.setOverrides}
+            onAssumed={m.setAssumedEmbedTokens}
+          />
+        </div>
 
-        <footer className="note">
+        <footer className="note reveal">
           <p>
             Polls <code>/metrics</code> every 2s. Counters are cumulative since this Zerocache
             process started and reset to zero on restart — this page detects that and clears the
@@ -165,7 +209,8 @@ export default function Dashboard() {
           <p>
             Completion savings are exact: the stored response carries the token counts the provider
             did not bill on a hit. Embedding savings are an estimate — hits × average tokens per
-            observed miss (or × the assumed size when no miss has been seen), × your embedding price.
+            observed miss (or × the assumed size when no miss has been seen), × your embedding
+            price.
           </p>
           <p>
             {s && s.rows.length
@@ -198,23 +243,27 @@ function sumRows(
   return (rows ?? []).reduce((s, r) => s + r[key], 0);
 }
 
-interface TileProps {
+interface CellProps {
   label: string;
   value: string;
-  spark: (number | null)[];
-  delta: string;
-  up: boolean;
+  spark?: (number | null)[];
+  delta?: string;
+  caption?: string;
+  up?: boolean;
 }
 
-function Tile({ label, value, spark, delta, up }: TileProps) {
+function Cell({ label, value, spark, delta, caption, up }: CellProps) {
   return (
-    <div className="tile">
-      <div className="t-label">{label}</div>
-      <div className="t-value">{value}</div>
-      <Sparkline values={spark} />
-      <div className="t-delta" data-up={up}>
-        {delta}
-      </div>
+    <div className="cell">
+      <div className="c-label">{label}</div>
+      <div className="c-value">{value}</div>
+      {spark && <Sparkline values={spark} />}
+      {delta && (
+        <div className="c-delta" data-up={up}>
+          {delta}
+        </div>
+      )}
+      {caption && <div className="c-delta">{caption}</div>}
     </div>
   );
 }
