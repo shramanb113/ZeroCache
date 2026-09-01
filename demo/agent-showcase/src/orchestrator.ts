@@ -280,50 +280,60 @@ export async function orchestrate(
 
   // ---- Stage 4: implement (parallel workers, one file each) ----------
   const knownFiles = [...new Set([...files, ...task.targetFiles])].sort();
-  const repoSnapshot = task.targetFiles.map((rel) => ({
-    path: rel,
-    content: readFileOrEmpty(workDir, rel),
-  }));
   let implemented = 0;
   const failedFiles: string[] = [];
-  await Promise.all(
-    task.targetFiles.map(async (rel) => {
-      const current = readFileOrEmpty(workDir, rel);
-      let attempt = 0;
-      let lastErr = "";
-      while (attempt < 2) {
-        attempt++;
-        const body = coderBody(
-          models.chat,
-          task,
-          rel,
-          current,
-          attempt === 1 ? plan : `${plan}\n\nPREVIOUS ATTEMPT FAILED: ${lastErr}`,
-          repoSnapshot,
-        );
-        const res = await gateway.chat(providers.chat, keys.openai, body, {
+  // Sequential: each worker sees what the previous ones wrote, so a small model
+  // keeps cross-file names consistent instead of collapsing every file to one
+  // answer. (The BRIEF stage is where concurrent coalescing is demonstrated.)
+  for (let w = 0; w < task.targetFiles.length; w++) {
+    const rel = task.targetFiles[w]!;
+    const liveSnapshot = task.targetFiles.map((r) => ({
+      path: r,
+      content: readFileOrEmpty(workDir, r),
+    }));
+    const current = readFileOrEmpty(workDir, rel);
+    let attempt = 0;
+    let lastErr = "";
+    let done = false;
+    while (attempt < 2 && !done) {
+      attempt++;
+      const body = coderBody(
+        models.chat,
+        task,
+        rel,
+        current,
+        attempt === 1 ? plan : `${plan}\n\nPREVIOUS ATTEMPT FAILED: ${lastErr}`,
+        liveSnapshot,
+      );
+      let res;
+      try {
+        res = await gateway.chat(providers.chat, keys.openai, body, {
           stage: "implement",
         });
-        record(res);
-        const diff =
-          ((res.data.choices as { message: { content: string } }[] | undefined)?.[0]
-            ?.message.content) ?? "";
-        try {
-          const body2 = repairImports(
-            rel,
-            applyCoderOutput(current, diff),
-            knownFiles,
-          );
-          writeFileRel(workDir, rel, body2);
-          implemented++;
-          return;
-        } catch (e) {
-          lastErr = (e as Error).message;
-        }
+      } catch (e) {
+        lastErr = (e as Error).message;
+        continue;
       }
-      failedFiles.push(rel);
-    }),
-  );
+      record(res);
+      const diff =
+        ((res.data.choices as { message: { content: string } }[] | undefined)?.[0]
+          ?.message.content) ?? "";
+      try {
+        const body2 = repairImports(
+          rel,
+          applyCoderOutput(current, diff),
+          knownFiles,
+        );
+        writeFileRel(workDir, rel, body2);
+        implemented++;
+        done = true;
+      } catch (e) {
+        lastErr = (e as Error).message;
+      }
+    }
+    if (!done) failedFiles.push(rel);
+    onFrame(stages);
+  }
   stages.push({
     name: "IMPLEMENT",
     status: failedFiles.length === 0 ? "done" : "failed",
