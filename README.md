@@ -20,6 +20,7 @@ No SDK to install. No framework plugin. No server-side provider credentials for 
 
 ## Table of contents
 
+- [Demo](#demo)
 - [What it does](#what-it-does)
 - [Quickstart](#quickstart)
 - [Using Zerocache](#using-zerocache)
@@ -38,6 +39,25 @@ No SDK to install. No framework plugin. No server-side provider credentials for 
 - [Testing](#testing)
 - [Further reading](#further-reading)
 - [License](#license)
+
+---
+
+## Demo
+
+**[`demo/agent-showcase/`](./demo/agent-showcase/)** is a bespoke multi-agent coding team — an architect, three parallel coders, a Claude reviewer over `/v1/messages`, a fixer — that ships a real rate-limiting feature to a sample repo and proves it with `node --test`. Then it runs the **identical** task again, served entirely from Zerocache:
+
+<!-- BEGIN agent-showcase numbers — regenerated from demo/agent-showcase/traces/ by Task A11 -->
+| | Run 1 — cold | Run 2 — cached | Run 3 — reworded |
+| --- | --- | --- | --- |
+| upstream calls | _TBD_ | **0** | _TBD_ |
+| wall time | _TBD_ | **~_TBD_ s** | _TBD_ |
+| est. cost | _TBD_ | **$0.00** | _TBD_ |
+| cache hit kind | — | exact | **semantic** |
+<!-- END agent-showcase numbers -->
+
+Same diffs, same passing tests, `X-Zerocache-*-Hit: true` on every call. A reworded third run still hits through the semantic near-match tier.
+
+> **Walkthrough video:** _coming soon_ &nbsp;·&nbsp; run it yourself: [`demo/agent-showcase/README.md`](./demo/agent-showcase/README.md)
 
 ---
 
@@ -89,6 +109,81 @@ docker run -d --name zerocache -p 8080:8080 -v zerocache-data:/data ghcr.io/shra
 ```sh
 cargo run -p zerocache-http    # dashboard at http://localhost:8080/dashboard
 ```
+
+---
+
+## Using Zerocache
+
+An end-to-end path from zero to a measured cache hit.
+
+### 1. Run it
+
+```sh
+docker run -d --name zerocache -p 8080:8080 -v zerocache-data:/data ghcr.io/shramanb113/zerocache:latest
+# or:  cargo run -p zerocache-http
+# semantic near-match tier:  docker run ... ghcr.io/shramanb113/zerocache:semantic  (then set ZEROCACHE_SEMANTIC=1)
+```
+
+No provider key is needed to start it — you send one per request.
+
+### 2. Point your client — one line
+
+The only change is the base URL. Your key, your models, your SDK, unchanged.
+
+```python
+# OpenAI Python SDK — chat + embeddings
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8080/openai/v1", api_key="sk-your-real-key")
+```
+
+```ts
+// OpenAI TS SDK
+import OpenAI from "openai";
+const client = new OpenAI({ baseURL: "http://localhost:8080/openai/v1", apiKey: process.env.OPENAI_API_KEY });
+```
+
+```python
+# Anthropic Python SDK — /v1/messages
+from anthropic import Anthropic
+client = Anthropic(base_url="http://localhost:8080/anthropic", api_key="sk-ant-your-real-key")
+```
+
+```sh
+# plain curl
+curl http://localhost:8080/openai/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-real-key" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"temperature":0}'
+```
+
+Swap `openai` for any of `mistral`, `gemini`, `groq`, `deepseek`, `together`, `openrouter`, `xai`, `fireworks` — each takes that provider's own key.
+
+### 3. Chat completions
+
+Send the request twice. The second response carries `X-Zerocache-Completion-Hit: true`, returns in ~1 ms, and costs nothing. Only **deterministic** requests are cached — `temperature: 0` or an explicit `seed`. See [Chat completions](#chat-completions).
+
+### 4. Embeddings
+
+Same story on `/{provider}/v1/embeddings` — identical text (down to casing / Unicode / punctuation) stops costing a second call. `input` takes a string or an array. Image embeddings: `POST /gemini/v1/images/embeddings` with `data:` URIs. See [Embeddings](#embeddings).
+
+### 5. Anthropic Messages
+
+`POST /{provider}/v1/messages` with Claude's native shape — `Authorization: Bearer` is rewritten to `x-api-key` upstream, `temperature: 0` to be cacheable. See [Anthropic Messages](#anthropic-messages).
+
+### 6. Watch it work
+
+- **`GET /dashboard`** — live hit rate, tokens not billed, dollars saved, per provider. Screenshot this mid-run.
+- **`GET /metrics`** — Prometheus counters behind the dashboard.
+- Response headers on every call: `X-Zerocache-Hits` / `X-Zerocache-Misses` (embeddings), `X-Zerocache-Completion-Hit` / `-Hit-Kind` / `-Semantic-Score` (chat + messages).
+
+### 7. Deploy
+
+- Single instance: the default `sled` store + a persistent volume (`-v zerocache-data:/data`).
+- Multi-replica: `ZEROCACHE_STORAGE_BACKEND=redis` + `ZEROCACHE_REDIS_URL` so every pod shares one cache. Add `ZEROCACHE_CROSS_REPLICA_COALESCING=1` to also collapse concurrent identical single-key misses across replicas.
+- `/health` (liveness) and `/ready` (store probe) are your Kubernetes probes; scrape `/metrics` per pod and `sum()`.
+
+### 8. Invalidate
+
+`DELETE /{provider}/v1/{embeddings,images/embeddings,chat/completions,messages}` with the same body + `Authorization` evicts the entry a matching `POST` would hit — owner-scoped, idempotent, `{"deleted": <count>}`.
 
 ---
 
