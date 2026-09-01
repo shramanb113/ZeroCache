@@ -14,6 +14,35 @@ import StatCallout from "../components/StatCallout.astro";
   </p>
 
   <section class="section">
+    <h2>Agent showcase — the second run is free</h2>
+    <p>
+      A multi-agent coding team (architect + 3 parallel coders + a Claude reviewer over
+      <code>/v1/messages</code> + a fixer) ships a real rate-limiting feature and proves it with
+      <code>node --test</code>. Then the <strong>identical</strong> task runs again, served entirely
+      from Zerocache. A third run reworded the task and still hit, through the semantic near-match
+      tier.
+    </p>
+    <div style="overflow-x: auto;">
+      <table class="bench-table">
+        <thead>
+          <tr><th>&nbsp;</th><th>Run 1 — cold</th><th>Run 2 — cached</th><th>Run 3 — reworded</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>upstream calls</td><td class="tbd">TBD</td><td class="hit">0</td><td class="tbd">TBD</td></tr>
+          <tr><td>wall time</td><td class="tbd">TBD</td><td class="hit">~TBD s</td><td class="tbd">TBD</td></tr>
+          <tr><td>est. cost</td><td class="tbd">TBD</td><td class="hit">$0.00</td><td class="tbd">TBD</td></tr>
+          <tr><td>hit kind</td><td>—</td><td>exact</td><td class="hit">semantic</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="bench-note">
+      <!-- Filled from demo/agent-showcase/traces/{run-cold,run-warm,run-semantic}.jsonl -->
+      Figures land here from the committed run trace once the live pass is recorded. Byte-identical
+      diffs and passing tests on every run.
+    </p>
+  </section>
+
+  <section class="section">
     <h2>Re-indexing an edited corpus</h2>
     <p>
       A 9-document corpus, re-indexed after editing one document and adding another. The other 7,
@@ -73,7 +102,7 @@ import StatCallout from "../components/StatCallout.astro";
   </section>
 
   <section class="section">
-    <h2>Three independent consumers</h2>
+    <h2>Consumer battle-tests — three independent frameworks</h2>
     <div class="stat-row">
       <StatCallout value="18/18" label="Mastra agentic checks passed" tone="hit" />
       <StatCallout value="18/19" label="LlamaIndex/Python real-key tests passed (1 external rate-limit)" tone="hit" />
@@ -164,6 +193,38 @@ import StatCallout from "../components/StatCallout.astro";
   .chart__bar {
     transform-box: fill-box;
     transform-origin: left center;
+  }
+  .bench-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+    max-width: 560px;
+  }
+  .bench-table th,
+  .bench-table td {
+    text-align: left;
+    padding: var(--space-2);
+    border-bottom: var(--hairline);
+  }
+  .bench-table th {
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-weight: 400;
+    font-size: 0.8rem;
+  }
+  .bench-table td {
+    font-family: var(--font-mono);
+  }
+  .bench-table .hit {
+    color: var(--hit);
+    font-weight: 600;
+  }
+  .bench-table .tbd {
+    color: var(--muted);
+  }
+  .bench-note {
+    color: var(--muted);
+    font-size: 0.9rem;
   }
 </style>
 

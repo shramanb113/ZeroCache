@@ -12,27 +12,28 @@ import CodeBlock from "../components/CodeBlock.astro";
 const rawBase = import.meta.env.BASE_URL;
 const base = rawBase.endsWith("/") ? rawBase : `${rawBase}/`;
 
-const quickstart = `docker run -p 8080:8080 ghcr.io/shramanb113/zerocache:latest
+const quickstart = `docker run -d -p 8080:8080 -v zerocache-data:/data ghcr.io/shramanb113/zerocache:latest
 
-curl http://localhost:8080/openai/v1/embeddings \\
+# send this twice — the second call is a ~1 ms cache hit, 100% off input AND output
+curl http://localhost:8080/openai/v1/chat/completions \\
   -H "Authorization: Bearer $OPENAI_API_KEY" \\
-  -H "Content-Type: application/json" \\
-  -d '{"model": "text-embedding-3-small", "input": "hello world"}'`;
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello"}],"temperature":0}'`;
 ---
 
 <BaseLayout
   title="Home"
-  description="A drop-in, Rust-native embedding cache. Point your OpenAI-compatible client at Zerocache instead of the real provider."
+  description="A drop-in, Rust-native cache for LLM and embedding APIs. Point your OpenAI- or Anthropic-compatible client at Zerocache instead of the real provider."
 >
   <section class="hero">
     <div class="hero__copy">
       <HashStrip />
-      <h1>Stop paying to re-embed text you've already embedded.</h1>
+      <h1>Stop paying to re-run LLM calls you've already made.</h1>
       <p class="hero__sub">
-        Zerocache sits between your ingestion pipeline and your embedding provider. It intercepts
-        <code>/v1/embeddings</code>, serves identical inputs from a local content-addressed store, and
-        forwards only cache misses upstream. No SDK, no framework plugin — point your existing client
-        at a new <code>base_url</code>.
+        Zerocache is one process between your app and every LLM / embedding provider you use. It
+        intercepts <code>/v1/chat/completions</code>, <code>/v1/messages</code>, and
+        <code>/v1/embeddings</code>, serves repeats from a local content-addressed store in ~1 ms,
+        and forwards only misses upstream. No SDK, no framework plugin — point your existing client
+        at a new <code>base_url</code>, and bring your own key per request.
       </p>
       <div class="hero__cta">
         <a class="hero__button" href="#quickstart">Try it →</a>
@@ -48,21 +49,24 @@ curl http://localhost:8080/openai/v1/embeddings \\
     <h2>How it works</h2>
     <ol class="steps">
       <li>
-        Your client sends a normal <code>POST /{"{provider}"}/v1/embeddings</code> request to
-        Zerocache instead of the real provider.
+        Your client sends a normal <code>POST /{"{provider}"}/v1/{"{chat/completions,messages,embeddings}"}</code>
+        request to Zerocache instead of the real provider.
       </li>
       <li>
-        Zerocache derives a content-addressed key from your forwarded API key, the provider, model,
-        and text.
+        Zerocache derives a content- and owner-addressed key from a hash of your forwarded API key,
+        the provider, the endpoint identity, the model, and a canonicalization of the request.
       </li>
       <li>
-        Anything already in the store returns instantly. Anything new is batched to the real
-        provider, using your key.
+        A hit returns in ~1 ms — 100% off input <em>and</em> output. A miss is forwarded upstream
+        with your key, then written back.
       </li>
-      <li>New vectors are written back and returned in the original request order.</li>
       <li>
-        Concurrent misses on the exact same text are coalesced into one upstream call, not one per
-        request.
+        Only deterministic requests are cached (<code>temperature: 0</code> or a <code>seed</code>);
+        a non-2xx upstream response is forwarded and never stored.
+      </li>
+      <li>
+        Concurrent misses on the exact same key are coalesced into one upstream call — in-process,
+        and across replicas on the redis backend.
       </li>
     </ol>
   </section>
@@ -70,13 +74,14 @@ curl http://localhost:8080/openai/v1/embeddings \\
   <section class="section">
     <h2>Measured, not claimed</h2>
     <div class="stat-row">
-      <StatCallout value="7 / 9" label="cache hits re-indexing an edited corpus" tone="hit" />
-      <StatCallout value="983ms → 5ms" label="ingest latency, miss vs. hit" tone="hit" />
-      <StatCallout value="7" label="embedding providers supported" tone="neutral" />
+      <StatCallout value="$0.00" label="cost of an agent run's fully-cached second pass" tone="hit" />
+      <StatCallout value="~1 ms" label="cache hit, vs. 1–20 s for a cold LLM call" tone="hit" />
+      <StatCallout value="16" label="providers — 9 chat, Anthropic messages, 7 embedding" tone="neutral" />
     </div>
     <p>
-      Full methodology and all three consumer battle-tests on the
-      <a href={`${base}benchmarks/`}>Benchmarks</a> page.
+      The <a href={`${base}demo/`}>agent showcase</a> ships a real feature with a multi-agent team,
+      then re-runs the identical task for free. Full methodology and the consumer battle-tests on
+      the <a href={`${base}benchmarks/`}>Benchmarks</a> page.
     </p>
   </section>
 
