@@ -139,9 +139,14 @@ const decisions = [
     detail: "A miss streams upstream frames to the client live while a background task buffers, assembles, and (on a clean finish) stores the record — with raw_sse alongside the assembled body. A stream:true and stream:false request for the same deterministic body share one entry. A hit replays raw_sse frame-by-frame; a non-cacheable stream:true request is a pure passthrough.",
   },
   {
+    title: "DELETE /{provider}/v1/chat/completions is the eviction counterpart the completion cache lacked",
+    why: "The completion and messages caches could store but not explicitly evict a single entry — the embedding path already had DELETE.",
+    detail: "Same body shape, same Authorization requirement, same 401/404/422 ladder as the chat POST; response { \"deleted\": 1 }, owner- and cache_scope-scoped, idempotent (count is keys requested, not found). One shared key-derivation helper now backs POST, streaming POST, and DELETE so they can't drift. With the semantic tier on, it also drops the request's vector record and HNSW node.",
+  },
+  {
     title: "Anthropic /v1/messages is a native surface, not an OpenAI-compat shim",
     why: "Claude-based agents send Anthropic's wire shape; forcing it through the OpenAI path would lose fields and mangle the response.",
-    detail: "New zerocache-adapters-anthropic + a messages orchestrator that reuses CompletionStore, the completion metrics, and the coalescing machinery unchanged. Auth is Bearer in / x-api-key upstream; anthropic-version and anthropic-beta fold into the cache key. Cache gate is temperature 0 only — Anthropic has no seed/n. Streaming and the semantic tier for this surface are deferred.",
+    detail: "New zerocache-adapters-anthropic + a messages orchestrator that reuses CompletionStore, the completion metrics, and the coalescing machinery unchanged. Auth is Bearer in / x-api-key upstream; anthropic-version and anthropic-beta fold into the cache key. Cache gate is temperature 0 only — Anthropic has no seed/n. stream: true is a raw passthrough; the semantic tier for this surface is deferred.",
   },
 ];
 ---

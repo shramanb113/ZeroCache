@@ -92,6 +92,13 @@ const chatProviders = [
         />
       ))}
     </div>
+    <ul class="notes">
+      <li><strong>Gemini</strong> is the only provider with image embeddings, and never reports token usage — <code>usage</code> is always zero on its responses.</li>
+      <li><strong>Bedrock</strong> authenticates with an Amazon bearer API key — no AWS SigV4. Titan and Cohere sit behind one router.</li>
+      <li><strong>Vertex AI</strong> uses a GCP OAuth2 access token, which lives about an hour; since <code>owner_id</code> is a hash of that credential, a Vertex caller's cache namespace rotates when the token does — fine for one long ingestion run, not across days.</li>
+      <li><strong>Azure</strong> registers as a provider only once <code>ZEROCACHE_AZURE_OPENAI_BASE_URL</code> or <code>ZEROCACHE_AZURE_FOUNDRY_BASE_URL</code> is set; with neither, <code>/azure/v1/embeddings</code> 404s. It covers the Azure OpenAI GA path and Foundry Models.</li>
+      <li><strong>OpenAI</strong> and <strong>Mistral</strong> take a configurable base URL, so a self-hosted wire-compatible endpoint (vLLM, LM Studio, TGI) works too. The cloud adapters are mock-tested only — no live-key smoke test in this environment.</li>
+    </ul>
   </section>
 </BaseLayout>
 
@@ -111,5 +118,18 @@ const chatProviders = [
     background: var(--surface);
     border: var(--hairline);
     padding: 2px 8px;
+  }
+  .notes {
+    margin-top: var(--space-4);
+    max-width: 64ch;
+    padding-left: 1.2em;
+    font-size: 0.9rem;
+    color: var(--muted);
+  }
+  .notes li {
+    margin-bottom: var(--space-2);
+  }
+  .notes strong {
+    color: var(--paper);
   }
 </style>

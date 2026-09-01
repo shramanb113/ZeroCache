@@ -60,6 +60,12 @@ const errorShapes = [
   ["400", "JSON that isn't syntactically valid, or a malformed image data URI"],
 ];
 
+const cloudGrammar = [
+  ["bedrock", "[<region>/]<modelId>[#<input_type>]", "us-east-1/cohere.embed-english-v3#search_query"],
+  ["vertexai", "[<location>/<project>/]<modelId>[#<task_type>]", "us-central1/my-proj/text-embedding-005#RETRIEVAL_DOCUMENT"],
+  ["azure", "[foundry:]<deployment>[#<input_type>]", "foundry:cohere-embed-v3-english#document"],
+];
+
 const operational = [
   ["GET /health", "Liveness. Zero I/O — proves only that the process/router is up."],
   ["GET /ready", "Readiness. 503 on a store-level error; a cache miss on the sentinel key is healthy."],
@@ -123,6 +129,25 @@ const operational = [
       <code>input</code> accepts either a JSON array of strings or a single bare JSON string — both
       are valid, matching OpenAI's real <code>input: string | string[]</code> contract.
     </p>
+  </section>
+
+  <section class="section">
+    <h2>Cloud provider routing</h2>
+    <p>
+      Azure, Bedrock, and Vertex AI each front several model vendors behind one API, so routing
+      coordinates (region, project, input/task type) are encoded into the <code>model</code> string
+      itself — no new wire field, since <code>model</code> is already free-form per request and
+      already lands in the cache key. <code>azure</code> is only a legal <code>{"{provider}"}</code>
+      once an Azure base-URL env var is set; otherwise it 404s like any unknown provider.
+    </p>
+    <table class="table">
+      <thead><tr><th>{"{provider}"}</th><th>model grammar</th><th>example</th></tr></thead>
+      <tbody>
+        {cloudGrammar.map(([provider, grammar, example]) => (
+          <tr><td><code>{provider}</code></td><td><code>{grammar}</code></td><td><code>{example}</code></td></tr>
+        ))}
+      </tbody>
+    </table>
   </section>
 
   <section class="section">

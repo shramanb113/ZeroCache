@@ -1,14 +1,13 @@
 ---
 import BaseLayout from "../layouts/BaseLayout.astro";
 import CodeBlock from "../components/CodeBlock.astro";
-import StatCallout from "../components/StatCallout.astro";
 
 const surfaces = [
   ["Retrieve", "Architect", "POST /openai/v1/embeddings · POST /gemini/v1/images/embeddings", "embeddings cache · image-embeddings cache"],
   ["Plan", "Architect", "POST /openai/v1/chat/completions", "chat completions cache · multi-provider"],
   ["Repo brief", "3× Coder (parallel)", "one identical POST /openai/v1/chat/completions, fired concurrently", "in-process coalescing (3 misses → 1 upstream call)"],
   ["Implement", "3× Coder (parallel)", "POST /openai/v1/chat/completions", "chat completions cache"],
-  ["Review", "Reviewer", "POST /anthropic/v1/messages (streaming)", "native Anthropic messages cache · streaming replay"],
+  ["Review", "Reviewer", "POST /anthropic/v1/messages", "native Anthropic messages cache (exact-match)"],
   ["Fix", "Fixer", "POST /openai/v1/chat/completions", "chat completions cache"],
 ];
 
@@ -17,7 +16,7 @@ cd ZeroCache/demo/agent-showcase
 npm install
 cp .env.example .env          # OPENAI_API_KEY required; ANTHROPIC + GEMINI optional
 
-# in another shell — semantic build so Run 3 works
+# in another shell — semantic build so the reworded run can hit
 ZEROCACHE_SEMANTIC=1 cargo run -p zerocache-http --features semantic
 
 npm run warm                  # pre-fills the cache (runs 1 → 2 → 3)
@@ -27,40 +26,35 @@ npm run -- run --run=3        # the reworded task, semantic hits`;
 
 <BaseLayout
   title="Demo"
-  description="A complex multi-agent coding team ships a real feature, then re-runs it served entirely from Zerocache's cache — byte-identical, ~$0, seconds."
+  description="A multi-agent coding team ships a real feature, then re-runs the identical task served entirely from Zerocache's cache — byte-identical diffs, passing tests, zero upstream calls."
 >
   <h1>Demo</h1>
   <p>
     <a href="https://github.com/shramanb113/ZeroCache/tree/master/demo/agent-showcase"><code>demo/agent-showcase/</code></a>
     is a bespoke multi-agent coding team — an architect, three parallel coders, a Claude reviewer
     over <code>/v1/messages</code>, a fixer — that ships a real rate-limiting feature to a sample
-    repo and proves it with <code>node --test</code>. Then it runs the <strong>identical</strong>
+    repo and proves it with <code>node --test</code>. It then runs the <strong>identical</strong>
     task again, served entirely from Zerocache: same diffs, same passing tests,
-    <code>X-Zerocache-*-Hit: true</code> on every call. A reworded third run still hits, through the
-    semantic near-match tier.
+    <code>X-Zerocache-Completion-Hit: true</code> on every model call. A third run rewords the task
+    and is designed to still hit, through the opt-in semantic near-match tier.
   </p>
 
   <section class="section">
-    <h2>Walkthrough</h2>
-    <div class="video-embed" role="img" aria-label="Walkthrough video placeholder">
-      <span>walkthrough video — coming soon</span>
-    </div>
-    <!-- Replace .video-embed with an <iframe>/<video> once the recording is ready. -->
-  </section>
-
-  <section class="section">
-    <h2>The result</h2>
-    <!-- BEGIN agent-showcase numbers — fill from demo/agent-showcase/traces/ -->
-    <div class="stat-row">
-      <StatCallout value="0" label="upstream calls on the cached re-run" tone="hit" />
-      <StatCallout value="$0.00" label="cost of the cached re-run" tone="hit" />
-      <StatCallout value="exact + semantic" label="hit kinds across runs 2 and 3" tone="hit" />
-    </div>
-    <p class="muted-note">
-      Full run 1 vs run 2 vs run 3 figures land here from the committed trace once the live pass is
-      recorded.
+    <h2>What a cached re-run looks like</h2>
+    <p>
+      Run 1 is cold — every model call is a real, billed upstream request. Run 2 is the same task,
+      unchanged: the cacheable chat-completion and <code>/v1/messages</code> calls return from the
+      store, the diffs applied to the sample repo are byte-identical, and <code>node --test</code>
+      passes exactly as it did on run 1. Run 3 rewords the brief; with a
+      <code>--features semantic</code> build and <code>ZEROCACHE_SEMANTIC=1</code>, the paraphrased
+      prompts match previously-served completions above the cosine threshold.
     </p>
-    <!-- END agent-showcase numbers -->
+    <p class="muted-note">
+      This demo is built to be run against your own keys for a live trace — it does not ship
+      pre-recorded numbers. For a measured result, see the support-triage agent suite on the
+      Benchmarks page: a second run was 100% cache hits, zero upstream calls, ~5.1k prompt + ~370
+      completion tokens saved per suite.
+    </p>
   </section>
 
   <section class="section">
@@ -95,31 +89,6 @@ npm run -- run --run=3        # the reworded task, semantic hits`;
 </BaseLayout>
 
 <style>
-  .video-embed {
-    aspect-ratio: 16 / 9;
-    width: 100%;
-    max-width: 760px;
-    display: grid;
-    place-items: center;
-    border: var(--hairline);
-    border-radius: var(--radius);
-    background:
-      repeating-linear-gradient(
-        45deg,
-        rgba(196, 98, 47, 0.05) 0 12px,
-        transparent 12px 24px
-      ),
-      var(--surface);
-    color: var(--muted);
-    font-family: var(--font-mono);
-    font-size: 0.85rem;
-  }
-  .stat-row {
-    display: flex;
-    gap: var(--space-5);
-    flex-wrap: wrap;
-    margin: var(--space-3) 0;
-  }
   .muted-note {
     color: var(--muted);
     font-size: 0.9rem;

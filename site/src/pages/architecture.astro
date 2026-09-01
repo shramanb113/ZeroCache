@@ -41,7 +41,9 @@ const principles = [
 const roadmap = [
   ["Budgets & rate limits", "Per-key monthly spend caps (429 when exceeded) and per-key RPS limits, with a cost-by-team view in the dashboard."],
   ["Multi-provider failover", "Retry a failed request on a second configured provider. The adapters already exist; only the routing policy is missing."],
-  ["Anthropic /v1/messages streaming & semantic tier", "The OpenAI-wire chat surface has streaming buffer-and-replay and the semantic near-match tier; the /v1/messages surface has neither yet."],
+  ["Request log + replay", "Opt-in: persist request/response pairs, browse them, replay one, diff the result."],
+  ["One-click deploy", "A fly.toml / Deploy button, and a hosted free tier."],
+  ["Anthropic /v1/messages streaming & semantic tier", "The OpenAI-wire chat surface has streaming buffer-and-replay and the semantic near-match tier; the /v1/messages surface has neither yet — stream: true there is a raw passthrough."],
 ];
 ---
 

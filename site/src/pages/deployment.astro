@@ -35,6 +35,7 @@ const envVars = [
   ["ZEROCACHE_AZURE_AUTH_MODE", "bearer (Entra token, default) or api-key"],
   ["ZEROCACHE_BEDROCK_REGION", "Default AWS region for Bedrock requests that don't specify one"],
   ["ZEROCACHE_VERTEX_PROJECT / _VERTEX_LOCATION", "Default GCP project/location for Vertex AI requests that don't specify one"],
+  ["OTEL_EXPORTER_OTLP_ENDPOINT / RUST_LOG", "Unset → console logging only. Set the OTLP endpoint for OpenTelemetry gRPC trace export; RUST_LOG defaults to info."],
 ];
 ---
 

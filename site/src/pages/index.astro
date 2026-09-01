@@ -22,18 +22,21 @@ curl http://localhost:8080/openai/v1/chat/completions \\
 
 <BaseLayout
   title="Home"
-  description="A drop-in, Rust-native cache for LLM and embedding APIs. Point your OpenAI- or Anthropic-compatible client at Zerocache instead of the real provider."
+  description="A self-hosted caching proxy for LLM and embedding APIs. Point your OpenAI- or Anthropic-compatible client at Zerocache instead of the provider; repeated chat completions, /v1/messages calls, and embeddings come back in ~1 ms."
 >
   <section class="hero">
     <div class="hero__copy">
       <HashStrip />
       <h1>Stop paying to re-run LLM calls you've already made.</h1>
       <p class="hero__sub">
-        Zerocache is one process between your app and every LLM / embedding provider you use. It
-        intercepts <code>/v1/chat/completions</code>, <code>/v1/messages</code>, and
-        <code>/v1/embeddings</code>, serves repeats from a local content-addressed store in ~1 ms,
-        and forwards only misses upstream. No SDK, no framework plugin — point your existing client
-        at a new <code>base_url</code>, and bring your own key per request.
+        Zerocache is a self-hosted caching proxy that sits between your app and every LLM / embedding
+        provider you use. It intercepts <code>/v1/chat/completions</code>,
+        <code>/v1/messages</code>, and <code>/v1/embeddings</code>, serves repeats from a local
+        content-addressed store in ~1 ms, and forwards only misses upstream. Provider-side prompt
+        caching discounts <em>input</em> tokens for a few minutes and still runs the model; Zerocache
+        serves the whole response — 100% off input <em>and</em> output — for as long as you keep the
+        entry, across runs and machines. No SDK, no framework plugin: point your existing client at a
+        new <code>base_url</code> and bring your own key per request.
       </p>
       <div class="hero__cta">
         <a class="hero__button" href="#quickstart">Try it →</a>
@@ -72,16 +75,38 @@ curl http://localhost:8080/openai/v1/chat/completions \\
   </section>
 
   <section class="section">
+    <h2>Where the savings come from</h2>
+    <p>
+      A single monotonic agent run gets almost no completion-cache hits — every turn's prompt is
+      strictly longer than the last. The savings are real, but they come from specific patterns,
+      agreed before building rather than assumed:
+    </p>
+    <ul class="steps">
+      <li>
+        <strong>Repeated runs</strong> — CI/eval loops, prompt tuning, re-asks. A full hit is 100%
+        off; provider prompt caching is an input-only discount on a request that still executes.
+      </li>
+      <li><strong>Auxiliary LLM calls</strong> — the short "summarize this" / "classify that" calls agents fire constantly, which recur verbatim across runs.</li>
+      <li><strong>Retry / flap storms</strong> — a burst of identical requests collapses to one upstream call via in-process coalescing.</li>
+      <li><strong>Multi-agent fan-out</strong> — templated prompts across N workers.</li>
+      <li><strong>RAG re-indexing</strong> — re-embedding a corpus after editing a few documents costs only the deltas.</li>
+    </ul>
+  </section>
+
+  <section class="section">
     <h2>Measured, not claimed</h2>
     <div class="stat-row">
-      <StatCallout value="$0.00" label="cost of an agent run's fully-cached second pass" tone="hit" />
-      <StatCallout value="~1 ms" label="cache hit, vs. 1–20 s for a cold LLM call" tone="hit" />
-      <StatCallout value="16" label="providers — 9 chat, Anthropic messages, 7 embedding" tone="neutral" />
+      <StatCallout value="100%" label="cache hits re-running a 3-ticket support-triage agent suite (10 model + 9 tool calls per run)" tone="hit" />
+      <StatCallout value="~1 ms" label="cache hit, vs. 200–800 ms for a cold embedding call and 1–20 s for a cold LLM call" tone="hit" />
+      <StatCallout value="9 + 7" label="chat providers (OpenAI-wire) + embedding providers, plus Anthropic /v1/messages" tone="neutral" />
     </div>
     <p>
-      The <a href={`${base}demo/`}>agent showcase</a> ships a real feature with a multi-agent team,
-      then re-runs the identical task for free. Full methodology and the consumer battle-tests on
-      the <a href={`${base}benchmarks/`}>Benchmarks</a> page.
+      Re-running that agent suite a second time was zero upstream calls, byte-identical resolutions,
+      and ~5.1k prompt + ~370 completion tokens saved per suite — every intermediate tool-call turn
+      included. The <a href={`${base}demo/`}>agent showcase</a> ships a real feature with a
+      multi-agent team, then re-runs the identical task served entirely from cache. Full methodology
+      and the three independent consumer battle-tests on the
+      <a href={`${base}benchmarks/`}>Benchmarks</a> page.
     </p>
   </section>
 
