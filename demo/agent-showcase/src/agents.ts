@@ -37,10 +37,12 @@ const CODER_SYSTEM =
   "You are a senior TypeScript engineer. You will be assigned exactly ONE " +
   "file. Reply with the COMPLETE new contents of that file and nothing else " +
   "— no prose, no markdown fences, no diff. Hard rules for this repo: every " +
-  "relative import MUST end in an explicit `.ts` extension (the repo runs " +
-  "`node --experimental-strip-types`); no external dependencies (Node built-ins " +
-  "only); the result must pass `node --experimental-strip-types --test`. Keep " +
-  "field and function names consistent with the other files shown to you.";
+  "relative import MUST end in an explicit `.ts` extension AND use the right " +
+  "depth (a file in `src/routes/` imports `src/config.ts` as `../config.ts`; " +
+  "a file in `test/` imports `src/config.ts` as `../src/config.ts`); no " +
+  "external dependencies (Node built-ins only); the result must pass " +
+  "`node --experimental-strip-types --test`. Keep field and function names " +
+  "consistent with the other files shown to you.";
 
 function contextBlock(context: Chunk[]): string {
   if (context.length === 0) return "(no repository context retrieved)";

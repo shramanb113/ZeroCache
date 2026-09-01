@@ -130,6 +130,30 @@ function readFileOrEmpty(root: string, rel: string): string {
   return existsSync(full) ? readFileSync(full, "utf8") : "";
 }
 
+/**
+ * Rewrite relative imports the model got the depth wrong on. For a file at
+ * `rel`, any `from "./x.ts"` / `"../x.ts"` whose target does not exist is
+ * re-pointed at the unique file named `x.ts` among `knownFiles`, path made
+ * relative to `rel`'s directory. Deterministic, and only ever narrows a broken
+ * import to an existing one.
+ */
+function repairImports(rel: string, content: string, knownFiles: string[]): string {
+  const fromDir = dirname(rel);
+  return content.replace(
+    /(\bfrom\s+["'])(\.\.?\/[^"']+?\.ts)(["'])/g,
+    (whole, pre: string, spec: string, post: string) => {
+      const resolved = join(fromDir, spec).split(sep).join("/");
+      if (knownFiles.includes(resolved)) return whole;
+      const base = spec.split("/").pop();
+      const matches = knownFiles.filter((f) => f.split("/").pop() === base);
+      if (matches.length !== 1) return whole;
+      let repl = relative(fromDir, matches[0]!).split(sep).join("/");
+      if (!repl.startsWith(".")) repl = `./${repl}`;
+      return `${pre}${repl}${post}`;
+    },
+  );
+}
+
 function writeFileRel(root: string, rel: string, content: string): void {
   const full = join(root, rel);
   mkdirSync(dirname(full), { recursive: true });
@@ -255,6 +279,7 @@ export async function orchestrate(
   onFrame(stages);
 
   // ---- Stage 4: implement (parallel workers, one file each) ----------
+  const knownFiles = [...new Set([...files, ...task.targetFiles])].sort();
   const repoSnapshot = task.targetFiles.map((rel) => ({
     path: rel,
     content: readFileOrEmpty(workDir, rel),
@@ -284,7 +309,12 @@ export async function orchestrate(
           ((res.data.choices as { message: { content: string } }[] | undefined)?.[0]
             ?.message.content) ?? "";
         try {
-          writeFileRel(workDir, rel, applyCoderOutput(current, diff));
+          const body2 = repairImports(
+            rel,
+            applyCoderOutput(current, diff),
+            knownFiles,
+          );
+          writeFileRel(workDir, rel, body2);
           implemented++;
           return;
         } catch (e) {
@@ -397,7 +427,11 @@ export async function orchestrate(
         ((res.data.choices as { message: { content: string } }[] | undefined)?.[0]
           ?.message.content) ?? "";
       try {
-        const next = applyCoderOutput(current, diff);
+        const next = repairImports(
+          rel,
+          applyCoderOutput(current, diff),
+          knownFiles,
+        );
         if (next.trim().length > 0) writeFileRel(workDir, rel, next);
       } catch {
         /* keep the pre-fix version */
