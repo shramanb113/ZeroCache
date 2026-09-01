@@ -86,10 +86,9 @@ test("separate keys have separate buckets", () => {
 function chatResponse(body) {
   const sys = body.messages?.[0]?.content ?? "";
   const user = body.messages?.[1]?.content ?? body.messages?.[0]?.content ?? "";
-  if (typeof sys === "string" && sys.includes("unified diff")) {
-    const m = /editing exactly one file: (\S+)/.exec(String(user));
-    const file = m?.[1];
-    return { choices: [{ message: { content: FILE_BODIES[file] ?? "// noop\n" } }], usage: { prompt_tokens: 800, completion_tokens: 200 } };
+  const fileMatch = /assigned exactly one file: (\S+)/.exec(String(user));
+  if (fileMatch) {
+    return { choices: [{ message: { content: FILE_BODIES[fileMatch[1]] ?? "// noop\n" } }], usage: { prompt_tokens: 800, completion_tokens: 200 } };
   }
   if (typeof user === "string" && user.includes("6 bullet points"))
     return { choices: [{ message: { content: "- a\n- b\n- c\n- d\n- e\n- f" } }], usage: { prompt_tokens: 400, completion_tokens: 60 } };
